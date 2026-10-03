@@ -1,12 +1,17 @@
 #define _GNU_SOURCE
 #include "lpm.h"
+#include "api.h"
 
 #include "laplace/laplace.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
 static void hex(const uint8_t b[16], char out[33]) {
     static const char H[] = "0123456789abcdef";
@@ -282,6 +287,12 @@ static int cmd_fetch(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_serve(int argc, char **argv) {
+    const char *host = argc > 0 ? argv[0] : "127.0.0.1";
+    int port = argc > 1 ? atoi(argv[1]) : 5188;
+    return api_serve(host, port);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: lpm check | id STRING | admit FILE... | fetch FILE ID | index RECORDS PATH... | search RECORDS QUERY | bench PATH...\n");
@@ -289,11 +300,20 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "check")) return cmd_check();
     if (!strcmp(argv[1], "id")) return cmd_id(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "text")) {
+        if (argc < 3) return fail("usage: lpm text STRING");
+        Lpm *ix = lpm_new(NULL);
+        if (!ix) return fail("tier 0 did not map");
+        lpm_show_text(ix, (const uint8_t *)argv[2], strlen(argv[2]), stdout);
+        lpm_free(ix);
+        return 0;
+    }
     if (!strcmp(argv[1], "admit")) return cmd_admit(argc - 2, argv + 2);
     if (!strcmp(argv[1], "fetch")) return cmd_fetch(argc - 2, argv + 2);
     if (!strcmp(argv[1], "index")) return cmd_index(argc - 2, argv + 2);
     if (!strcmp(argv[1], "search")) return cmd_search(argc - 2, argv + 2);
     if (!strcmp(argv[1], "bench")) return cmd_bench(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "serve")) return cmd_serve(argc - 2, argv + 2);
     fprintf(stderr, "unknown command %s\n", argv[1]);
     return 2;
 }

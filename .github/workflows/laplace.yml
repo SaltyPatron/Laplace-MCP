@@ -1,0 +1,17 @@
+name: Laplace-MCP
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  mcp:
+    runs-on: [self-hosted, laplace, Laplace-MCP]
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: make -C native
+      - name: check
+        run: |
+          ./native/lpm check
+          ./native/lpm text 'Sherlock Holmes'

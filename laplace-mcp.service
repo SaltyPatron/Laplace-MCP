@@ -1,0 +1,17 @@
+[Unit]
+Description=Laplace-MCP
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ahart
+Group=ahart
+ExecStart=/repos/src/Laplace-MCP/native/lpm serve 127.0.0.1 5188
+Restart=on-failure
+RestartSec=2
+Environment="LAPLACE_CONNINFO=host=/tmp port=5432 user=laplace dbname=laplace"
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -3,6 +3,7 @@
 
 #include "laplace/laplace.h"
 
+#include <math.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -131,11 +132,21 @@ static void add_feat(Lpm *ix, const uint8_t id[16]) {
     ix->nfeat++;
 }
 
+static void ent_kids(Ent *e, const lp_ref *ch, uint32_t n) {
+    if (e->kids || n == 0 || n > 200000u) return;
+    e->kids = malloc((size_t)n * 16);
+    if (!e->kids) return;
+    for (uint32_t i = 0; i < n; i++) memcpy(e->kids + (size_t)i * 16, ch[i].id.b, 16);
+    e->nkids = n;
+}
+
 static lp_ref on_compose(void *ud, const lp_ref *ch, uint32_t n, uint8_t tier) {
     Lpm *ix = ud;
     lp_ref r = lp_ref_compose(ch, n, tier);
     int fresh = 0;
-    ent_put(ix, &r, &fresh);
+    for (uint32_t i = 0; i < n; i++) ent_put(ix, &ch[i], &fresh);
+    Ent *e = ent_put(ix, &r, &fresh);
+    ent_kids(e, ch, n);
     ix->compositions++;
     int low = 1;
     for (uint32_t i = 0; i < n; i++) if (ch[i].tier > 1) { low = 0; break; }
@@ -225,13 +236,7 @@ static lp_ref compose_put(Lpm *ix, const lp_ref *ch, uint32_t n, uint8_t tier) {
     int fresh = 0;
     Ent *e = ent_put(ix, &r, &fresh);
     ix->compositions++;
-    if (!e->kids && n > 0 && n <= 200000u) {
-        e->kids = malloc((size_t)n * 16);
-        if (e->kids) {
-            for (uint32_t i = 0; i < n; i++) memcpy(e->kids + (size_t)i * 16, ch[i].id.b, 16);
-            e->nkids = n;
-        }
-    }
+    ent_kids(e, ch, n);
     return r;
 }
 
@@ -646,6 +651,69 @@ size_t lpm_search(Lpm *ix, const char *q, size_t n, LpmHit *out, size_t cap) {
     return wrote;
 }
 
+size_t lpm_containers(const Lpm *ix, const uint8_t id[16], LpmHit *out, size_t cap) {
+    size_t n = 0;
+    Ent *e = ent_find(ix, id);
+    if (e) {
+        for (uint32_t i = 0; i < e->nd && n < cap; i++) {
+            uint32_t di = e->docs[i];
+            if (di >= ix->ndocs) continue;
+            Doc *d = &ix->docs[di];
+            LpmHit *h = &out[n++];
+            memset(h, 0, sizeof *h);
+            memcpy(h->id, d->id, 16);
+            memcpy(h->m, d->m, sizeof h->m);
+            h->hilbert = d->hilbert;
+            h->line0 = d->line0;
+            h->line1 = d->line1;
+            h->bytes = d->bytes;
+            snprintf(h->path, sizeof h->path, "%s", ix->paths + d->path);
+        }
+    }
+    for (size_t di = 0; di < ix->ndocs && n < cap; di++) {
+        if (memcmp(ix->docs[di].id, id, 16)) continue;
+        int seen = 0;
+        for (size_t k = 0; k < n; k++) if (!strcmp(out[k].path, ix->paths + ix->docs[di].path)) seen = 1;
+        if (seen) continue;
+        Doc *d = &ix->docs[di];
+        LpmHit *h = &out[n++];
+        memset(h, 0, sizeof *h);
+        memcpy(h->id, d->id, 16);
+        memcpy(h->m, d->m, sizeof h->m);
+        h->hilbert = d->hilbert;
+        snprintf(h->path, sizeof h->path, "%s", ix->paths + d->path);
+    }
+    return n;
+}
+
+static void traj_walk(const Lpm *ix, const uint8_t id[16], double **pts, size_t *n, size_t *cap, int depth) {
+    Ent *e = ent_find(ix, id);
+    if (!e || depth > 64) return;
+    if (!e->nkids) {
+        if (*n == *cap) {
+            *cap = *cap ? *cap * 2 : 64;
+            *pts = grow(*pts, *cap * 4 * sizeof(double));
+        }
+        double *p = *pts + *n * 4;
+        for (int d = 0; d < 4; d++) p[d] = ldexp((double)e->m[d], -53);
+        (*n)++;
+        return;
+    }
+    for (uint32_t i = 0; i < e->nkids; i++) traj_walk(ix, e->kids + (size_t)i * 16, pts, n, cap, depth + 1);
+}
+
+double lpm_frechet(const Lpm *ix, const uint8_t a[16], const uint8_t b[16]) {
+    if (!ent_find(ix, a) || !ent_find(ix, b)) return -1;
+    double *pa = NULL, *pb = NULL;
+    size_t na = 0, nb = 0, ca = 0, cb = 0;
+    traj_walk(ix, a, &pa, &na, &ca, 0);
+    traj_walk(ix, b, &pb, &nb, &cb, 0);
+    double d = (na && nb) ? lp_frechet4(pa, na, pb, nb) : -1;
+    free(pa);
+    free(pb);
+    return d;
+}
+
 int lpm_identify(Lpm *ix, const char *s, size_t n, LpmRec *out) {
     memset(out, 0, sizeof *out);
     lp_id flat;
@@ -683,6 +751,57 @@ int lpm_fetch(const Lpm *ix, const uint8_t id[16], LpmRec *out, uint8_t *kids, u
     if (nkids) *nkids = n;
     if (kids && cap && n) memcpy(kids, e->kids, (n < cap ? n : cap) * 16);
     return 0;
+}
+
+static int cp_of(const Lpm *ix, const uint8_t id[16], const uint32_t *cps, uint32_t nc) {
+    for (uint32_t i = 0; i < nc; i++)
+        if (!memcmp(ix->t0[cps[i]].id.b, id, 16)) return (int)cps[i];
+    return -1;
+}
+
+static void emit_node(const Lpm *ix, const uint8_t id[16], const uint32_t *cps, uint32_t nc, FILE *o) {
+    Ent *e = ent_find(ix, id);
+    if (e && e->nkids > 1) {
+        fputc('[', o);
+        for (uint32_t i = 0; i < e->nkids; i++) {
+            if (i) fputc(',', o);
+            emit_node(ix, e->kids + (size_t)i * 16, cps, nc, o);
+        }
+        fputc(']', o);
+        return;
+    }
+    int cp = cp_of(ix, id, cps, nc);
+    if (cp == ' ') { fputs("' '", o); return; }
+    if (cp >= 32 && cp < 127) { fputc(cp, o); return; }
+    if (cp > 0) { fprintf(o, "U+%04X", cp); return; }
+    if (e && e->nkids == 1) { emit_node(ix, e->kids, cps, nc, o); return; }
+    fputs("?", o);
+}
+
+void lpm_show_text(Lpm *ix, const uint8_t *s, size_t n, void *file) {
+    FILE *o = file;
+    static const char H[] = "0123456789abcdef";
+    ix->collecting = 0;
+    lp_ref trunk = lp_text_decompose(ix->text, s, n, on_compose, ix);
+    uint32_t cps[256];
+    uint32_t nc = 0;
+    size_t i = 0;
+    uint32_t cp;
+    while (i < n && nc < 256 && lp_utf8_next(s, n, &i, &cp)) {
+        int seen = 0;
+        for (uint32_t k = 0; k < nc; k++) if (cps[k] == cp) seen = 1;
+        if (!seen) cps[nc++] = cp;
+    }
+    char id[33];
+    for (int b = 0; b < 16; b++) { id[b * 2] = H[trunk.id.b[b] >> 4]; id[b * 2 + 1] = H[trunk.id.b[b] & 15]; }
+    id[32] = 0;
+    fprintf(o, "id        %s\n", id);
+    fprintf(o, "tier      %u\n", trunk.tier);
+    fprintf(o, "hilbert   %llu\n", (unsigned long long)lp_hilbert4(&trunk.c));
+    fprintf(o, "m         %lld %lld %lld %lld\n",
+            (long long)trunk.c.m[0], (long long)trunk.c.m[1], (long long)trunk.c.m[2], (long long)trunk.c.m[3]);
+    emit_node(ix, trunk.id.b, cps, nc, o);
+    fputc('\n', o);
 }
 
 int lpm_last(const Lpm *ix, LpmHit *out) {

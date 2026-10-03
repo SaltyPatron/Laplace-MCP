@@ -45,6 +45,10 @@ int lpm_index_path(Lpm *, const char *path);
 
 /* Rank documents by how many of the query's constituent IDs they contain. */
 size_t lpm_search(Lpm *, const char *q, size_t n, LpmHit *out, size_t cap);
+/* Documents whose trunk is this ID, or that contain it. */
+size_t lpm_containers(const Lpm *, const uint8_t id[16], LpmHit *out, size_t cap);
+/* Fréchet of the two records' trajectories (ordered constituent coordinates). -1 if either ID is absent. */
+double lpm_frechet(const Lpm *, const uint8_t a[16], const uint8_t b[16]);
 
 /* The entity and physicality of a UTF-8 string, from the text decomposition. */
 int lpm_identify(Lpm *, const char *s, size_t n, LpmRec *out);
@@ -53,6 +57,8 @@ int lpm_lookup(const Lpm *, const uint8_t id[16], LpmRec *out);
 /* The record for an id: physicality in out, constituent ids in kids (cap of them). */
 int lpm_fetch(const Lpm *, const uint8_t id[16], LpmRec *out, uint8_t *kids, uint32_t cap, uint32_t *nkids);
 int lpm_last(const Lpm *, LpmHit *out);
+/* Print a text's decomposition: trunk id, physicality, and the constituent tree. */
+void lpm_show_text(Lpm *, const uint8_t *s, size_t n, void *file);
 void lpm_stats(const Lpm *, LpmStats *);
 
 int lpm_save(const Lpm *, const char *path);
