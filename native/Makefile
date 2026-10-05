@@ -14,8 +14,10 @@ all: liblpm.so lpm
 liblpm.so: lpm.c lpm.h
 	$(CC) $(CFLAGS) -shared -o $@ lpm.c $(LIBS) $(RPATH)
 
-lpm: main.c api.c api.h liblpm.so lpm.h
-	$(CC) $(CFLAGS) -o $@ main.c api.c -L. -llpm $(LIBS) -L$(PG)/lib -lpq $(RPATH) -Wl,-rpath,'$$ORIGIN'
+ENGINE_SRC := /repos/src/Laplace-Engine/src
+
+lpm: main.c api.c api.h liblpm.so lpm.h db_bridge.c $(ENGINE_SRC)/read.c
+	$(CC) $(CFLAGS) -fopenmp -I$(ENGINE_SRC) -o $@ main.c api.c db_bridge.c $(ENGINE_SRC)/read.c -L. -llpm $(LIBS) -L$(PG)/lib -lpq $(RPATH) -Wl,-rpath,'$$ORIGIN' -fopenmp
 
 clean:
 	rm -f liblpm.so lpm
