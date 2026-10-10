@@ -3,7 +3,7 @@
 HTTP service in front of Laplace. Callers send content or an ID. The process maps tier 0, names the entity, and calls the database. Callers are not linked to Postgres.
 
 ```
-native/lpm serve 127.0.0.1 5188
+native/lpm serve                 # LAPLACE_MCP_HOST and LAPLACE_MCP_PORT, or: lpm serve HOST PORT; unset, 127.0.0.1 5188
 ```
 
 nginx proxies `POST /mcp` on port 8443 to that process. Direct routes are under `/v1/`. The contract, the measurements, and what is not a route yet are in [docs/API.md](docs/API.md).

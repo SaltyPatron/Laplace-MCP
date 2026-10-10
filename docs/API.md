@@ -6,6 +6,17 @@ The process listens on `127.0.0.1:5188`. nginx `laplace-managed` proxies `POST h
 
 `LAPLACE_CONNINFO` selects the database. Unset, the process uses `host=/tmp port=5432 user=laplace dbname=laplace`.
 
+Nothing about the machine is compiled in but a default. The process reads, from its environment (the unit takes the machine's `/etc/laplace/machine.env` when there is one):
+
+| Name | What | Unset |
+|---|---|---|
+| `LAPLACE_MCP_HOST`, `LAPLACE_MCP_PORT` | the address and port `lpm serve` listens on; `lpm serve HOST PORT` still wins | `127.0.0.1`, `5188` |
+| `LAPLACE_CONNINFO` | the database | `host=/tmp port=5432 user=laplace dbname=laplace` |
+| `LAPLACE_ENGINE` | the engine program the routes run | `$LAPLACE_BUILD/Laplace-Engine/icx-release/laplace`, or `/repos/build/...` without `LAPLACE_BUILD` |
+| `LAPLACE_GRAMMARS` | the directory of compiled tree-sitter grammars | `/repos/build/grammars` |
+
+`native/Makefile` builds against `LAPLACE_SRC`, `LAPLACE_DEPSRC`, `LAPLACE_BUILD`, `LAPLACE_DEPS`, `LAPLACE_ICU_DIR` and `LAPLACE_PG_DIR`, with the deployment target's values as defaults.
+
 One process holds one database connection. `lpm serve` is that process. `laplace_mcp.py` is not.
 
 ## What a caller sends
