@@ -269,6 +269,10 @@ Hold *holds_above(const lp_id *keys, int nkeys, int floor, int each, int standin
 void holds_free(Hold *h, int n);
 int tier_max(const lp_id *ids, int n);
 size_t ids_param(uint8_t *out, const lp_id *ids, uint32_t n);
+/* attested: Laplace-Engine/src/walk.c. Who said a claim is not a row: it is read off the containment above the claim,
+ * one row a claim and the trunk that holds it (a trunk in the witness table is a witness, with its trust). */
+typedef struct { lp_id claim, trunk; double games, tokens, score; uint32_t position; double trust; int witness; } Attested;
+Attested *attested(PGconn *pg, const lp_id *claims, int n, int *nout, uint64_t *rows);
 
 static void buf_add(char **b, size_t *n, size_t *cap, const char *s, size_t m) {
     if (*n + m + 1 > *cap) {
@@ -312,7 +316,8 @@ typedef struct {
     lp_coord c;
     Hold *h;
     int nh;
-    PGresult *att;
+    Attested *att;
+    int natt;
     lp_id *kids;
     int *ktier;
     int *kcp;
@@ -323,7 +328,7 @@ static void downs_free(Down *d, int n) {
     if (!d) return;
     for (int i = 0; i < n; i++) {
         holds_free(d[i].h, d[i].nh);
-        if (d[i].att) PQclear(d[i].att);
+        free(d[i].att);
         free(d[i].kids);
         free(d[i].ktier);
         free(d[i].kcp);
@@ -331,12 +336,9 @@ static void downs_free(Down *d, int n) {
     free(d);
 }
 
-static void phy_leaf_name(char *out, size_t cap, int tier, const lp_id *id) {
-    int big = tier == 0 || tier == 2 || tier == 3 || tier == 4 || tier == 5 || tier == 6;
-    if (tier >= 16) snprintf(out, cap, "physicality_tx");
-    else if (tier >= 0 && big) snprintf(out, cap, "physicality_t%d_%x", tier, id->b[0] >> 4);
-    else if (tier >= 0) snprintf(out, cap, "physicality_t%d", tier);
-    else snprintf(out, cap, "physicality");
+/* An entity's physicality is in the leaf of its ID's first byte (physicality_00 .. physicality_ff); a leaf holds every tier. */
+static void phy_leaf_name(char *out, size_t cap, const lp_id *id) {
+    snprintf(out, cap, "physicality_%02x", id->b[0]);
 }
 
 static void emit_ids(char **b, size_t *n, size_t *cap, const uint8_t *path, int plen, int *nids) {
@@ -354,28 +356,19 @@ static void emit_ids(char **b, size_t *n, size_t *cap, const uint8_t *path, int 
     free(ids);
 }
 
-static void emit_att_rows(char **b, size_t *n, size_t *cap, PGresult *att) {
-    int rows = att ? PQntuples(att) : 0;
+/* What the records under one trunk said of one claim: games (the records that say it), tokens (with the times each says
+ * it), score (the mean a game), position (the least any gave it; null when none did). */
+static void emit_att_rows(char **b, size_t *n, size_t *cap, const Attested *att, int rows) {
     for (int i = 0; i < rows; i++) {
-        char claim[33], wit[33];
-        lp_id id;
-        memcpy(id.b, PQgetvalue(att, i, 0), 16);
-        hex_id(&id, claim);
-        memcpy(id.b, PQgetvalue(att, i, 1), 16);
-        hex_id(&id, wit);
-        int pos_null = PQgetisnull(att, i, 2);
-        int pos = pos_null ? 0 : (int)lp_be(PQgetvalue(att, i, 2), 4);
-        uint32_t sb = (uint32_t)lp_be(PQgetvalue(att, i, 3), 4);
-        float score;
-        memcpy(&score, &sb, 4);
-        int games = (int)lp_be(PQgetvalue(att, i, 4), 4);
-        double trust = lp_be_f64(PQgetvalue(att, i, 5));
-        if (pos_null) buf_fmt(b, n, cap,
-            "%s{\"claim\":\"%s\",\"witness\":\"%s\",\"position\":null,\"score\":%.6g,\"games\":%d,\"trust\":%.6g}",
-            i ? "," : "", claim, wit, score, games, trust);
-        else buf_fmt(b, n, cap,
-            "%s{\"claim\":\"%s\",\"witness\":\"%s\",\"position\":%d,\"score\":%.6g,\"games\":%d,\"trust\":%.6g}",
-            i ? "," : "", claim, wit, pos, score, games, trust);
+        char claim[33], trunk[33], pos[16] = "null";
+        hex_id(&att[i].claim, claim);
+        hex_id(&att[i].trunk, trunk);
+        if (att[i].position) snprintf(pos, sizeof pos, "%u", att[i].position);
+        buf_fmt(b, n, cap,
+            "%s{\"claim\":\"%s\",\"trunk\":\"%s\",\"witness\":%s,\"trust\":%.6g,"
+            "\"games\":%.0f,\"tokens\":%.0f,\"score\":%.6g,\"position\":%s}",
+            i ? "," : "", claim, trunk, att[i].witness ? "true" : "false", att[i].trust,
+            att[i].games, att[i].tokens, att[i].games > 0 ? att[i].score / att[i].games : 0.0, pos);
     }
 }
 
@@ -450,7 +443,7 @@ static void emit_down(char **b, size_t *n, size_t *cap, const Down *d, int fan) 
             seen++;
         }
         buf_add(b, n, cap, "],\"attestations\":[", strlen("],\"attestations\":["));
-        emit_att_rows(b, n, cap, d->att);
+        emit_att_rows(b, n, cap, d->att, d->natt);
         buf_add(b, n, cap, "]", 1);
         free(order);
         free(conf);
@@ -507,11 +500,7 @@ static void on_search(int c, const char *body) {
     const char *pv[1] = { (const char *)ab };
     int pl[1] = { (int)al }, pf[1] = { 1 };
     char leaf[64], psql[192];
-    int big = floor == 0 || floor == 2 || floor == 3 || floor == 4 || floor == 5 || floor == 6;
-    if (floor >= 16) snprintf(leaf, sizeof leaf, "physicality_tx");
-    else if (floor >= 0 && big) snprintf(leaf, sizeof leaf, "physicality_t%d_%x", floor, trunk.id.b[0] >> 4);
-    else if (floor >= 0) snprintf(leaf, sizeof leaf, "physicality_t%d", floor);
-    else snprintf(leaf, sizeof leaf, "physicality");
+    phy_leaf_name(leaf, sizeof leaf, &trunk.id);
     snprintf(psql, sizeof psql, "SELECT path, tier, mask FROM %s WHERE entity = ANY($1::blake3[])", leaf);
     PGresult *self = PQexecParams(pg, psql, 1, NULL, pv, pl, pf, 1);
     if (PQresultStatus(self) != PGRES_TUPLES_OK) {
@@ -523,29 +512,15 @@ static void on_search(int c, const char *body) {
         http(c, 500, b);
         return;
     }
-    /* Attestations of this ID and of every claim that holds it. One set, the claim index. */
+    /* Who said this ID and every claim that holds it: a walk up the containment from them (the engine's attested). */
     int nclaim = 0;
     for (int i = 0; i < nh; i++) nclaim += h[i].claim;
-    uint8_t *cb = malloc(20 + 20 * (size_t)(nclaim + 1));
     lp_id *cids = malloc(sizeof(lp_id) * (size_t)(nclaim + 1));
     int ncids = 0;
     cids[ncids++] = trunk.id;
     for (int i = 0; i < nh; i++) if (h[i].claim) cids[ncids++] = h[i].entity;
-    size_t cl = ids_param(cb, cids, (uint32_t)ncids);
-    const char *cv[1] = { (const char *)cb };
-    int cln[1] = { (int)cl }, cf[1] = { 1 };
-    PGresult *att = PQexecParams(pg,
-        "SELECT a.claim, a.witness, a.position, a.score, a.games, w.trust "
-        "FROM attestation a JOIN witness w ON w.id = a.witness WHERE a.claim = ANY($1::blake3[])",
-        1, NULL, cv, cln, cf, 1);
-    if (PQresultStatus(att) != PGRES_TUPLES_OK) {
-        char e[512], b[700];
-        json_esc(PQerrorMessage(pg), e, sizeof e);
-        snprintf(b, sizeof b, "{\"error\":\"attestation\",\"detail\":\"%s\"}", e);
-        PQclear(att); PQclear(self); free(cb); free(cids); holds_free(h, nh);
-        http(c, 500, b);
-        return;
-    }
+    int natt = 0;
+    Attested *att = attested(pg, cids, ncids, &natt, NULL);
     /* The trunk's path mixes tiers. Each constituent keeps its own tier. Tier 0 and tier 1
      * stay in the path. A constituent above them is read for what holds it. */
     Down *down = NULL;
@@ -588,31 +563,14 @@ static void on_search(int c, const char *body) {
         int n2 = 0;
         cids2[n2++] = down[i].id;
         for (int k = 0; k < down[i].nh; k++) if (down[i].h[k].claim) cids2[n2++] = down[i].h[k].entity;
-        uint8_t *bb = malloc(20 + 20 * (size_t)n2);
-        size_t bl = ids_param(bb, cids2, (uint32_t)n2);
-        const char *bv[1] = { (const char *)bb };
-        int bln[1] = { (int)bl }, bf[1] = { 1 };
-        down[i].att = PQexecParams(pg,
-            "SELECT a.claim, a.witness, a.position, a.score, a.games, w.trust "
-            "FROM attestation a JOIN witness w ON w.id = a.witness WHERE a.claim = ANY($1::blake3[])",
-            1, NULL, bv, bln, bf, 1);
-        free(bb);
+        down[i].att = attested(pg, cids2, n2, &down[i].natt, NULL);
         free(cids2);
-        if (PQresultStatus(down[i].att) != PGRES_TUPLES_OK) {
-            char e[512], b[700];
-            json_esc(PQerrorMessage(pg), e, sizeof e);
-            snprintf(b, sizeof b, "{\"error\":\"attestation\",\"detail\":\"%s\"}", e);
-            downs_free(down, ndown);
-            PQclear(att); PQclear(self); free(cb); free(cids); holds_free(h, nh);
-            http(c, 500, b);
-            return;
-        }
         uint8_t oneb[40];
         size_t onel = ids_param(oneb, &down[i].id, 1);
         const char *ov[1] = { (const char *)oneb };
         int ol[1] = { (int)onel }, of[1] = { 1 };
         char leaf[64], psql2[192];
-        phy_leaf_name(leaf, sizeof leaf, down[i].tier, &down[i].id);
+        phy_leaf_name(leaf, sizeof leaf, &down[i].id);
         snprintf(psql2, sizeof psql2, "SELECT path FROM %s WHERE entity = ANY($1::blake3[])", leaf);
         PGresult *pr = PQexecParams(pg, psql2, 1, NULL, ov, ol, of, 1);
         if (PQresultStatus(pr) == PGRES_TUPLES_OK && PQntuples(pr) > 0) {
@@ -708,27 +666,7 @@ static void on_search(int c, const char *body) {
         seen++;
     }
     buf_add(&out, &un, &ucap, "],\"attestations\":[", strlen("],\"attestations\":["));
-    for (int i = 0; i < PQntuples(att); i++) {
-        char claim[33], wit[33];
-        lp_id id;
-        memcpy(id.b, PQgetvalue(att, i, 0), 16);
-        hex_id(&id, claim);
-        memcpy(id.b, PQgetvalue(att, i, 1), 16);
-        hex_id(&id, wit);
-        int pos_null = PQgetisnull(att, i, 2);
-        int pos = pos_null ? 0 : (int)lp_be(PQgetvalue(att, i, 2), 4);
-        uint32_t sb = (uint32_t)lp_be(PQgetvalue(att, i, 3), 4);
-        float score;
-        memcpy(&score, &sb, 4);
-        int games = (int)lp_be(PQgetvalue(att, i, 4), 4);
-        double trust = lp_be_f64(PQgetvalue(att, i, 5));
-        if (pos_null) buf_fmt(&out, &un, &ucap,
-            "%s{\"claim\":\"%s\",\"witness\":\"%s\",\"position\":null,\"score\":%.6g,\"games\":%d,\"trust\":%.6g}",
-            i ? "," : "", claim, wit, score, games, trust);
-        else buf_fmt(&out, &un, &ucap,
-            "%s{\"claim\":\"%s\",\"witness\":\"%s\",\"position\":%d,\"score\":%.6g,\"games\":%d,\"trust\":%.6g}",
-            i ? "," : "", claim, wit, pos, score, games, trust);
-    }
+    emit_att_rows(&out, &un, &ucap, att, natt);
     buf_add(&out, &un, &ucap, "],\"constituents\":[", strlen("],\"constituents\":["));
     for (int i = 0; i < ndown; i++) {
         if (i) buf_add(&out, &un, &ucap, ",", 1);
@@ -736,8 +674,7 @@ static void on_search(int c, const char *body) {
     }
     buf_add(&out, &un, &ucap, "]}", 2);
     PQclear(self);
-    PQclear(att);
-    free(cb);
+    free(att);
     free(cids);
     free(order);
     free(conf);
