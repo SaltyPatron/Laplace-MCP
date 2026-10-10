@@ -10,7 +10,7 @@ Group=ahart
 # The machine's declaration, when it has one: LAPLACE_MCP_HOST, LAPLACE_MCP_PORT, LAPLACE_ENGINE or LAPLACE_BUILD,
 # LAPLACE_GRAMMARS, LAPLACE_CONNINFO. Unset: loopback, 5188 and the deployment target's paths.
 EnvironmentFile=-/etc/laplace/machine.env
-ExecStart=/repos/src/Laplace-MCP/native/lpm serve
+ExecStart=/repos/build/Laplace-MCP/icx-release/lpm serve
 Restart=on-failure
 RestartSec=2
 Environment="LAPLACE_CONNINFO=host=/tmp port=5432 user=laplace dbname=laplace"

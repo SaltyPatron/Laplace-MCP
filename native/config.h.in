@@ -1,0 +1,6 @@
+/* Where things are when the environment does not say: what this service was built with. */
+#define LPM_CONNINFO_DEFAULT "@LAPLACE_CONNINFO@"
+#define LPM_ENGINE_DEFAULT   "@LAPLACE_ENGINE@"
+#define LPM_GRAMMARS_DEFAULT "@LAPLACE_GRAMMARS@"
+#define LPM_HOST_DEFAULT     "@LAPLACE_MCP_HOST@"
+#define LPM_PORT_DEFAULT     @LAPLACE_MCP_PORT@

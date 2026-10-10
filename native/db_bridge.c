@@ -1,6 +1,7 @@
 /* The connection the engine's reader uses. holds_above lives in Laplace-Engine/src/read.c;
  * the service links that file and these symbols, and does not fork the laplace binary. */
 #include "engine.h"
+#include "lpm_config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +12,7 @@ static char noted_conn[8192];
 
 const char *laplace_db(void) {
     const char *v = getenv("LAPLACE_CONNINFO");
-    return v && *v ? v : "host=/tmp port=5432 user=laplace dbname=laplace";
+    return v && *v ? v : LPM_CONNINFO_DEFAULT;
 }
 const char *db_noted(void) { return noted_conn; }
 

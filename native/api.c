@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "api.h"
+#include "lpm_config.h"
 
 #include "laplace/laplace.h"
 
@@ -21,17 +22,14 @@ const lp_tier0_record *T0;
 static lp_text *TX;
 static PGconn *PG;
 
-static const char *CONN_DEFAULT = "host=/tmp port=5432 user=laplace dbname=laplace";
-/* The engine the routes run: LAPLACE_ENGINE, or the release build under LAPLACE_BUILD, or the deployment target's. */
-static const char *ENGINE = "/repos/build/Laplace-Engine/icx-release/laplace";
-static char ENGINE_BUF[1024];
+/* Where things are when the environment does not say: what this service was built with (lpm_config.h). */
+static const char *CONN_DEFAULT = LPM_CONNINFO_DEFAULT;
+/* The engine the routes run: LAPLACE_ENGINE, else the one this build was configured beside. */
+static const char *ENGINE = LPM_ENGINE_DEFAULT;
 
 static void engine_resolve(void) {
-    const char *e = getenv("LAPLACE_ENGINE"), *b = getenv("LAPLACE_BUILD");
-    if (e && *e) snprintf(ENGINE_BUF, sizeof ENGINE_BUF, "%s", e);
-    else if (b && *b) snprintf(ENGINE_BUF, sizeof ENGINE_BUF, "%s/Laplace-Engine/icx-release/laplace", b);
-    else return;
-    ENGINE = ENGINE_BUF;
+    const char *e = getenv("LAPLACE_ENGINE");
+    if (e && *e) ENGINE = e;
 }
 
 static uint64_t nsec(void) {

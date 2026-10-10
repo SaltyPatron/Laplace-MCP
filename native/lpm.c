@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "lpm.h"
+#include "lpm_config.h"
 
 #include "laplace/laplace.h"
 
@@ -346,9 +347,9 @@ static const TSLanguage *load_lang(const char *name) {
     static int nlang;
     for (int i = 0; i < nlang; i++) if (!strcmp(names[i], name)) return langs[i];
     char so[512], sym[96];
-    /* LAPLACE_GRAMMARS names the directory the compiled grammars are in; unset, the deployment target's. */
+    /* LAPLACE_GRAMMARS names the directory the compiled grammars are in; unset, the one this build was configured with. */
     const char *dir = getenv("LAPLACE_GRAMMARS");
-    snprintf(so, sizeof so, "%s/libtree-sitter-%s.so", dir && *dir ? dir : "/repos/build/grammars", name);
+    snprintf(so, sizeof so, "%s/libtree-sitter-%s.so", dir && *dir ? dir : LPM_GRAMMARS_DEFAULT, name);
     if (access(so, R_OK) != 0) return NULL;
     void *h = dlopen(so, RTLD_NOW | RTLD_LOCAL);
     if (!h) return NULL;

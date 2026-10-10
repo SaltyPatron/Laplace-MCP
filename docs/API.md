@@ -15,7 +15,7 @@ Nothing about the machine is compiled in but a default. The process reads, from 
 | `LAPLACE_ENGINE` | the engine program the routes run | `$LAPLACE_BUILD/Laplace-Engine/icx-release/laplace`, or `/repos/build/...` without `LAPLACE_BUILD` |
 | `LAPLACE_GRAMMARS` | the directory of compiled tree-sitter grammars | `/repos/build/grammars` |
 
-`native/Makefile` builds against `LAPLACE_SRC`, `LAPLACE_DEPSRC`, `LAPLACE_BUILD`, `LAPLACE_DEPS`, `LAPLACE_ICU_DIR` and `LAPLACE_PG_DIR`, with the deployment target's values as defaults.
+It is built as the engine is (`CMakeLists.txt`): Laplace-Native as part of it, with icx under the floating-point contract and laplace-math, and the engine's reader (`read.c`, `pg.c`) from `LAPLACE_ENGINE_SRC` (the engine's `src` beside this repository). The defaults in the table are what the build was configured with (`native/config.h.in`): the value in the environment at configure time, else the deployment target's.
 
 One process holds one database connection. `lpm serve` is that process. `laplace_mcp.py` is not.
 
