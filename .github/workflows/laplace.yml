@@ -1,3 +1,7 @@
+# Laplace-MCP on its runner: the service built with icx as the engine is, with Laplace-Native as part of it and the
+# engine's reader from Laplace-Engine (both checked out beside it), under Laplace-Operations' floating-point contract
+# (private: the secret LAPLACE_CHECKOUT, agents.sh's), and its own checks. The runner's environment (runner/.env, from
+# agents.sh) names its build root and the machine's dependencies, tier 0 and grammars.
 name: Laplace-MCP
 on:
   workflow_dispatch:
@@ -9,9 +13,24 @@ jobs:
     runs-on: [self-hosted, laplace, Laplace-MCP]
     steps:
       - uses: actions/checkout@v4
+        with: { path: Laplace-MCP }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/Laplace-Native", path: Laplace-Native }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", path: Laplace-Engine }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
       - name: build
-        run: make -C native
-      - name: check
         run: |
-          ./native/lpm check
-          ./native/lpm text 'Sherlock Holmes'
+          . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
+          export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native LAPLACE_OPERATIONS=$GITHUB_WORKSPACE/Laplace-Operations
+          export LAPLACE_ENGINE_SRC=$GITHUB_WORKSPACE/Laplace-Engine/src OMP_NUM_THREADS=$(nproc) MKL_NUM_THREADS=$(nproc)
+          cmake -S Laplace-MCP -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release"
+          echo "built against Laplace-Native $(git -C Laplace-Native rev-parse --short HEAD) and Laplace-Engine $(git -C Laplace-Engine rev-parse --short HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: checks
+        run: |
+          L=$LAPLACE_BUILD/Laplace-MCP/icx-release/lpm
+          [ -s "$LAPLACE_TIER0" ] || { echo "no tier 0 at $LAPLACE_TIER0 yet: the Operations deploy makes it"; exit 0; }
+          "$L" check
+          "$L" text 'Sherlock Holmes'

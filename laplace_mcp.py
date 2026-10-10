@@ -6,7 +6,8 @@ import json
 import os
 import sys
 
-_lib = ctypes.CDLL(os.path.join(os.path.dirname(os.path.abspath(__file__)), "native", "liblpm.so"))
+# liblpm.so from the build: LAPLACE_MCP_LIB names it; else the release build under LAPLACE_BUILD.
+_lib = ctypes.CDLL(os.environ.get("LAPLACE_MCP_LIB") or os.path.join(os.environ.get("LAPLACE_BUILD", "/repos/build"), "Laplace-MCP", "icx-release", "liblpm.so"))
 
 
 class Rec(ctypes.Structure):
