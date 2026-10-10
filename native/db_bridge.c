@@ -16,6 +16,12 @@ const char *laplace_db(void) {
 }
 const char *db_noted(void) { return noted_conn; }
 
+/* The engine's commands read under one exported snapshot (its main.c: db_read), which its pool takes when it opens.
+ * This process outlives any one read and its pool opens once, so it names none: each statement sees the database as it
+ * is when that statement begins, as this service has read since it was written. One world for a whole request needs
+ * the engine's pool to take a snapshot per read; it has no call for that yet. */
+const char *db_snapshot(void) { return NULL; }
+
 void *xrealloc(void *p, size_t n) {
     p = realloc(p, n ? n : 1);
     if (!p) { perror("realloc"); exit(1); }
