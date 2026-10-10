@@ -22,7 +22,17 @@ static lp_text *TX;
 static PGconn *PG;
 
 static const char *CONN_DEFAULT = "host=/tmp port=5432 user=laplace dbname=laplace";
+/* The engine the routes run: LAPLACE_ENGINE, or the release build under LAPLACE_BUILD, or the deployment target's. */
 static const char *ENGINE = "/repos/build/Laplace-Engine/icx-release/laplace";
+static char ENGINE_BUF[1024];
+
+static void engine_resolve(void) {
+    const char *e = getenv("LAPLACE_ENGINE"), *b = getenv("LAPLACE_BUILD");
+    if (e && *e) snprintf(ENGINE_BUF, sizeof ENGINE_BUF, "%s", e);
+    else if (b && *b) snprintf(ENGINE_BUF, sizeof ENGINE_BUF, "%s/Laplace-Engine/icx-release/laplace", b);
+    else return;
+    ENGINE = ENGINE_BUF;
+}
 
 static uint64_t nsec(void) {
     struct timespec ts;
@@ -1188,6 +1198,7 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
 }
 
 int api_serve(const char *host, int port) {
+    engine_resolve();
     T0 = lp_tier0_map(NULL);
     if (!T0) {
         fprintf(stderr, "tier 0 did not map\n");

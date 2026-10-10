@@ -288,8 +288,10 @@ static int cmd_fetch(int argc, char **argv) {
 }
 
 static int cmd_serve(int argc, char **argv) {
-    const char *host = argc > 0 ? argv[0] : "127.0.0.1";
-    int port = argc > 1 ? atoi(argv[1]) : 5188;
+    /* serve [HOST [PORT]]: an argument, else LAPLACE_MCP_HOST and LAPLACE_MCP_PORT, else loopback and 5188 */
+    const char *eh = getenv("LAPLACE_MCP_HOST"), *ep = getenv("LAPLACE_MCP_PORT");
+    const char *host = argc > 0 ? argv[0] : eh && *eh ? eh : "127.0.0.1";
+    int port = argc > 1 ? atoi(argv[1]) : ep && *ep ? atoi(ep) : 5188;
     return api_serve(host, port);
 }
 
