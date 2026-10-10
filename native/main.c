@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "lpm.h"
 #include "api.h"
+#include "lpm_config.h"
 
 #include "laplace/laplace.h"
 
@@ -91,8 +92,17 @@ static int cmd_check(void) {
     if (!found) return fail("search missed the admitted text");
     if (!strcmp(hits[0].path, "c.txt")) return fail("the unrelated note ranked first");
 
-    if (lpm_save(ix, "/tmp/lpm-check.records")) return fail("save");
-    Lpm *loaded = lpm_load("/tmp/lpm-check.records", NULL);
+    /* the records go to a file of this run's own and are removed: a name fixed in a shared directory is another user's
+       to keep, and a second user could then not write it */
+    const char *tmpdir = getenv("TMPDIR");
+    char records[1024];
+    snprintf(records, sizeof records, "%s/lpm-check.XXXXXX", tmpdir && *tmpdir ? tmpdir : "/tmp");
+    int rfd = mkstemp(records);
+    if (rfd < 0) return fail("no temporary file for the records");
+    close(rfd);
+    if (lpm_save(ix, records)) { unlink(records); return fail("save"); }
+    Lpm *loaded = lpm_load(records, NULL);
+    unlink(records);
     if (!loaded) return fail("load");
     LpmHit hits2[8];
     size_t n2 = lpm_search(loaded, "lp_text_decompose", 17, hits2, 8);
@@ -288,10 +298,10 @@ static int cmd_fetch(int argc, char **argv) {
 }
 
 static int cmd_serve(int argc, char **argv) {
-    /* serve [HOST [PORT]]: an argument, else LAPLACE_MCP_HOST and LAPLACE_MCP_PORT, else loopback and 5188 */
+    /* serve [HOST [PORT]]: an argument, else LAPLACE_MCP_HOST and LAPLACE_MCP_PORT, else what this build was configured with */
     const char *eh = getenv("LAPLACE_MCP_HOST"), *ep = getenv("LAPLACE_MCP_PORT");
-    const char *host = argc > 0 ? argv[0] : eh && *eh ? eh : "127.0.0.1";
-    int port = argc > 1 ? atoi(argv[1]) : ep && *ep ? atoi(ep) : 5188;
+    const char *host = argc > 0 ? argv[0] : eh && *eh ? eh : LPM_HOST_DEFAULT;
+    int port = argc > 1 ? atoi(argv[1]) : ep && *ep ? atoi(ep) : LPM_PORT_DEFAULT;
     return api_serve(host, port);
 }
 
