@@ -17,7 +17,7 @@ include(${LAPLACE_NATIVE}/cmake/LaplaceFlags.cmake)
 find_package(OpenMP REQUIRED)
 
 laplace_path(LAPLACE_ENGINE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../Laplace-Engine/src" "Laplace-Engine's sources: the reader this service links")
-foreach(f read.c pg.c engine.h)
+foreach(f read.c pg.c walk.c engine.h)
   if(NOT EXISTS "${LAPLACE_ENGINE_SRC}/${f}")
     message(FATAL_ERROR "LAPLACE_ENGINE_SRC: no ${f} at '${LAPLACE_ENGINE_SRC}'")
   endif()
@@ -59,7 +59,7 @@ target_compile_options(lpm_lib PRIVATE ${LP_C_FLAGS})
 target_link_libraries(lpm_lib PRIVATE laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime dl ${LP_SYSLIBS})
 
 # lpm: the commands and the service (serve).
-add_executable(lpm_program native/main.c native/api.c native/db_bridge.c ${LAPLACE_ENGINE_SRC}/read.c ${LAPLACE_ENGINE_SRC}/pg.c)
+add_executable(lpm_program native/main.c native/api.c native/db_bridge.c ${LAPLACE_ENGINE_SRC}/read.c ${LAPLACE_ENGINE_SRC}/pg.c ${LAPLACE_ENGINE_SRC}/walk.c)
 set_target_properties(lpm_program PROPERTIES OUTPUT_NAME lpm)
 target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_ENGINE_SRC} ${LAPLACE_NATIVE}/src
                            ${LAPLACE_BLAKE3_DIR} ${LAPLACE_ICU_DIR}/include ${LAPLACE_PG_DIR}/include)
