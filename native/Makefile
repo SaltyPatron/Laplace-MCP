@@ -24,8 +24,9 @@ liblpm.so: lpm.c lpm.h
 
 ENGINE_SRC := $(LAPLACE_SRC)/Laplace-Engine/src
 
-lpm: main.c api.c api.h liblpm.so lpm.h db_bridge.c $(ENGINE_SRC)/read.c
-	$(CC) $(CFLAGS) -fopenmp -I$(ENGINE_SRC) -o $@ main.c api.c db_bridge.c $(ENGINE_SRC)/read.c -L. -llpm $(LIBS) -L$(PG)/lib -lpq $(RPATH) -Wl,-rpath,'$$ORIGIN' -fopenmp
+# the engine's reader and the statement arguments it sends (read.c, pg.c), over this service's own connection (db_bridge.c)
+lpm: main.c api.c api.h liblpm.so lpm.h db_bridge.c $(ENGINE_SRC)/read.c $(ENGINE_SRC)/pg.c
+	$(CC) $(CFLAGS) -fopenmp -I$(ENGINE_SRC) -o $@ main.c api.c db_bridge.c $(ENGINE_SRC)/read.c $(ENGINE_SRC)/pg.c -L. -llpm $(LIBS) -L$(PG)/lib -lpq $(RPATH) -Wl,-rpath,'$$ORIGIN' -fopenmp
 
 clean:
 	rm -f liblpm.so lpm
