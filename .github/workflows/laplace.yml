@@ -1,3 +1,7 @@
+# Laplace-MCP on its runner: the service built against what this machine's deployment built (Laplace-Native's library
+# and the Engine's reader, under the machine's own LAPLACE_SRC and LAPLACE_BUILD), and its own checks. The runner's
+# environment (runner/.env, from agents.sh) names a build root of its own for what a runner builds; this service
+# builds nothing of Native's or the Engine's, so it reads the machine's declaration (laplace.env) for where they are.
 name: Laplace-MCP
 on:
   workflow_dispatch:
@@ -10,7 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: build
-        run: make -C native
+        run: |
+          unset LAPLACE_BUILD LAPLACE_WORK
+          . "${LAPLACE_OPERATIONS:-${LAPLACE_DEPSRC:-/repos/src}/Laplace-Operations}/laplace.env"
+          echo "against $LAPLACE_BUILD/Laplace-Native/icx-release and $LAPLACE_SRC/Laplace-Engine/src ($(git -C "$LAPLACE_SRC/Laplace-Engine" rev-parse --short HEAD 2>/dev/null))" | tee -a "$GITHUB_STEP_SUMMARY"
+          make -C native
       - name: check
         run: |
           ./native/lpm check
