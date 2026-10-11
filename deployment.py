@@ -17,14 +17,18 @@ def run(args, **kwargs):
 
 
 def digest(path):
+    value = hashlib.sha256()
     with Path(path).open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            value.update(block)
+    return value.hexdigest()
 
 
 def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
+        os.fchmod(stream.fileno(), 0o644)
         json.dump(value, stream, indent=2)
         stream.write('\n')
         name = stream.name
@@ -104,7 +108,7 @@ def package(config, output):
                 if '=>' in fields and len(fields) >= 3 and fields[2].startswith('/'):
                     dependency = Path(fields[2]).resolve()
                     if not dependency.is_relative_to(stage):
-                        dependencies[str(dependency)] = digest(dependency)
+                        dependencies[fields[2]] = digest(dependency)
         files = {str(p.relative_to(stage)): digest(p) for p in sorted(stage.rglob('*')) if p.is_file()}
         receipt = {'schema': 'laplace.modular-package/v1', 'revisions': revisions,
                    'files': files, 'host_dependencies': dependencies}
