@@ -98,8 +98,10 @@ def package(config, output):
                        LAPLACE_OPERATIONS=str(source / 'Laplace-Operations'),
                        LAPLACE_CONNINFO='', OMP_NUM_THREADS=str(config['threads']), MKL_NUM_THREADS='1')
     release_root = prefix / 'releases'
+    # Setup provisions a shared setgid prefix. Existing release directories may
+    # belong to the operator; a group-authorized runner can publish there but
+    # cannot chmod another user's directory. New directories inherit its group.
     release_root.mkdir(parents=True, exist_ok=True)
-    release_root.chmod(0o2775)
     # Native's paths/flags consume the selected Operations configuration. The caller
     # supplies the toolchain session; service processes never inherit that session.
     with tempfile.TemporaryDirectory(prefix='.package-', dir=release_root) as temporary:
