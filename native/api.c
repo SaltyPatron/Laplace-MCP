@@ -880,6 +880,7 @@ static int engine_run(char **av, char **outp, int *code, int timeout_s) {
         n += (size_t)r;
     }
     close(fds[0]);
+    buf[n] = '\0';
     if (timed) {
         kill(-pid, SIGTERM);
         snprintf(buf + n, cap - n, "\n[stopped after %d s]\n", timeout_s);
