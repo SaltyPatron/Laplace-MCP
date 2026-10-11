@@ -2,6 +2,14 @@
 
 HTTP service in front of Laplace. Callers send content or an ID. The process maps tier 0, names the entity, and calls the database. Callers are not linked to Postgres.
 
+For an installed service, use Laplace-Operations' `sudo ./setup.sh modular`
+(also included by its default setup on declared hosts). The installed unit is
+`laplace-modular-mcp.service`; its paths, identity and allocations come from the
+host's modular installation declaration. Operations calls `deployment.py` to package
+this service with its matching Engine and recipes, then verifies the candidate before
+replacing the active release. Runtime database connections are supplied at launch;
+they are never embedded in the package. The commands below are for development.
+
 ```
 . ../Laplace-Operations/laplace.env
 cmake -S . -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo
