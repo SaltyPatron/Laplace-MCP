@@ -75,11 +75,23 @@ def package(config, output):
     revisions = {}
     for repo in ('Laplace-MCP', 'Laplace-Engine', 'Laplace-Native', 'Laplace-Operations'):
         checkout = source / repo
-        if run(['git', '-C', checkout, 'status', '--porcelain'], capture_output=True).stdout.strip():
+        if run(['git', '-C', checkout, 'status', '--porcelain', '--untracked-files=no'], capture_output=True).stdout.strip():
             raise ValueError('Commit the selected source before packaging: ' + repo)
         revisions[repo] = run(['git', '-C', checkout, 'rev-parse', 'HEAD'], capture_output=True).stdout.strip()
-    build_identity = hashlib.sha256(json.dumps({'source': str(source.resolve()), 'revisions': revisions}, sort_keys=True).encode()).hexdigest()
+    build_identity = hashlib.sha256(json.dumps({'source': str(source.resolve()), 'builder': os.geteuid(), 'revisions': revisions}, sort_keys=True).encode()).hexdigest()
     build = build / build_identity
+    # Build exact Git trees. Untracked developer files and the old in-source
+    # serving binaries stay untouched and cannot enter the installed package.
+    snapshot = build / 'sources'
+    snapshot.mkdir(parents=True, exist_ok=True)
+    for repo, revision in revisions.items():
+        destination = snapshot / repo
+        if not destination.exists():
+            run(['git', 'clone', '--quiet', '--shared', '--no-checkout', source / repo, destination])
+            run(['git', '-C', destination, 'checkout', '--quiet', '--detach', revision])
+        if run(['git', '-C', destination, 'rev-parse', 'HEAD'], capture_output=True).stdout.strip() != revision or run(['git', '-C', destination, 'status', '--porcelain'], capture_output=True).stdout.strip():
+            raise ValueError('Build source snapshot was modified: ' + repo)
+    source = snapshot
     environment = dict(os.environ, LAPLACE_SRC=str(source), LAPLACE_BUILD=str(build),
                        LAPLACE_NATIVE=str(source / 'Laplace-Native'),
                        LAPLACE_ENGINE_SRC=str(source / 'Laplace-Engine/src'),
