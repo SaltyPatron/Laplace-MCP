@@ -115,7 +115,8 @@ def package(config, output):
             run(['cmake', '--build', tree, '--parallel', config['build_jobs']], env=environment)
             run(['cmake', '--install', tree, '--prefix', stage], env=environment)
         import shutil
-        shutil.copytree(source / 'Laplace-Engine/recipes', stage / 'share/recipes')
+        for directory in ('recipes', 'firmware'):
+            shutil.copytree(source / 'Laplace-Engine' / directory, stage / 'share' / directory)
         dependencies = {}
         for relative in ('bin/lpm', 'bin/laplace', 'lib/liblpm.so'):
             report = run(['ldd', stage / relative], capture_output=True).stdout
@@ -180,8 +181,21 @@ def verify_http(base):
         'params': {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': 'installation', 'version': '1'}}})
     if 'result' not in initialized or initialized['result'].get('serverInfo', {}).get('name') != 'laplace':
         raise ValueError('MCP initialization failed')
+    engine = {}
+    for operation, arguments in (
+        ('text', {'input': 'Sherlock Holmes'}),
+        ('hop', {'input': 'Sherlock Holmes'}),
+        ('translate', {'input': 'dog', 'from': 'en', 'to': 'de'}),
+        ('degrees', {'input': 'Sherlock Holmes', 'other': 'Sherlock Holmes'}),
+        ('pull', {'input': 'Sherlock Holmes'}),
+    ):
+        result = request(base, '/v1/' + operation, arguments)
+        if result.get('exit') != 0 or not isinstance(result.get('log'), str) or not result['log']:
+            raise ValueError('Installed Engine operation failed: ' + operation)
+        engine[operation] = {'exit': result['exit'], 'output_bytes': len(result['log'].encode())}
     return {'surface': 'passed', 'database_search': {k: len(search[k]) for k in ('physicality', 'claims', 'occurrences', 'attestations', 'constituents')},
-            'mcp_initialize': 'passed', 'scope': 'Installed protocol and selected native/database readback; no ingestion or whole-product capability claim'}
+            'mcp_initialize': 'passed', 'engine_operations': engine,
+            'scope': 'Installed protocol, Engine operations and selected native/database readback; no ingestion or whole-product capability claim'}
 
 
 def probe(config, release):
