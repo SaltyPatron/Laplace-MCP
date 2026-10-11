@@ -70,6 +70,7 @@ def runtime_environment(config, release):
 def package(config, output):
     if os.geteuid() == 0:
         raise ValueError('Build and package as the declared deployment operator, never root')
+    os.umask(0o002)
     source, build, prefix = (Path(config[k]) for k in ('source', 'build', 'prefix'))
     revisions = {}
     for repo in ('Laplace-MCP', 'Laplace-Engine', 'Laplace-Native', 'Laplace-Operations'):
@@ -77,6 +78,8 @@ def package(config, output):
         if run(['git', '-C', checkout, 'status', '--porcelain'], capture_output=True).stdout.strip():
             raise ValueError('Commit the selected source before packaging: ' + repo)
         revisions[repo] = run(['git', '-C', checkout, 'rev-parse', 'HEAD'], capture_output=True).stdout.strip()
+    build_identity = hashlib.sha256(json.dumps({'source': str(source.resolve()), 'revisions': revisions}, sort_keys=True).encode()).hexdigest()
+    build = build / build_identity
     environment = dict(os.environ, LAPLACE_SRC=str(source), LAPLACE_BUILD=str(build),
                        LAPLACE_NATIVE=str(source / 'Laplace-Native'),
                        LAPLACE_ENGINE_SRC=str(source / 'Laplace-Engine/src'),
@@ -84,6 +87,7 @@ def package(config, output):
                        LAPLACE_CONNINFO='', OMP_NUM_THREADS=str(config['threads']), MKL_NUM_THREADS='1')
     release_root = prefix / 'releases'
     release_root.mkdir(parents=True, exist_ok=True)
+    release_root.chmod(0o2775)
     # Native's paths/flags consume the selected Operations configuration. The caller
     # supplies the toolchain session; service processes never inherit that session.
     with tempfile.TemporaryDirectory(prefix='.package-', dir=release_root) as temporary:

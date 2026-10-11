@@ -31,6 +31,20 @@ jobs:
       - name: checks
         run: |
           L=$LAPLACE_BUILD/Laplace-MCP/icx-release/lpm
-          [ -s "$LAPLACE_TIER0" ] || { echo "no tier 0 at $LAPLACE_TIER0 yet: the Operations deploy makes it"; exit 0; }
+          [ -s "$LAPLACE_TIER0" ] || { echo "Required tier 0 is missing at $LAPLACE_TIER0; install prepared inputs before verification"; exit 1; }
           "$L" check
           "$L" text 'Sherlock Holmes'
+  deploy:
+    needs: mcp
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Deploy this exact revision through Operations
+        env:
+          GH_TOKEN: ${{ secrets.LAPLACE_CHECKOUT }}
+          OWNER: ${{ github.repository_owner }}
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: |
+          gh api "repos/$OWNER/Laplace-Operations/dispatches" -f event_type=main-merged \
+            -f "client_payload[repository]=$REPOSITORY" -f "client_payload[sha]=$REVISION"
