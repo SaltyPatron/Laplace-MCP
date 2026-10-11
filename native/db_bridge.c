@@ -33,7 +33,7 @@ PGconn *db_connect(const char *conninfo) {
     if (conninfo != noted_conn) snprintf(noted_conn, sizeof noted_conn, "%s", conninfo);
     PGconn *pg = PQconnectdb(conninfo);
     if (PQstatus(pg) != CONNECTION_OK) {
-        fprintf(stderr, "%s (LAPLACE_CONNINFO: %s)\n", PQerrorMessage(pg), conninfo);
+        fprintf(stderr, "Database connection failed: %s", PQerrorMessage(pg));
         exit(1);
     }
     PQclear(PQexec(pg, "SET client_min_messages = warning"));
