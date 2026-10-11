@@ -1,0 +1,29 @@
+[Unit]
+Description=Laplace modular MCP
+After=network-online.target {postgres_service}
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={user}
+Group={group}
+EnvironmentFile={environment_file}
+WorkingDirectory={state}
+ExecStart={executable} serve
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={state}
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -23,13 +23,9 @@ foreach(f read.c pg.c walk.c engine.h)
   endif()
 endforeach()
 
-# What the process uses when its environment does not say (native/config.h.in): each from the environment this is
-# configured in (laplace.env, the machine's declaration), else the deployment target's value.
-if(DEFINED ENV{LAPLACE_CONNINFO} AND NOT "$ENV{LAPLACE_CONNINFO}" STREQUAL "")
-  set(LAPLACE_CONNINFO "$ENV{LAPLACE_CONNINFO}" CACHE STRING "the database, as a libpq connection string" FORCE)
-else()
-  set(LAPLACE_CONNINFO "host=/tmp port=5432 user=laplace dbname=laplace" CACHE STRING "the database, as a libpq connection string")
-endif()
+# Connections belong to the installation, never the build cache or shipped binary.
+unset(LAPLACE_CONNINFO CACHE)
+set(LAPLACE_CONNINFO "")
 laplace_path(LAPLACE_BUILD "/repos/build" "build trees")
 laplace_path(LAPLACE_ENGINE "${LAPLACE_BUILD}/Laplace-Engine/icx-release/laplace" "the engine program the routes run")
 foreach(pair "LAPLACE_MCP_HOST=127.0.0.1" "LAPLACE_MCP_PORT=5188")
