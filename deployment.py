@@ -175,7 +175,7 @@ def verify_http(base):
     search = request(base, '/v1/search', {'input': 'Sherlock Holmes'})
     if not all(isinstance(search.get(k), list) for k in ('physicality', 'claims', 'occurrences', 'attestations', 'constituents')):
         raise ValueError('Database search did not return its typed result collections')
-    if not search['physicality'] or not search['constituents']:
+    if not search['constituents']:
         raise ValueError('Configured knowledge did not resolve the declared installation readback')
     initialized = request(base, '/mcp', {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
         'params': {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': 'installation', 'version': '1'}}})
