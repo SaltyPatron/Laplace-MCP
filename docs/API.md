@@ -19,6 +19,10 @@ It is built as the engine is (`CMakeLists.txt`): Laplace-Native as part of it, w
 
 One process holds one database connection. `lpm serve` is that process. `laplace_mcp.py` is not.
 
+## Who may call it
+
+`lpm serve` takes a bearer token: `LAPLACE_MCP_TOKEN`, or the `LAPLACE_MCP_TOKEN=` line of the file `LAPLACE_MCP_TOKEN_FILE` names. Without one of at least 32 characters and no whitespace it does not listen; it exits 2. Every request but `GET /health` sends `Authorization: Bearer <token>`; any other gets `401` with `WWW-Authenticate: Bearer` and `{"error":"unauthorized"}`, and nothing is dispatched. On hart-server setup makes the token once, in `/etc/laplace/secrets/modular-mcp.env` (root and `laplace-runner`, 0640), and the unit reads it. `lpm mcp` over stdio takes none: it is the calling user's own process.
+
 ## What a caller sends
 
 Jina's embedding API is `POST https://api.jina.ai/v1/embeddings` with a JSON body of `model` and `input` (a string or a list of strings, and for some models an image or a PDF). The response is a list of float vectors. See [Jina embeddings](https://jina.ai/embeddings/).
@@ -93,7 +97,7 @@ A proof file `/tmp/lpm-api-proof.txt`, one line `Sherlock Holmes kept his pipe o
 
 `GET /health` answers without the database.
 
-Served now: embeddings, rerank, code_search, reindex, code_where, sources, file_outline, recipe_plan, search, forward, shape, ingest, hop, text, translate, pull, degrees, surface, health. `hop`, `text`, `translate`, `pull` and `degrees` run the engine command of that name on `input` (`translate` also takes `from` and `to`; `degrees` takes `other`) and return its exit code and log.
+Served now: embeddings, rerank, code_search, reindex, code_where, code_callers, code_callees, sources, ingest_status, file_outline, recipe_plan, search, forward, shape, ingest, hop, text, translate, pull, degrees, surface, health. `hop`, `text`, `translate`, `pull` and `degrees` run the engine command of that name on `input` (`translate` also takes `from` and `to`; `degrees` takes `other`) and return its exit code and log.
 
 Engine commands that are not a route here: tier0, flags, highway, deploy, forget, sweep, index, structure, tree, turn, fills, status, bench, model; `sources` is read from the database rather than run. `hop` is the engine's program over the same container and claim reads search calls. `fills` in the engine is containers, then `lp_follows` for the exact run, then a parent walk through `laplace_fills`. `laplace_fills` by itself is that parent walk, so this service does not expose it as "what follows."
 
@@ -101,13 +105,14 @@ Specified past these routes, and not built as their own endpoints: turn, gaps, f
 
 ## MCP
 
-`POST /mcp` also speaks MCP JSON-RPC when the body contains `"jsonrpc"`. Tools: `embeddings`, `search`, `forward`, `shape`, `ingest`, `code_search`, `rerank`, `reindex`, `code_where`, `sources`, `file_outline`, `recipe_plan`, `hop`, `text`, `translate`, `pull`, `degrees`. `tools/list` gives each one's arguments.
+`POST /mcp` also speaks MCP JSON-RPC when the body contains `"jsonrpc"`. Tools: `embeddings`, `search`, `forward`, `shape`, `ingest`, `code_search`, `rerank`, `reindex`, `code_where`, `code_callers`, `code_callees`, `sources`, `ingest_status`, `file_outline`, `recipe_plan`, `hop`, `text`, `translate`, `pull`, `degrees`. `tools/list` gives each one's arguments.
 
 `~/.grok/config.toml` has:
 
 ```toml
 [mcp_servers.laplace]
 url = "http://127.0.0.1:5188/mcp"
+headers = { Authorization = "Bearer ${LAPLACE_MODULAR_MCP_TOKEN}" }
 ```
 
 `grok mcp doctor laplace` reported handshake OK, protocol 2025-11-25, 5 tools. A Grok process restricted to `laplace__search` called `search` on `Sherlock Holmes` and received the six containers and three claims. A session that was already open before `grok mcp add` does not gain the tool; `use_tool` in that session returns tool not found until a new session loads the config.
@@ -117,7 +122,7 @@ url = "http://127.0.0.1:5188/mcp"
 ```
 curl -skS --resolve hart-server:8443:127.0.0.1 \
   -X POST https://hart-server:8443/mcp \
-  -H 'Content-Type: application/json' \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer $LAPLACE_MODULAR_MCP_TOKEN" \
   -d '{"op":"search","input":"Sherlock Holmes"}'
 ```
 
@@ -184,12 +189,18 @@ On HART-DESKTOP the services are the llama.cpp servers on `127.0.0.1:8711` (code
 
 ## Code from the database
 
-`code_where` and `sources` read the database (`LAPLACE_CONNINFO`), not the local index: they answer for code a recipe source ingested, such as Laplace-Engine's `workspace-code`. Nothing is read from a working tree.
+`code_where`, `code_callers`, `code_callees`, `sources`, `ingest_status` and `file_outline` read the database (`LAPLACE_CONNINFO`), not the local index: they answer for code a recipe source ingested, such as Laplace-Engine's `workspace-code`. Nothing is read from a working tree.
 
 `code_where` takes `query` (required: a name, or any exact span of code), `path` (a substring the file's path must contain), `defines` (true: only files that define it), `limit` (files, default 20), `occurrences` (per file, default 3, at most 16) and `context` (bytes, default 120). It walks up the container index from the query's entity through every path that holds it to the files: a file is a trunk over its metadata and its content, and the walk stops there. Each hit has `path` (the file's pathname record), `file` (its trunk ID), `defines` (the declaration kinds the code recipe said of the name in that file, such as `function_definition` or `class_declaration`; files that define it come first), `occurrences` (how many places in its syntax tree hold it) and `at`: for each place, `line`, `context` (the innermost enclosing node of at least `context` bytes), `enclosing` (the first line of the outermost enclosing node under 8 KiB below the file, usually the declaration) with its span `line0`..`line1`, and `depth`. Lines are counted in the file's recorded content. The answer also has `files`, `nodes` and `levels` walked, and `cut` when the walk reached 400,000 nodes and stopped (a name as common as `return`).
 
 `sources` returns each witness in the database: `id`, `name` (the first part of its trunk) and `trust`.
 
 `file_outline` takes `path` (the end of a file's pathname, matched at a `/` boundary) or `file` (the file's ID, as `code_where` returns it). For each matching file (up to 16) it returns `path`, `file`, `bytes`, and `declarations`: the claims `[kind, name]` its code recipe said of it, in the order said, each with `line`, the first line at or after the previous declaration where `name` stands as a whole word. A C recipe says parameters as well as functions, so a C function's parameters follow it.
+
+`code_callers` takes `query` (required: a declared name), `path` (a substring the file's path must contain) and `limit` (callers, default 50). Each place `code_where` finds the name (a path up from it that is not a claim) is a chain of nodes below its file, each found where it stands in the file's recorded content. A node that starts on the line of a declaration in the file's outline, and holds that declaration's name in its first line before the place, is that declaration's node; the innermost one holds the place. `callers` lists those declarations: `name`, `kind`, `path`, `file`, `line` (the declaration's) and `at` (the lines of its uses). A place that no declaration holds is listed in `top_level` (`path`, `file`, `at`). A declaration's own name, its head, is not a use of it. Same-named declarations in different files are not told apart. The answer also has `files` and `cut`, as `code_where` has.
+
+`code_callees` takes `query` (required: a declared name) and `path` (a substring the defining file's path must contain). For each definition of the name (a file that defines it, at a line its outline gives), its code is the outermost node of the place's chain that starts on that line. `definitions` lists `path`, `file`, `kind`, `line0`..`line1` and `callees`: each name in that code followed by `(` that a code recipe declared, meaning a claim `[kind, name]` said by a file's record of claims, or, when that record would hold only the one claim, the claim said in its place as the record (the engine says a record of one claim as that claim). Each callee has `name`, `kind`, `declared_in` (how many files) and up to 4 `files` (`path`, `file`). `outside` lists the names it calls that nothing in the database declares, such as a library's or the language's.
+
+`ingest_status` takes `source` (optional: one source's name) and reads only. `sources` lists each witness with `id`, `name` (the first 200 bytes of its record), `trust`, `parts` (how many parts its trunk holds after its record) and `readings` (how many witnesses begin with the same record). More than one reading is a source read again without superseding its earlier reading (Laplace-Engine `supersede`). `activity` lists the database's sessions that are not idle, as `pg_stat_activity` shows them to this role: `pid`, `user`, `state`, `seconds` and `query` (200 bytes). `logs` lists the engine's per-source ingest logs from `LAPLACE_INGEST_LOGS`, else `$LAPLACE_WORK/logs/ingest`, newest first, at most 20: `source`, `modified` (UTC), `bytes` and `last` (the last line). It is `null` when neither directory is set or readable.
 
 `recipe_plan` takes `input` (optional: a source name or a path) and returns `exit` and `log` from `laplace ingest --plan`: which recipe reads which files, with nothing read into the database. Without `input` it plans every source in order.

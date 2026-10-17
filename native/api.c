@@ -111,7 +111,7 @@ static void http(int c, int code, const char *body) {
         stdio_body = strdup(body ? body : "");
         return;
     }
-    const char *why = code == 200 ? "OK" : code == 202 ? "Accepted" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : "Error";
+    const char *why = code == 200 ? "OK" : code == 202 ? "Accepted" : code == 400 ? "Bad Request" : code == 401 ? "Unauthorized" : code == 404 ? "Not Found" : "Error";
     char hdr[256];
     int n = snprintf(hdr, sizeof hdr,
                      "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
@@ -1709,7 +1709,10 @@ static const char *SURFACE =
     "{\"method\":\"POST\",\"path\":\"/v1/ingest\",\"body\":\"{\\\"path\\\":\\\"/absolute/path\\\"}\",\"does\":\"laplace ingest: decompose, deduplicate, record, attest\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/code_where\",\"body\":\"{\\\"query\\\":\\\"name or span\\\",\\\"path\\\":\\\"optional\\\",\\\"defines\\\":true}\",\"does\":\"where a name or span of code stands in the code the database holds, read off the containment above it\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/file_outline\",\"body\":\"{\\\"path\\\":\\\"end of a pathname\\\"} or {\\\"file\\\":\\\"32 hex\\\"}\",\"does\":\"the claims [kind, name] a code recipe said of a file, in order, with lines\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/code_callers\",\"body\":\"{\\\"query\\\":\\\"declared name\\\",\\\"path\\\":\\\"optional\\\"}\",\"does\":\"the declarations whose code uses a name, with the lines\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/code_callees\",\"body\":\"{\\\"query\\\":\\\"declared name\\\",\\\"path\\\":\\\"optional\\\"}\",\"does\":\"what a declaration calls that a code recipe declared, and where\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/sources\",\"does\":\"the witnesses the database holds\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/ingest_status\",\"body\":\"{\\\"source\\\":\\\"optional\\\"}\",\"does\":\"each witness with its parts and readings, the database's busy sessions, the ingest logs\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/recipe_plan\",\"body\":\"{\\\"input\\\":\\\"optional source or path\\\"}\",\"does\":\"laplace ingest --plan\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/hop\",\"body\":\"{\\\"input\\\":\\\"text\\\"}\",\"does\":\"laplace hop\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/text\",\"body\":\"{\\\"input\\\":\\\"32 hex\\\"}\",\"does\":\"laplace text\"},"
@@ -1718,7 +1721,7 @@ static const char *SURFACE =
     "{\"method\":\"POST\",\"path\":\"/v1/degrees\",\"body\":\"{\\\"input\\\":\\\"text\\\",\\\"other\\\":\\\"text\\\"}\",\"does\":\"laplace degrees\"},"
     "{\"method\":\"GET\",\"path\":\"/v1/surface\"},"
     "{\"method\":\"GET\",\"path\":\"/health\"},"
-    "{\"method\":\"POST\",\"path\":\"/mcp\",\"body\":\"JSON-RPC 2.0 MCP or op: embeddings|rerank|code_search|reindex|code_where|sources|file_outline|recipe_plan|search|forward|shape|frechet|ingest|hop|text|translate|degrees|pull|surface\"}"
+    "{\"method\":\"POST\",\"path\":\"/mcp\",\"body\":\"JSON-RPC 2.0 MCP or op: embeddings|rerank|code_search|reindex|code_where|code_callers|code_callees|sources|ingest_status|file_outline|recipe_plan|search|forward|shape|frechet|ingest|hop|text|translate|degrees|pull|surface\"}"
     "],"
     "\"database_functions\":[\"laplace_containers\",\"laplace_claims\",\"laplace_claims_each\",\"laplace_text\",\"laplace_fills\",\"laplace_forward\",\"laplace_frechet4d\",\"laplace_dtw4d\",\"laplace_edr4d\",\"laplace_distance4d\",\"laplace_couple\",\"laplace_follows\",\"laplace_paths\",\"laplace_attested\",\"laplace_compose\",\"laplace_parts\"],"
     "\"engine_commands\":[\"tier0\",\"flags\",\"highway\",\"deploy\",\"sources\",\"ingest\",\"forget\",\"sweep\",\"index\",\"structure\",\"tree\",\"text\",\"pull\",\"turn\",\"hop\",\"translate\",\"degrees\",\"fills\",\"status\",\"bench\",\"model\"]}";
@@ -1903,6 +1906,62 @@ static size_t fo_vertices(PGconn *pg, const lp_id *id, lp_vertex *out, size_t ca
     return n;
 }
 static int fo_word(char c) { return isalnum((unsigned char)c) || c == '_' || (unsigned char)c >= 0x80; }
+/* One file's outline: its recorded text (every part but the OS's record and what is said of the file) and the claims
+ * [kind, name] said of it, in the file's order, each at the first line at or after the one before it where its name
+ * stands as a word in that text (line 0: it does not). file_outline answers it; code_callers and code_callees read it. */
+typedef struct { char *kind, *name; size_t line; } FoDecl;
+static void fo_free(FoDecl *d, size_t n) {
+    for (size_t k = 0; k < n; k++) { free(d[k].kind); free(d[k].name); }
+    free(d);
+}
+static size_t fo_outline(PGconn *pg, Reader *rd, const lp_id *file, FoDecl **declp, char **textp, size_t *tnp) {
+    static lp_vertex fv[4096], rv[4096];
+    size_t nv = fo_vertices(pg, file, fv, 4096);
+    /* the recorded text: every part but the OS's record and what is said of the file */
+    size_t tn = 0, tcap = 1 << 16;
+    char *text = malloc(tcap);
+    text[0] = 0;
+    lp_vec(lp_id) claims = { 0 };
+    for (size_t v = 0; v < nv; v++) {
+        uint32_t sd = fv[v].said;
+        if (sd == LP_SAID_METADATA) continue;
+        if (sd == LP_SAID_RECORD || sd == LP_SAID_CLAIM) {
+            size_t nr = sd == LP_SAID_RECORD ? fo_vertices(pg, &fv[v].id, rv, 4096) : 0;
+            int has = 0;
+            for (size_t k = 0; k < nr; k++) if (rv[k].said == LP_SAID_CLAIM) { has = 1; lp_push(&claims, rv[k].id); }
+            if (!has) lp_push(&claims, fv[v].id);      /* a claim said alone: its own record */
+            continue;
+        }
+        for (uint32_t k = 0; k < (fv[v].run ? fv[v].run : 1); k++) {
+            char *t = reader_text(rd, &fv[v].id, (size_t)8 << 20);
+            size_t l = strlen(t);
+            if (tn + l + 1 > tcap) { while (tn + l + 1 > tcap) tcap *= 2; text = realloc(text, tcap); }
+            memcpy(text + tn, t, l + 1);
+            tn += l;
+            free(t);
+        }
+    }
+    FoDecl *dl = NULL;
+    size_t nd = 0, at = 0, line = 1;
+    for (size_t k = 0; k < claims.n; k++) {
+        lp_id two[4];
+        if (reader_parts(rd, &claims.v[k], two, 4) != 2) continue;
+        char *kind = reader_text(rd, &two[0], 120), *name = reader_text(rd, &two[1], 400);
+        size_t nl = strlen(name), found = 0, fl = 0;
+        for (size_t p = at, ln = line; nl && p + nl <= tn; p++) {
+            if (p > at && text[p - 1] == '\n') ln++;
+            if (!memcmp(text + p, name, nl) && (p == 0 || !fo_word(text[p - 1])) && !fo_word(text[p + nl])) { found = p + 1; fl = ln; break; }
+        }
+        dl = realloc(dl, (nd + 1) * sizeof *dl);
+        dl[nd++] = (FoDecl){ kind, name, found ? fl : 0 };
+        if (found) { at = found - 1; line = fl; }
+    }
+    lp_vec_free(&claims);
+    *declp = dl;
+    *textp = text;
+    *tnp = tn;
+    return nd;
+}
 static void on_file_outline(int c, const char *body) {
     char want[2048] = "", fid[64] = "";
     jstr(body, "path", want, sizeof want);
@@ -1964,63 +2023,26 @@ static void on_file_outline(int c, const char *body) {
     char *out = NULL;
     size_t on = 0, ocap = 0;
     buf_fmt(&out, &on, &ocap, "{\"database\":\"%s\",\"files\":[", PQdb(pg));
-    static lp_vertex fv[4096], rv[4096];
     for (size_t f = 0; f < files.n && f < 16; f++) {
-        size_t nv = fo_vertices(pg, &files.v[f], fv, 4096);
-        /* the recorded text: every part but the OS's record and what is said of the file */
-        size_t tn = 0, tcap = 1 << 16;
-        char *text = malloc(tcap);
-        text[0] = 0;
-        lp_vec(lp_id) claims = { 0 };
-        for (size_t v = 0; v < nv; v++) {
-            uint32_t sd = fv[v].said;
-            if (sd == LP_SAID_METADATA) continue;
-            if (sd == LP_SAID_RECORD || sd == LP_SAID_CLAIM) {
-                size_t nr = sd == LP_SAID_RECORD ? fo_vertices(pg, &fv[v].id, rv, 4096) : 0;
-                int has = 0;
-                for (size_t k = 0; k < nr; k++) if (rv[k].said == LP_SAID_CLAIM) { has = 1; lp_push(&claims, rv[k].id); }
-                if (!has) lp_push(&claims, fv[v].id);      /* a claim said alone: its own record */
-                continue;
-            }
-            for (uint32_t k = 0; k < (fv[v].run ? fv[v].run : 1); k++) {
-                char *t = reader_text(rd, &fv[v].id, (size_t)8 << 20);
-                size_t l = strlen(t);
-                if (tn + l + 1 > tcap) { while (tn + l + 1 > tcap) tcap *= 2; text = realloc(text, tcap); }
-                memcpy(text + tn, t, l + 1);
-                tn += l;
-                free(t);
-            }
-        }
+        FoDecl *dl = NULL;
+        char *text = NULL;
+        size_t tn = 0, nd = fo_outline(pg, rd, &files.v[f], &dl, &text, &tn);
         char *path = cw_file_name(rd, &files.v[f]), pe[8192], fh[33];
         json_esc(path, pe, sizeof pe);
         hex_id(&files.v[f], fh);
         buf_fmt(&out, &on, &ocap, "%s{\"path\":\"%s\",\"file\":\"%s\",\"bytes\":%zu,\"declarations\":[", f ? "," : "", pe, fh, tn);
         free(path);
-        size_t at = 0, line = 1, shown = 0;
-        for (size_t k = 0; k < claims.n; k++) {
-            lp_id two[4];
-            if (reader_parts(rd, &claims.v[k], two, 4) != 2) continue;
-            char *kind = reader_text(rd, &two[0], 120), *name = reader_text(rd, &two[1], 400);
-            size_t nl = strlen(name), found = 0, fl = 0;
-            for (size_t p = at, ln = line; nl && p + nl <= tn; p++) {
-                if (p > at && text[p - 1] == '\n') ln++;
-                if (!memcmp(text + p, name, nl) && (p == 0 || !fo_word(text[p - 1])) && !fo_word(text[p + nl])) { found = p + 1; fl = ln; break; }
-            }
-            char ke[300], ne[900];
-            json_esc(kind, ke, sizeof ke);
-            json_esc(name, ne, sizeof ne);
-            buf_fmt(&out, &on, &ocap, "%s{\"kind\":\"%s\",\"name\":\"%s\"", shown ? "," : "", ke, ne);
-            if (found) {
-                buf_fmt(&out, &on, &ocap, ",\"line\":%zu", fl);
-                at = found - 1; line = fl;
-            }
+        for (size_t k = 0; k < nd; k++) {
+            buf_add(&out, &on, &ocap, k ? ",{\"kind\":\"" : "{\"kind\":\"", k ? 10 : 9);
+            cw_str(&out, &on, &ocap, dl[k].kind);
+            buf_add(&out, &on, &ocap, "\",\"name\":\"", 10);
+            cw_str(&out, &on, &ocap, dl[k].name);
+            buf_add(&out, &on, &ocap, "\"", 1);
+            if (dl[k].line) buf_fmt(&out, &on, &ocap, ",\"line\":%zu", dl[k].line);
             buf_add(&out, &on, &ocap, "}", 1);
-            shown++;
-            free(kind);
-            free(name);
         }
         buf_add(&out, &on, &ocap, "]}", 2);
-        lp_vec_free(&claims);
+        fo_free(dl, nd);
         free(text);
     }
     buf_fmt(&out, &on, &ocap, "],\"ms\":%.3f}", (double)(nsec() - t0) / 1e6);
@@ -2207,7 +2229,557 @@ static void on_code_where(int c, const char *body) {    char name[2048];
     http(c, 200, out ? out : "{\"error\":\"memory\"}");
     free(out);
 }
-/* The sources the database holds: each witness, its name (the first part of its trunk, the record its source file
+/* ---- code_callers and code_callees (Laplace-MCP#27), read off the same containment code_where walks. A place the
+ * name stands (a path up from it that is not a claim) is a chain of nodes below its file, each where it stands in the
+ * file's recorded text. A node that starts on a declaration's line of the file's outline and holds that declaration's
+ * name in its first line, before the place, is that declaration's node: the innermost one is what holds the place. */
+static const char *cc_word(const char *base, const char *from, const char *end, const char *name) {
+    size_t nl = strlen(name);
+    for (const char *p = from; nl && p + nl <= end; p++)
+        if (!memcmp(p, name, nl) && (p == base || !fo_word(p[-1])) && !fo_word(p[nl])) return p;
+    return NULL;
+}
+typedef struct { const char *at; size_t len; long line; } CcNode;
+static size_t cc_nodes(const CwDag *d, Reader *rd, const CwPath *pp, const char *whole, CcNode *o, size_t cap) {
+    size_t n = 0;
+    const char *from = whole, *end = whole + strlen(whole);
+    for (size_t z = 2; z + 1 < pp->len && n < cap; z++) {
+        char *tx = reader_text(rd, &d->n[pp->n[z]].id, (size_t)8 << 20);
+        size_t l = strlen(tx);
+        const char *q = l ? strstr(from, tx) : NULL;
+        free(tx);
+        if (!q || q + l > end) continue;
+        o[n++] = (CcNode){ q, l, (long)cw_lines(whole, (size_t)(q - whole)) };
+        from = q;
+        end = q + l;
+    }
+    return n;
+}
+/* The place itself: the name where it stands as a word in the innermost node. */
+static const char *cc_place(const char *whole, const CcNode *o, size_t n, const char *name) {
+    const char *nm = cc_word(whole, o[n - 1].at, o[n - 1].at + o[n - 1].len, name);
+    return nm ? nm : o[n - 1].at;
+}
+/* The declaration (outline index) whose node holds the place, -1 when none does; *head: the place is that
+ * declaration's own name. */
+static long cc_holder(const char *whole, const CcNode *o, size_t n, const FoDecl *dl, size_t nd, const char *nm, int *head) {
+    long caller = -1;
+    *head = 0;
+    for (size_t k = 0; k < n; k++) {
+        size_t hl = strcspn(o[k].at, "\n");
+        if (hl > o[k].len) hl = o[k].len;
+        for (size_t q = 0; q < nd; q++) {
+            if ((long)dl[q].line != o[k].line) continue;
+            const char *w = cc_word(whole, o[k].at, o[k].at + hl, dl[q].name);
+            if (w && w <= nm) { caller = (long)q; *head = w == nm; break; }
+        }
+    }
+    return caller;
+}
+static PGconn *cc_db(int c) {
+    PGconn *pg = db();
+    if (!pg) {
+        char e[512], b[640];
+        json_esc(PQerrorMessage(PG), e, sizeof e);
+        snprintf(b, sizeof b, "{\"error\":\"database\",\"detail\":\"%s\"}", e);
+        http(c, 503, b);
+    }
+    return pg;
+}
+typedef struct { int n; long l[16]; } CcLines;
+static void cc_line(CcLines *cl, long line) {
+    for (int z = 0; z < cl->n; z++) if (cl->l[z] == line) return;
+    if (cl->n < 16) cl->l[cl->n++] = line;
+}
+static void cc_lines_json(char **out, size_t *on, size_t *ocap, const CcLines *cl) {
+    buf_fmt(out, on, ocap, "\"at\":[");
+    for (int z = 0; z < cl->n; z++) buf_fmt(out, on, ocap, "%s%ld", z ? "," : "", cl->l[z]);
+    buf_fmt(out, on, ocap, "]");
+}
+
+/* code_callers: the declarations whose code uses the name, each with the lines it does at; a use outside every
+ * declaration is its file's top level. A declaration's own name (its head) is not a use of it. */
+static void on_code_callers(int c, const char *body) {
+    char name[2048] = "", under[512] = "";
+    jstr(body, "query", name, sizeof name);         /* "query", as code_where's: an MCP call's body names its tool "name" */
+    if (!name[0]) { http(c, 400, "{\"error\":\"query\"}"); return; }
+    jstr(body, "path", under, sizeof under);
+    int limit = 50;
+    jint(body, "limit", &limit);
+    if (limit < 1) limit = 1;
+    if (limit > 500) limit = 500;
+    lp_ref trunk, parts[256];
+    size_t np = 0;
+    if (!name_entity(name, &trunk, parts, 256, &np)) { http(c, 500, "{\"error\":\"tier0\"}"); return; }
+    PGconn *pg = cc_db(c);
+    if (!pg) return;
+    uint64_t t0 = nsec();
+    CwDag d = { 0 };
+    int levels = 0, cut = 0;
+    cw_walk(&trunk.id, &d, 400000, &levels, &cut);
+    Reader *rd = reader_new(pg);
+    CwPath *paths = malloc(sizeof(CwPath) * 32), cur;
+    CcNode *nodes = malloc(sizeof(CcNode) * 160);
+    char *out = NULL, *top = NULL;
+    size_t on = 0, ocap = 0, tn = 0, tcap = 0, files = 0;
+    buf_fmt(&out, &on, &ocap, "{\"name\":\"");
+    cw_str(&out, &on, &ocap, name);
+    buf_fmt(&out, &on, &ocap, "\",\"database\":\"%s\",\"callers\":[", PQdb(pg));
+    int shown = 0, ntop = 0;
+    for (size_t i = 0; i < d.nn && shown < limit; i++) {
+        if (!d.n[i].file) continue;
+        char *path = cw_file_name(rd, &d.n[i].id);
+        if (under[0] && !strstr(path, under)) { free(path); continue; }
+        size_t npth = 0, steps = 0;
+        cur.len = 0;
+        cw_paths(&d, i, &cur, paths, &npth, 32, &steps);
+        FoDecl *dl = NULL;
+        char *text = NULL, *whole = NULL;
+        size_t tl = 0, nd = 0;
+        CcLines *by = NULL, alone = { 0 };
+        for (size_t k = 0; k < npth; k++) {
+            if (paths[k].len < 3 || d.n[paths[k].n[paths[k].len - 2]].claim) continue;
+            if (!whole) {
+                whole = reader_text(rd, &d.n[paths[k].n[1]].id, (size_t)8 << 20);
+                nd = fo_outline(pg, rd, &d.n[i].id, &dl, &text, &tl);
+                by = calloc(nd + 1, sizeof *by);
+            }
+            size_t nn = cc_nodes(&d, rd, &paths[k], whole, nodes, 160);
+            if (!nn) continue;
+            const char *nm = cc_place(whole, nodes, nn, name);
+            int head = 0;
+            long q = cc_holder(whole, nodes, nn, dl, nd, nm, &head);
+            if (head) continue;
+            cc_line(q >= 0 ? &by[q] : &alone, (long)cw_lines(whole, (size_t)(nm - whole)));
+        }
+        char fh[33];
+        hex_id(&d.n[i].id, fh);
+        int any = 0;
+        for (size_t q = 0; q < nd && shown < limit; q++) {
+            if (!by[q].n) continue;
+            buf_fmt(&out, &on, &ocap, "%s{\"name\":\"", shown ? "," : "");
+            cw_str(&out, &on, &ocap, dl[q].name);
+            buf_fmt(&out, &on, &ocap, "\",\"kind\":\"");
+            cw_str(&out, &on, &ocap, dl[q].kind);
+            buf_fmt(&out, &on, &ocap, "\",\"path\":\"");
+            cw_str(&out, &on, &ocap, path);
+            buf_fmt(&out, &on, &ocap, "\",\"file\":\"%s\",\"line\":%zu,", fh, dl[q].line);
+            cc_lines_json(&out, &on, &ocap, &by[q]);
+            buf_fmt(&out, &on, &ocap, "}");
+            shown++;
+            any = 1;
+        }
+        if (alone.n) {
+            buf_fmt(&top, &tn, &tcap, "%s{\"path\":\"", ntop ? "," : "");
+            cw_str(&top, &tn, &tcap, path);
+            buf_fmt(&top, &tn, &tcap, "\",\"file\":\"%s\",", fh);
+            cc_lines_json(&top, &tn, &tcap, &alone);
+            buf_fmt(&top, &tn, &tcap, "}");
+            ntop++;
+        }
+        if (any || alone.n) files++;
+        free(by);
+        fo_free(dl, nd);
+        free(text);
+        free(whole);
+        free(path);
+    }
+    buf_fmt(&out, &on, &ocap, "],\"top_level\":[");
+    if (top) buf_add(&out, &on, &ocap, top, tn);
+    buf_fmt(&out, &on, &ocap, "],\"files\":%zu,\"shown\":%d,\"cut\":%s,\"ms\":%.3f}", files, shown, cut ? "true" : "false", (double)(nsec() - t0) / 1e6);
+    free(top);
+    free(nodes);
+    free(paths);
+    reader_free(rd);
+    lp_idmap_free(d.m);
+    free(d.n);
+    http(c, 200, out ? out : "{\"error\":\"memory\"}");
+    free(out);
+}
+
+/* code_callees: what a declaration calls. Its code is its node (the outermost node starting on the line of a
+ * declaration of the name in a file's outline that holds the name there). A callee is a name in that code followed by
+ * "(" that a code recipe declared in a file the database holds: a claim [kind, name] said by that file's record of
+ * claims, or as its one record; each with its kind and up to 4 of those files. A name called that nothing declares
+ * (a library's, a language's) is listed apart, in outside. */
+typedef struct { char *name, *kind; lp_id file[4]; int nfile, total; } CeCand;
+static void ce_file(CeCand *x, const char *kind, const lp_id *file) {
+    if (!x->kind) x->kind = strdup(kind);
+    for (int k = 0; k < x->nfile; k++) if (!memcmp(x->file[k].b, file->b, 16)) return;
+    x->total++;
+    if (x->nfile < 4) x->file[x->nfile++] = *file;
+}
+typedef struct { size_t rec, claim; } CePair;
+static void on_code_callees(int c, const char *body) {
+    char name[2048] = "", under[512] = "";
+    jstr(body, "query", name, sizeof name);         /* "query", as code_where's: an MCP call's body names its tool "name" */
+    if (!name[0]) { http(c, 400, "{\"error\":\"query\"}"); return; }
+    jstr(body, "path", under, sizeof under);
+    lp_ref trunk, parts[256];
+    size_t np = 0;
+    if (!name_entity(name, &trunk, parts, 256, &np)) { http(c, 500, "{\"error\":\"tier0\"}"); return; }
+    PGconn *pg = cc_db(c);
+    if (!pg) return;
+    uint64_t t0 = nsec();
+    CwDag d = { 0 };
+    int levels = 0, cut = 0;
+    cw_walk(&trunk.id, &d, 400000, &levels, &cut);
+    Reader *rd = reader_new(pg);
+    CwPath *paths = malloc(sizeof(CwPath) * 32), cur;
+    CcNode *nodes = malloc(sizeof(CcNode) * 160);
+    /* the definitions: each its file, its outline entry and its code; the names each calls, by candidate index */
+    typedef struct { size_t node; char *path, *kind; size_t line; long line1; lp_vec(size_t) calls; } CeDef;
+    CeDef defs[16];
+    size_t ndef = 0;
+    lp_idmap *cand = lp_idmap_new();
+    lp_vec(CeCand) cs = { 0 };
+    for (size_t i = 0; i < d.nn && ndef < 16; i++) {
+        if (!d.n[i].file) continue;
+        size_t npth = 0, steps = 0;
+        cur.len = 0;
+        cw_paths(&d, i, &cur, paths, &npth, 32, &steps);
+        int def = 0;
+        for (size_t k = 0; k < npth; k++) if (paths[k].len >= 2 && d.n[paths[k].n[paths[k].len - 2]].claim) def = 1;
+        if (!def) continue;
+        char *path = cw_file_name(rd, &d.n[i].id);
+        if (under[0] && !strstr(path, under)) { free(path); continue; }
+        FoDecl *dl = NULL;
+        char *text = NULL, *whole = NULL;
+        size_t tl = 0, nd = fo_outline(pg, rd, &d.n[i].id, &dl, &text, &tl);
+        const char *seen[16];
+        size_t nseen = 0;
+        for (size_t k = 0; k < npth && ndef < 16; k++) {
+            if (paths[k].len < 3 || d.n[paths[k].n[paths[k].len - 2]].claim) continue;
+            if (!whole) whole = reader_text(rd, &d.n[paths[k].n[1]].id, (size_t)8 << 20);
+            size_t nn = cc_nodes(&d, rd, &paths[k], whole, nodes, 160);
+            if (!nn) continue;
+            const char *nm = cc_place(whole, nodes, nn, name);
+            long nl = (long)cw_lines(whole, (size_t)(nm - whole));
+            long q = -1;
+            for (size_t z = 0; z < nd; z++) if ((long)dl[z].line == nl && !strcmp(dl[z].name, name)) { q = (long)z; break; }
+            if (q < 0) continue;
+            size_t k0 = nn;
+            for (size_t z = 0; z < nn; z++) if (nodes[z].line == nl) { k0 = z; break; }
+            if (k0 == nn) continue;
+            const char *s = nodes[k0].at, *e = s + nodes[k0].len;
+            int dup = 0;
+            for (size_t z = 0; z < nseen; z++) if (seen[z] == s) dup = 1;
+            if (dup || nseen == 16) continue;
+            seen[nseen++] = s;
+            CeDef *df = &defs[ndef++];
+            memset(df, 0, sizeof *df);
+            df->node = i;
+            df->path = strdup(path);
+            df->kind = strdup(dl[q].kind);
+            df->line = dl[q].line;
+            df->line1 = (long)cw_lines(whole, (size_t)(e - whole)) - (e > s && e[-1] == '\n');
+            for (const char *p = s; p < e; p++) {          /* each name followed by "(" */
+                if (!(isalpha((unsigned char)*p) || *p == '_' || (unsigned char)*p >= 0x80) || (p > whole && fo_word(p[-1]))) continue;
+                const char *w = p;
+                while (p < e && fo_word(*p)) p++;
+                const char *a = p;
+                while (a < e && (*a == ' ' || *a == '\t' || *a == '\r' || *a == '\n')) a++;
+                if (a >= e || *a != '(') { p--; continue; }
+                size_t wl = (size_t)(p - w);
+                p--;
+                if (wl >= 256 || (wl == strlen(name) && !memcmp(w, name, wl))) continue;
+                char tok[256];
+                memcpy(tok, w, wl);
+                tok[wl] = 0;
+                lp_ref tr, tp[256];
+                size_t tnp = 0;
+                if (!name_entity(tok, &tr, tp, 256, &tnp)) continue;
+                bool fresh;
+                size_t ci = lp_idmap_put(cand, &tr.id, &fresh);
+                if (fresh) { CeCand x = { 0 }; x.name = strdup(tok); lp_push(&cs, x); }
+                int have = 0;
+                for (size_t z = 0; z < df->calls.n; z++) if (df->calls.v[z] == ci) have = 1;
+                if (!have && df->calls.n < 256) lp_push(&df->calls, ci);
+            }
+        }
+        fo_free(dl, nd);
+        free(text);
+        free(whole);
+        free(path);
+    }
+    /* which of them a code recipe declared, and in which files: name, its claim [kind, name], what says the claim (a
+     * file's record of claims, or the file itself, said as its one record), and the file that holds that record */
+    size_t ncand = lp_idmap_count(cand);
+    if (ncand) {
+        lp_vec(lp_vertex) vx = { 0 };
+        int nh = 0;
+        Hold *h = holds_any(lp_idmap_keys(cand), (int)ncand, &nh);
+        lp_idmap *claim = lp_idmap_new();
+        lp_vec(size_t) claim_c = { 0 };
+        lp_vec(char *) claim_k = { 0 };
+        for (int j = 0; j < nh; j++) {
+            lp_id two[4];
+            if (reader_parts(rd, &h[j].entity, two, 4) != 2) continue;
+            int64_t ci = lp_idmap_find(cand, &two[1]);
+            if (ci < 0) continue;
+            bool fresh;
+            lp_idmap_put(claim, &h[j].entity, &fresh);
+            if (fresh) { lp_push(&claim_c, (size_t)ci); lp_push(&claim_k, reader_text(rd, &two[0], 120)); }
+        }
+        holds_free(h, nh);
+        size_t nclaim = lp_idmap_count(claim);
+        lp_idmap *rec = lp_idmap_new();
+        lp_vec(CePair) pairs = { 0 };
+        if (nclaim) {
+            h = holds_any(lp_idmap_keys(claim), (int)nclaim, &nh);
+            for (int j = 0; j < nh; j++) {
+                size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
+                if (!nv) continue;
+                lp_vec_reserve(&vx, nv);
+                lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
+                for (size_t v = 0; v < nv; v++) {
+                    if (vx.v[v].said != LP_SAID_CLAIM && vx.v[v].said != LP_SAID_RECORD) continue;
+                    int64_t x = lp_idmap_find(claim, &vx.v[v].id);
+                    if (x < 0) continue;
+                    if (vx.v[0].said == LP_SAID_METADATA) ce_file(&cs.v[claim_c.v[x]], claim_k.v[x], &h[j].entity);
+                    else lp_push(&pairs, (CePair){ lp_idmap_put(rec, &h[j].entity, NULL), (size_t)x });
+                }
+            }
+            holds_free(h, nh);
+        }
+        size_t nrec = lp_idmap_count(rec);
+        if (nrec) {
+            h = holds_any(lp_idmap_keys(rec), (int)nrec, &nh);
+            for (int j = 0; j < nh; j++) {
+                size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
+                if (!nv) continue;
+                lp_vec_reserve(&vx, nv);
+                lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
+                if (vx.v[0].said != LP_SAID_METADATA) continue;
+                for (size_t v = 0; v < nv; v++) {
+                    if (vx.v[v].said != LP_SAID_RECORD) continue;
+                    int64_t r = lp_idmap_find(rec, &vx.v[v].id);
+                    if (r < 0) continue;
+                    for (size_t z = 0; z < pairs.n; z++)
+                        if (pairs.v[z].rec == (size_t)r) ce_file(&cs.v[claim_c.v[pairs.v[z].claim]], claim_k.v[pairs.v[z].claim], &h[j].entity);
+                }
+            }
+            holds_free(h, nh);
+        }
+        for (size_t z = 0; z < claim_k.n; z++) free(claim_k.v[z]);
+        lp_vec_free(&claim_k);
+        lp_vec_free(&claim_c);
+        lp_vec_free(&pairs);
+        lp_vec_free(&vx);
+        lp_idmap_free(claim);
+        lp_idmap_free(rec);
+    }
+    char *out = NULL;
+    size_t on = 0, ocap = 0;
+    buf_fmt(&out, &on, &ocap, "{\"name\":\"");
+    cw_str(&out, &on, &ocap, name);
+    buf_fmt(&out, &on, &ocap, "\",\"database\":\"%s\",\"definitions\":[", PQdb(pg));
+    for (size_t f = 0; f < ndef; f++) {
+        CeDef *df = &defs[f];
+        char fh[33];
+        hex_id(&d.n[df->node].id, fh);
+        buf_fmt(&out, &on, &ocap, "%s{\"path\":\"", f ? "," : "");
+        cw_str(&out, &on, &ocap, df->path);
+        buf_fmt(&out, &on, &ocap, "\",\"file\":\"%s\",\"kind\":\"", fh);
+        cw_str(&out, &on, &ocap, df->kind);
+        buf_fmt(&out, &on, &ocap, "\",\"line0\":%zu,\"line1\":%ld,\"callees\":[", df->line, df->line1);
+        int n = 0;
+        for (size_t z = 0; z < df->calls.n; z++) {
+            CeCand *x = &cs.v[df->calls.v[z]];
+            if (!x->nfile) continue;
+            buf_fmt(&out, &on, &ocap, "%s{\"name\":\"", n++ ? "," : "");
+            cw_str(&out, &on, &ocap, x->name);
+            buf_fmt(&out, &on, &ocap, "\",\"kind\":\"");
+            cw_str(&out, &on, &ocap, x->kind ? x->kind : "");
+            buf_fmt(&out, &on, &ocap, "\",\"declared_in\":%d,\"files\":[", x->total);
+            for (int k = 0; k < x->nfile; k++) {
+                char *pth = cw_file_name(rd, &x->file[k]), xh[33];
+                hex_id(&x->file[k], xh);
+                buf_fmt(&out, &on, &ocap, "%s{\"path\":\"", k ? "," : "");
+                cw_str(&out, &on, &ocap, pth);
+                buf_fmt(&out, &on, &ocap, "\",\"file\":\"%s\"}", xh);
+                free(pth);
+            }
+            buf_fmt(&out, &on, &ocap, "]}");
+        }
+        buf_fmt(&out, &on, &ocap, "],\"outside\":[");
+        n = 0;
+        for (size_t z = 0; z < df->calls.n; z++) {
+            CeCand *x = &cs.v[df->calls.v[z]];
+            if (x->nfile) continue;
+            buf_fmt(&out, &on, &ocap, "%s\"", n++ ? "," : "");
+            cw_str(&out, &on, &ocap, x->name);
+            buf_fmt(&out, &on, &ocap, "\"");
+        }
+        buf_fmt(&out, &on, &ocap, "]}");
+        free(df->path);
+        free(df->kind);
+        lp_vec_free(&df->calls);
+    }
+    buf_fmt(&out, &on, &ocap, "],\"cut\":%s,\"ms\":%.3f}", cut ? "true" : "false", (double)(nsec() - t0) / 1e6);
+    for (size_t z = 0; z < cs.n; z++) { free(cs.v[z].name); free(cs.v[z].kind); }
+    lp_vec_free(&cs);
+    lp_idmap_free(cand);
+    free(nodes);
+    free(paths);
+    reader_free(rd);
+    lp_idmap_free(d.m);
+    free(d.n);
+    http(c, 200, out ? out : "{\"error\":\"memory\"}");
+    free(out);
+}
+
+/* ---- ingest_status (Laplace-MCP#28): what the database holds and how current it is, read only. Each witness: its
+ * name, trust, how many parts its trunk holds after its record, and readings, how many witnesses begin with the same record (a
+ * source read again without superseding its earlier reading has more than one). Then the database's sessions that
+ * are not idle, as pg_stat_activity shows them to this role, and the engine's per-source ingest logs
+ * (LAPLACE_INGEST_LOGS, else $LAPLACE_WORK/logs/ingest), newest first, each with its last line. */
+#ifndef _WIN32
+#include <dirent.h>
+typedef struct { char name[256]; time_t mtime; long long bytes; } IsLog;
+static int is_log_cmp(const void *a, const void *b) {
+    const IsLog *x = a, *y = b;
+    return x->mtime < y->mtime ? 1 : x->mtime > y->mtime ? -1 : strcmp(x->name, y->name);
+}
+#endif
+static void on_ingest_status(int c, const char *body) {
+    char want[512] = "";
+    jstr(body, "source", want, sizeof want);
+    PGconn *pg = cc_db(c);
+    if (!pg) return;
+    uint64_t t0 = nsec();
+    PGresult *r = PQexecParams(pg, "SELECT id, trust FROM witness", 0, NULL, NULL, NULL, NULL, 1);
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+        char e[512], b[640];
+        json_esc(PQerrorMessage(pg), e, sizeof e);
+        snprintf(b, sizeof b, "{\"error\":\"witness\",\"detail\":\"%s\"}", e);
+        PQclear(r);
+        http(c, 500, b);
+        return;
+    }
+    Reader *rd = reader_new(pg);
+    int nw = PQntuples(r);
+    size_t cap = (size_t)1 << 20;
+    lp_id *kid = malloc(sizeof(lp_id) * cap), *recs = calloc((size_t)nw + 1, sizeof(lp_id));
+    size_t *nfiles = calloc((size_t)nw + 1, sizeof(size_t));
+    for (int i = 0; i < nw; i++) {
+        lp_id id;
+        memcpy(id.b, PQgetvalue(r, i, 0), 16);
+        size_t m = reader_parts(rd, &id, kid, cap);
+        if (m) recs[i] = kid[0];
+        nfiles[i] = m;
+    }
+    char *out = NULL;
+    size_t on = 0, ocap = 0;
+    buf_fmt(&out, &on, &ocap, "{\"database\":\"%s\",\"sources\":[", PQdb(pg));
+    int shown = 0;
+    for (int i = 0; i < nw; i++) {
+        lp_id id;
+        memcpy(id.b, PQgetvalue(r, i, 0), 16);
+        double trust;
+        uint64_t tb = lp_be(PQgetvalue(r, i, 1), 8);
+        memcpy(&trust, &tb, 8);
+        if (want[0]) {                                  /* the whole name, not the shown 200 bytes of it */
+            char *whole = nfiles[i] ? reader_text(rd, &recs[i], (size_t)1 << 16) : strdup("");
+            int same = !strcmp(whole, want);
+            free(whole);
+            if (!same) continue;
+        }
+        char *nm = nfiles[i] ? reader_text(rd, &recs[i], 200) : strdup("");
+        int readings = 0;
+        for (int k = 0; k < nw; k++) if (nfiles[k] && !memcmp(recs[k].b, recs[i].b, 16)) readings++;
+        char idh[33];
+        hex_id(&id, idh);
+        buf_fmt(&out, &on, &ocap, "%s{\"id\":\"%s\",\"name\":\"", shown++ ? "," : "", idh);
+        cw_str(&out, &on, &ocap, nm);
+        buf_fmt(&out, &on, &ocap, "\",\"trust\":%.3f,\"parts\":%zu%s,\"readings\":%d}", trust, nfiles[i] ? nfiles[i] - 1 : 0, nfiles[i] >= cap ? ",\"parts_cut\":true" : "", readings);
+        free(nm);
+    }
+    PQclear(r);
+    free(kid);
+    free(recs);
+    free(nfiles);
+    reader_free(rd);
+    buf_fmt(&out, &on, &ocap, "],\"activity\":[");
+    r = PQexec(pg, "SELECT pid, coalesce(usename::text, ''), coalesce(state, ''), coalesce(extract(epoch FROM now() - query_start)::bigint, 0), "
+                   "left(regexp_replace(coalesce(query, ''), '\\s+', ' ', 'g'), 200) FROM pg_stat_activity "
+                   "WHERE datname = current_database() AND pid <> pg_backend_pid() AND state IS DISTINCT FROM 'idle' ORDER BY query_start NULLS LAST LIMIT 32");
+    if (PQresultStatus(r) == PGRES_TUPLES_OK)
+        for (int i = 0; i < PQntuples(r); i++) {
+            buf_fmt(&out, &on, &ocap, "%s{\"pid\":%s,\"user\":\"", i ? "," : "", PQgetvalue(r, i, 0));
+            cw_str(&out, &on, &ocap, PQgetvalue(r, i, 1));
+            buf_fmt(&out, &on, &ocap, "\",\"state\":\"");
+            cw_str(&out, &on, &ocap, PQgetvalue(r, i, 2));
+            buf_fmt(&out, &on, &ocap, "\",\"seconds\":%s,\"query\":\"", PQgetvalue(r, i, 3));
+            cw_str(&out, &on, &ocap, PQgetvalue(r, i, 4));
+            buf_fmt(&out, &on, &ocap, "\"}");
+        }
+    PQclear(r);
+    buf_fmt(&out, &on, &ocap, "],\"logs\":");
+    char dir[4096] = "";
+    const char *ld = getenv("LAPLACE_INGEST_LOGS"), *work = getenv("LAPLACE_WORK");
+    if (ld && *ld) snprintf(dir, sizeof dir, "%s", ld);
+    else if (work && *work) snprintf(dir, sizeof dir, "%s/logs/ingest", work);
+    int listed = 0;
+#ifndef _WIN32
+    DIR *dd = dir[0] ? opendir(dir) : NULL;
+    if (dd) {
+        lp_vec(IsLog) logs = { 0 };
+        struct dirent *de;
+        while ((de = readdir(dd))) {
+            size_t l = strlen(de->d_name);
+            if (l < 5 || l >= 256 || strcmp(de->d_name + l - 4, ".log")) continue;
+            char fp[4400];
+            struct stat st;
+            snprintf(fp, sizeof fp, "%s/%s", dir, de->d_name);
+            if (stat(fp, &st) || !S_ISREG(st.st_mode)) continue;
+            IsLog x = { "", st.st_mtime, (long long)st.st_size };
+            memcpy(x.name, de->d_name, l - 4);
+            x.name[l - 4] = 0;
+            if (want[0] && strcmp(x.name, want)) continue;
+            lp_push(&logs, x);
+        }
+        closedir(dd);
+        qsort(logs.v, logs.n, sizeof *logs.v, is_log_cmp);
+        buf_fmt(&out, &on, &ocap, "{\"dir\":\"");
+        cw_str(&out, &on, &ocap, dir);
+        buf_fmt(&out, &on, &ocap, "\",\"runs\":[");
+        for (size_t k = 0; k < logs.n && k < 20; k++) {
+            char fp[4400], tail[4097] = "", when[32];
+            snprintf(fp, sizeof fp, "%s/%s.log", dir, logs.v[k].name);
+            FILE *f = fopen(fp, "rb");
+            if (f) {
+                long sz = logs.v[k].bytes > 4096 ? 4096 : (long)logs.v[k].bytes;
+                fseek(f, -sz, SEEK_END);
+                size_t got = fread(tail, 1, (size_t)sz, f);
+                tail[got] = 0;
+                fclose(f);
+            }
+            size_t tl = strlen(tail);
+            while (tl && (tail[tl - 1] == '\n' || tail[tl - 1] == '\r' || tail[tl - 1] == ' ')) tail[--tl] = 0;
+            char *last = strrchr(tail, '\n');
+            last = last ? last + 1 : tail;
+            if (strlen(last) > 240) last[240] = 0;
+            for (char *p = last; *p; p++) if ((unsigned char)*p < 0x20 && *p != '\t') *p = ' ';
+            struct tm tmv;
+            gmtime_r(&logs.v[k].mtime, &tmv);
+            strftime(when, sizeof when, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+            buf_fmt(&out, &on, &ocap, "%s{\"source\":\"", k ? "," : "");
+            cw_str(&out, &on, &ocap, logs.v[k].name);
+            buf_fmt(&out, &on, &ocap, "\",\"modified\":\"%s\",\"bytes\":%lld,\"last\":\"", when, logs.v[k].bytes);
+            cw_str(&out, &on, &ocap, last);
+            buf_fmt(&out, &on, &ocap, "\"}");
+        }
+        buf_fmt(&out, &on, &ocap, "]}");
+        lp_vec_free(&logs);
+        listed = 1;
+    }
+#endif
+    if (!listed) buf_fmt(&out, &on, &ocap, "null");
+    buf_fmt(&out, &on, &ocap, ",\"ms\":%.3f}", (double)(nsec() - t0) / 1e6);
+    http(c, 200, out);
+    free(out);
+}/* The sources the database holds: each witness, its name (the first part of its trunk, the record its source file
  * names) and its trust. */
 static void on_sources(int c, const char *body) {
     (void)body;
@@ -2270,6 +2842,9 @@ static const char *TOOLS =
     "{\"tools\":["
     "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates, and the union is ordered by reciprocal rank fusion of each collection's ranking and the Laplace rerank's (fusion rerank: the rerank alone); a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, the fused score and each ranking's rank of the hit, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"fusion\":{\"type\":\"string\",\"enum\":[\"rrf\",\"rerank\"]},\"bridge\":{\"type\":\"boolean\",\"description\":\"add to the query the words the database's wordnets reach from its words (laplace translate), for the lexical retrieval and the rerank\"},\"scope\":{\"type\":\"string\",\"enum\":[\"all\",\"code\",\"docs\"],\"description\":\"which embedding collections are asked: code (the default), prose (docs), or both (all)\"},\"explain\":{\"type\":\"boolean\",\"description\":\"every candidate of the union, not only the first limit\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code (query) stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment above it, nothing from a working tree. Each file that holds it, by the pathname its record gives: defines, the declaration kinds its recipe said of the name there (function_definition, class_declaration...), files that define it first; occurrences, how many places in its syntax tree hold it; at, up to occurrences (default 3) of them: the line, the innermost enclosing node of at least context bytes (default 120), and the enclosing declaration's first line with its span line0..line1. defines true: only files that define it. path: a substring the file path must contain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"defines\":{\"type\":\"boolean\"},\"limit\":{\"type\":\"integer\"},\"occurrences\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
+    "{\"name\":\"code_callers\",\"description\":\"Who uses a name (query) in the code the Laplace database holds: each declaration (name, kind, path, its line) whose code holds a place the name stands, with the lines it does at (at). A place outside every declaration is its file's top level (top_level); a declaration's own name is not a use of it. Read off the containment code_where walks and the file's outline; same-named declarations in different files are not told apart. path: a substring the file path must contain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"a declared name\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
+    "{\"name\":\"code_callees\",\"description\":\"What a declaration calls, in the code the Laplace database holds: for each definition of the name (query; path, kind, line0..line1), each name in its code followed by ( that a code recipe declared, with its kind and the files that declare it (callees), and the names it calls that nothing there declares (outside: a library's, a language's). path: a substring the defining file's path must contain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"a declared name\"},\"path\":{\"type\":\"string\"}},\"required\":[\"query\"]}},"
+    "{\"name\":\"ingest_status\",\"description\":\"What the Laplace database holds and how current it is, read only: each source's witness (name, trust, parts: what its trunk holds after its record, and readings: how many witnesses begin with its record; more than one is a source read again without superseding its earlier reading), the database's sessions that are not idle (a running ingest), and the engine's per-source ingest logs, newest first, with each one's last line. source: one source's name.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"source\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"sources\",\"description\":\"The sources the Laplace database holds: each witness ID, its name and trust.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"file_outline\",\"description\":\"What a file in the Laplace database declares: the claims [kind, name] its code recipe said of it, in the file's order, each with the line where its name first stands after the one before. The file by the end of its pathname (path) or its ID (file, as code_where returns it).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"recipe_plan\",\"description\":\"Which recipe reads what, as laplace ingest --plan answers it, without reading anything into the database: a source name or a path (input), else every source in order.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[]}},"
@@ -2339,6 +2914,9 @@ static void mcp_rpc(int c, const char *body) {
         else if (!strcmp(name, "code_where")) on_code_where(c, body);
         else if (!strcmp(name, "sources")) on_sources(c, body);
         else if (!strcmp(name, "file_outline")) on_file_outline(c, body);
+        else if (!strcmp(name, "code_callers")) on_code_callers(c, body);
+        else if (!strcmp(name, "code_callees")) on_code_callees(c, body);
+        else if (!strcmp(name, "ingest_status")) on_ingest_status(c, body);
         else if (!strcmp(name, "recipe_plan")) on_recipe_plan(c, body);
         else if (!strcmp(name, "rerank")) on_rerank(c, body);
         else if (!strcmp(name, "search")) on_search(c, body);
@@ -2395,6 +2973,9 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
         else if (!strcmp(op, "code_where")) path = "/v1/code_where";
         else if (!strcmp(op, "sources")) path = "/v1/sources";
         else if (!strcmp(op, "file_outline")) path = "/v1/file_outline";
+        else if (!strcmp(op, "code_callers")) path = "/v1/code_callers";
+        else if (!strcmp(op, "code_callees")) path = "/v1/code_callees";
+        else if (!strcmp(op, "ingest_status")) path = "/v1/ingest_status";
         else if (!strcmp(op, "recipe_plan")) path = "/v1/recipe_plan";
         else if (!strcmp(op, "search")) path = "/v1/search";
         else if (!strcmp(op, "forward")) path = "/v1/forward";
@@ -2431,6 +3012,9 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
     else if (!strcmp(path, "/v1/code_where")) on_code_where(c, body);
     else if (!strcmp(path, "/v1/sources")) on_sources(c, body);
     else if (!strcmp(path, "/v1/file_outline")) on_file_outline(c, body);
+    else if (!strcmp(path, "/v1/code_callers")) on_code_callers(c, body);
+    else if (!strcmp(path, "/v1/code_callees")) on_code_callees(c, body);
+    else if (!strcmp(path, "/v1/ingest_status")) on_ingest_status(c, body);
     else if (!strcmp(path, "/v1/recipe_plan")) on_recipe_plan(c, body);
     else if (!strcmp(path, "/v1/search")) on_search(c, body);
     else if (!strcmp(path, "/v1/forward")) on_by_parts(c, body, FORWARD_SQL, "forward");
@@ -2484,7 +3068,68 @@ int api_mcp_stdio(void) {
     return 0;
 }
 
+/* ---- who may call the listener. Every request but GET /health carries Authorization: Bearer TOKEN, the one the
+ * installation made for this service (Laplace-Operations: /etc/laplace/secrets/modular-mcp.env, made once, as the
+ * monorepo MCP's mcp.env is). The token is LAPLACE_MCP_TOKEN, else the LAPLACE_MCP_TOKEN line of the file
+ * LAPLACE_MCP_TOKEN_FILE names (or its first line). With no token of at least 32 characters and no whitespace the
+ * listener does not start: it fails closed. stdio (lpm mcp) is the calling user's own process and takes none. */
+static char SERVE_TOKEN[513];
+static size_t SERVE_TOKEN_N;
+static int token_take(const char *v, size_t n) {
+    while (n && (v[n - 1] == '\n' || v[n - 1] == '\r')) n--;
+    if (n >= 2 && (v[0] == '"' || v[0] == '\'') && v[n - 1] == v[0]) { v++; n -= 2; }
+    if (n < 32 || n >= sizeof SERVE_TOKEN) return 0;
+    for (size_t i = 0; i < n; i++) if ((unsigned char)v[i] <= ' ' || v[i] == 0x7f) return 0;
+    memcpy(SERVE_TOKEN, v, n);
+    SERVE_TOKEN[n] = 0;
+    SERVE_TOKEN_N = n;
+    return 1;
+}
+static int serve_token_load(void) {
+    const char *e = getenv("LAPLACE_MCP_TOKEN");
+    if (e && *e) return token_take(e, strlen(e));
+    const char *f = getenv("LAPLACE_MCP_TOKEN_FILE");
+    if (!f || !*f) return 0;
+    FILE *fp = fopen(f, "rb");
+    if (!fp) { perror(f); return 0; }
+    char line[1024], first[1024] = "";
+    int ok = 0, lines = 0;
+    while (fgets(line, sizeof line, fp)) {
+        if (!lines++) snprintf(first, sizeof first, "%s", line);
+        if (!strncmp(line, "LAPLACE_MCP_TOKEN=", 18)) { ok = token_take(line + 18, strlen(line + 18)); break; }
+    }
+    fclose(fp);
+    if (!ok && lines && !strchr(first, '=')) ok = token_take(first, strlen(first));
+    memset(line, 0, sizeof line);
+    memset(first, 0, sizeof first);
+    return ok;
+}
+/* The request's bearer token against the service's, in time that does not depend on where they differ. */
+static int request_authorized(const char *req, const char *head_end) {
+    const char *p = req;
+    while ((p = strstr(p, "\r\n")) && p < head_end) {
+        p += 2;
+        if (strncasecmp(p, "Authorization:", 14)) continue;
+        const char *v = p + 14;
+        while (*v == ' ' || *v == '\t') v++;
+        if (strncasecmp(v, "Bearer ", 7)) return 0;
+        v += 7;
+        while (*v == ' ') v++;
+        size_t n = strcspn(v, "\r\n");
+        while (n && (v[n - 1] == ' ' || v[n - 1] == '\t')) n--;
+        unsigned d = n != SERVE_TOKEN_N;
+        for (size_t i = 0; i < SERVE_TOKEN_N; i++) d |= (unsigned)(unsigned char)SERVE_TOKEN[i] ^ (unsigned)(unsigned char)(i < n ? v[i] : 0);
+        return d == 0 && SERVE_TOKEN_N > 0;
+    }
+    return 0;
+}
+
 int api_serve(const char *host, int port) {
+    if (!serve_token_load()) {
+        fprintf(stderr, "lpm serve: no token: set LAPLACE_MCP_TOKEN, or LAPLACE_MCP_TOKEN_FILE to a file with its "
+                        "LAPLACE_MCP_TOKEN line (at least 32 characters, no whitespace); refusing to listen unauthenticated\n");
+        return 2;
+    }
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
@@ -2540,6 +3185,15 @@ int api_serve(const char *host, int port) {
         char *q = strchr(path, '?');
         if (q) *q = 0;
         char *body = strstr(req, "\r\n\r\n");
+        int open_route = !strcmp(method, "GET") && !strcmp(path, "/health");
+        if (!open_route && (!body || !request_authorized(req, body))) {
+            static const char deny[] = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nWWW-Authenticate: Bearer\r\n"
+                                       "Content-Length: 24\r\nConnection: close\r\n\r\n{\"error\":\"unauthorized\"}";
+            send(c, deny, (int)strlen(deny), MSG_NOSIGNAL);
+            free(req);
+            close_sock(c);
+            continue;
+        }
         body = body ? body + 4 : "";
         dispatch(c, method, path, body);
         free(req);
