@@ -23,7 +23,7 @@ def call(tool, args):
     msgs = [{'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}},
             {'jsonrpc': '2.0', 'id': 1, 'method': tool and 'tools/call' or 'tools/list',
              'params': {'name': tool, 'arguments': args} if tool else {}}]
-    env = dict(os.environ, LAPLACE_CONNINFO=conninfo)
+    env = dict(os.environ, LAPLACE_CONNINFO=conninfo, LAPLACE_ENGINE=str(Path(engine).resolve()))
     p = subprocess.run([lpm, 'mcp'], input='\n'.join(json.dumps(m) for m in msgs) + '\n', env=env,
                        capture_output=True, text=True, timeout=120)
     lines = [l for l in p.stdout.splitlines() if l.strip()]
