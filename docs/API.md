@@ -133,7 +133,7 @@ A query is decomposed the same way. Documents are ranked by BM25 over the query 
 
 | Name | What |
 |---|---|
-| `LAPLACE_CODE_ROOTS` | directories indexed when there are no records, separated by `;` (or `:` on Linux) |
+| `LAPLACE_CODE_ROOTS` | directories indexed and kept up to date, separated by `;` (or `:` on Linux) |
 | `LAPLACE_CODE_RECORDS` | records file: loaded on the first call when it exists and is this version, else the index is built from the roots and saved; saved again whenever a refresh changes anything |
 | `LAPLACE_CODE_REFRESH_SECONDS` | how often a `code_search` call first brings the index up to date with its roots; `0` never (default `30`) |
 
@@ -153,3 +153,23 @@ env = { LAPLACE_CODE_RECORDS = "E:/Data/Laplace/work/code-index/workspace.lpm" }
 `code_search` takes `query` (required), `limit` (1 to 64, default 15) and `path` (a file or directory to add before searching). Each hit has `path`, `line0`, `line1`, `id`, `hilbert`, `shared` (query constituents held), `frechet` (4D Fréchet of the query and snippet word trajectories), `rerank` (the `rerank` tool's score of the snippet, 0 to 1) and `snippet` (up to 60 lines read from the file).
 
 `reindex` takes `path` (optional: one file or directory; otherwise every root) and returns `unchanged`, `changed`, `added`, `removed`, `rebuilt`, `files`, `docs`, `stale`, `entities` and `ms`.
+### Semantic candidates
+
+With `LAPLACE_CODE_SEMANTIC=1`, `code_search` also embeds the query with an OpenAI-compatible `/v1/embeddings` endpoint and takes the nearest chunks from Qdrant collections built from the same trees (code-search's collections: payload `path` is the repository label then the path inside it, with `start`, `end` and `text`). A label resolves to the root in `LAPLACE_CODE_ROOTS` with that directory name. The lexical candidates (three times `limit`) and the semantic ones are joined; a semantic chunk that overlaps a lexical document is that document, with the chunk's cosine. Each candidate's text is scored by Laplace `rerank` against the query and the union is returned in that order.
+
+| Name | What |
+|---|---|
+| `LAPLACE_CODE_SEMANTIC` | `1` to use semantic candidates; unset or `0` lexical only |
+| `LAPLACE_CODE_QDRANT` | Qdrant base URL, for example `http://192.168.1.2:6333` |
+| `LAPLACE_CODE_QDRANT_KEY` | sent as `api-key` when set |
+| `LAPLACE_CODE_EMBED_URL`, `LAPLACE_CODE_EMBED_KEY` | code embedding endpoint and its bearer key |
+| `LAPLACE_CODE_COLLECTIONS` | comma-separated collections whose vectors that endpoint made |
+| `LAPLACE_CODE_QUERY_PREFIX` | text before the query (default `Find the most relevant code snippet given the following query:` and a newline, for jina-code-embeddings) |
+| `LAPLACE_CODE_TEXT_EMBED_URL`, `LAPLACE_CODE_TEXT_EMBED_KEY` | optional second endpoint for prose collections (key defaults to `LAPLACE_CODE_EMBED_KEY`) |
+| `LAPLACE_CODE_TEXT_COLLECTIONS` | collections for the second endpoint |
+| `LAPLACE_CODE_TEXT_QUERY_PREFIX` | default `Instruct: Given a question, retrieve passages that answer it` then a newline and `Query: `, for Qwen3-Embedding |
+| `LAPLACE_CODE_SEMANTIC_CANDIDATES` | nearest chunks taken per collection (default three times `limit`) |
+
+Only `http://` URLs are supported. When semantic candidates are configured and an endpoint is unreachable, refuses the key, or a collection does not exist, `code_search` is an error naming the URL and the response; it does not answer from the lexical index alone. The result reports `semantic`, `semantic_ms` and `candidates` (`lexical`, `semantic`, `union`); each hit has `source` (`lexical`, `semantic` or `both`), and a hit with a semantic source has `cosine` and `collection`. A semantic-only hit whose file is under a root shows those lines from the file; otherwise it shows the chunk text.
+
+On HART-DESKTOP the services are the llama.cpp servers on `127.0.0.1:8711` (code) and `:8713` (prose) and the collections `laplace-desktop-code` and `laplace-desktop-text` on hart-server's Qdrant.
