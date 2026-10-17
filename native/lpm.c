@@ -58,7 +58,18 @@ struct Lpm {
     size_t sc_pn, sc_pcap;
     uint8_t *sc_feat;
     size_t sc_fn, sc_fcap;
+    /* Declaration chunking while a grammar file is admitted: a named node becomes its own document
+     * when no ancestor already is one and it spans LPM_CHUNK_MIN_LINES..LPM_CHUNK_MAX_LINES lines. */
+    int chunk_on;
+    uint32_t chunk_path, chunk_lines;
 };
+
+/* A document small enough to be the answer: a declaration or a block of text, never a whole large file. */
+#define LPM_CHUNK_MIN_LINES 3
+#define LPM_CHUNK_MAX_LINES 120
+/* Text with no grammar is cut into blocks at blank lines and headings, LPM_TEXT_MIN..LPM_TEXT_MAX lines each. */
+#define LPM_TEXT_MIN_LINES 8
+#define LPM_TEXT_MAX_LINES 48
 
 static void *grow(void *p, size_t n) {
     p = realloc(p, n ? n : 1);
@@ -195,6 +206,10 @@ static uint32_t add_path(Lpm *ix, const char *path) {
     }
     uint32_t off = (uint32_t)ix->npaths;
     memcpy(ix->paths + ix->npaths, path, n);
+#ifdef _WIN32
+    /* One separator in what is stored and returned: a root given as E:\x walked as E:\x/y reads E:/x/y. */
+    for (size_t i = 0; i < n; i++) if (ix->paths[off + i] == '\\') ix->paths[off + i] = '/';
+#endif
     ix->npaths += n;
     return off;
 }
@@ -484,11 +499,44 @@ static const char *grammar_name(const char *path) {
     return NULL;
 }
 
+/* A document: the entity r, lines l0..l1 of the file at path_off, holding the features collected since f0. */
+static void push_doc(Lpm *ix, const lp_ref *r, uint32_t l0, uint32_t l1, uint32_t bytes, uint32_t path_off, size_t f0) {
+    add_feat(ix, r->id.b);
+    if (ix->ndocs == ix->cdocs) {
+        ix->cdocs = ix->cdocs ? ix->cdocs * 2 : 256;
+        ix->docs = grow(ix->docs, ix->cdocs * sizeof *ix->docs);
+    }
+    Doc *d = &ix->docs[ix->ndocs];
+    memset(d, 0, sizeof *d);
+    memcpy(d->id, r->id.b, 16);
+    memcpy(d->m, r->c.m, sizeof d->m);
+    d->hilbert = lp_hilbert4(&r->c);
+    d->tier = r->tier;
+    d->line0 = l0;
+    d->line1 = l1;
+    d->bytes = bytes;
+    d->path = path_off;
+    post_features_range(ix, (uint32_t)ix->ndocs, f0, ix->nfeat);
+    ix->ndocs++;
+}
+
 /* The concrete syntax tree, composed the way the engine composes a grammar-only recipe:
  * each node is its children with the bytes between them kept as text; a leaf is text. */
 static lp_ref ast_node(Lpm *ix, TSNode nd, const uint8_t *src, uint32_t lo, uint32_t hi, int depth) {
     uint32_t nc = ts_node_child_count(nd);
     if (nc == 0 || depth > 200) return text_cached(ix, src + lo, hi > lo ? hi - lo : 0);
+    int emit = 0, outer = ix->chunk_on;
+    uint32_t l0 = 0, l1 = 0;
+    size_t f0 = ix->nfeat;
+    if (outer && ts_node_is_named(nd)) {
+        l0 = ts_node_start_point(nd).row + 1;
+        l1 = ts_node_end_point(nd).row + 1;
+        uint32_t span = l1 - l0 + 1;
+        if (span >= LPM_CHUNK_MIN_LINES && span <= LPM_CHUNK_MAX_LINES && !(l0 == 1 && l1 >= ix->chunk_lines)) {
+            emit = 1;
+            ix->chunk_on = 0;           /* its descendants are inside this document */
+        }
+    }
     TSNode *cn = malloc(sizeof(TSNode) * nc);
     uint32_t *cs = malloc(sizeof(uint32_t) * nc * 2);
     uint32_t *ce = cs + nc;
@@ -523,6 +571,8 @@ static lp_ref ast_node(Lpm *ix, TSNode nd, const uint8_t *src, uint32_t lo, uint
     }
     lp_ref r = k ? compose_put(ix, kids, k, (uint8_t)(tier + 1)) : text_cached(ix, src + lo, hi > lo ? hi - lo : 0);
     free(kids); free(has); free(cs); free(cn);
+    ix->chunk_on = outer;
+    if (emit) push_doc(ix, &r, l0, l1, hi - lo, ix->chunk_path, f0);
     return r;
 }
 
@@ -557,32 +607,15 @@ static lp_ref admit_grammar(Lpm *ix, const char *name, const uint8_t *s, size_t 
     lp_ref *kids = malloc(sizeof(lp_ref) * (2 * (size_t)got + 1));
     uint8_t *has = calloc(2 * (size_t)got + 1, 1);
     if (!kids || !has) abort();
+    /* Each top-level node is a document if it is a declaration-sized span; a larger one (a namespace, a class)
+     * is not, and its members are. */
+    ix->chunk_path = path_off;
+    ix->chunk_lines = file_lines;
     for (uint32_t i = 0; i < got; i++) if (ce[i] > cs[i]) {
-        size_t f0 = ix->nfeat;
+        ix->chunk_on = 1;
         kids[2 * i + 1] = ast_node(ix, cn[i], s, cs[i], ce[i], 1);
+        ix->chunk_on = 0;
         has[2 * i + 1] = 1;
-        uint32_t l0 = ts_node_start_point(cn[i]).row + 1;
-        uint32_t l1 = ts_node_end_point(cn[i]).row + 1;
-        if (ts_node_is_named(cn[i]) && l1 >= l0 + 2 && !(l0 == 1 && l1 >= file_lines)) {
-            add_feat(ix, kids[2 * i + 1].id.b);
-            size_t f1 = ix->nfeat;
-            if (ix->ndocs == ix->cdocs) {
-                ix->cdocs = ix->cdocs ? ix->cdocs * 2 : 256;
-                ix->docs = grow(ix->docs, ix->cdocs * sizeof *ix->docs);
-            }
-            Doc *sub = &ix->docs[ix->ndocs];
-            memset(sub, 0, sizeof *sub);
-            memcpy(sub->id, kids[2 * i + 1].id.b, 16);
-            memcpy(sub->m, kids[2 * i + 1].c.m, sizeof sub->m);
-            sub->hilbert = lp_hilbert4(&kids[2 * i + 1].c);
-            sub->tier = kids[2 * i + 1].tier;
-            sub->line0 = l0;
-            sub->line1 = l1;
-            sub->bytes = ce[i] - cs[i];
-            sub->path = path_off;
-            post_features_range(ix, (uint32_t)ix->ndocs, f0, f1);
-            ix->ndocs++;
-        }
     }
     uint32_t at = 0;
     for (uint32_t i = 0; i < got; i++) {
@@ -601,6 +634,37 @@ static lp_ref admit_grammar(Lpm *ix, const char *name, const uint8_t *s, size_t 
     ts_tree_delete(t);
     ts_parser_delete(ps);
     return trunk;
+}
+
+/* Text with no grammar: blocks of lines, cut at a blank line or before a heading once a block holds
+ * LPM_TEXT_MIN_LINES, and always at LPM_TEXT_MAX_LINES. Each block is a document; the file stays one too. */
+static void admit_text_blocks(Lpm *ix, const uint8_t *s, size_t n, uint32_t path_off, uint32_t file_lines) {
+    if (file_lines <= LPM_TEXT_MAX_LINES) return;
+    size_t b0 = 0, i = 0;
+    uint32_t line = 1, l0 = 1, lines = 0;
+    while (i < n) {
+        size_t ls = i;
+        while (i < n && s[i] != '\n') i++;
+        size_t le = i;
+        if (i < n) i++;
+        int blank = 1;
+        for (size_t k = ls; k < le; k++) if (s[k] != ' ' && s[k] != '\t' && s[k] != '\r') { blank = 0; break; }
+        int heading = !blank && s[ls] == '#';
+        if (heading && lines >= LPM_TEXT_MIN_LINES) {
+            size_t f0 = ix->nfeat;
+            lp_ref r = text_cached(ix, s + b0, ls - b0);
+            push_doc(ix, &r, l0, line - 1, (uint32_t)(ls - b0), path_off, f0);
+            b0 = ls; l0 = line; lines = 0;
+        }
+        lines++;
+        if ((blank && lines >= LPM_TEXT_MIN_LINES) || lines >= LPM_TEXT_MAX_LINES || i >= n) {
+            size_t f0 = ix->nfeat;
+            lp_ref r = text_cached(ix, s + b0, i - b0);
+            if (r.tier) push_doc(ix, &r, l0, line, (uint32_t)(i - b0), path_off, f0);
+            b0 = i; l0 = line + 1; lines = 0;
+        }
+        line++;
+    }
 }
 
 static int is_utf8(const uint8_t *s, size_t n) {
@@ -625,7 +689,10 @@ int lpm_admit(Lpm *ix, const char *path, const uint8_t *s, size_t n) {
     } else {
         const char *g = utf8 ? grammar_name(path) : NULL;
         if (g && load_lang(g)) trunk = admit_grammar(ix, g, s, n, path_off, file_lines);
-        else if (utf8) trunk = text_cached(ix, s, n);
+        else if (utf8) {
+            admit_text_blocks(ix, s, n, path_off, file_lines);
+            trunk = text_cached(ix, s, n);
+        }
         else {
             lp_id *ids = malloc(n * sizeof *ids);
             __int128 sum[4] = {0, 0, 0, 0};
@@ -787,27 +854,37 @@ size_t lpm_search(Lpm *ix, const char *q, size_t n, LpmHit *out, size_t cap) {
     uint32_t *shared = calloc(ix->ndocs, sizeof *shared);
     double *rank = calloc(ix->ndocs, sizeof *rank);
     if (!shared || !rank) abort();
+    /* BM25 with presence only: each shared constituent adds its IDF, and a document's sum is scaled by its
+     * length against the mean, so a declaration that holds the query outranks the whole file around it. */
+    const double k1 = 1.2, b = 0.75;
+    double avg = 0;
+    for (size_t d = 0; d < ix->ndocs; d++) avg += ix->docs[d].bytes;
+    avg = avg / (double)ix->ndocs;
+    if (avg < 1) avg = 1;
     for (size_t f = 0; f < ix->nfeat; f++) {
         Ent *e = ent_find(ix, ix->feat + f * 16);
         if (!e || !e->nd) continue;
-        double wgt = (double)ix->ndocs / (double)e->nd;
+        double idf = log(1.0 + (double)ix->ndocs / (double)e->nd);
         for (uint32_t d = 0; d < e->nd; d++) {
             uint32_t di = e->docs[d];
             if (di >= ix->ndocs) continue;
             shared[di]++;
-            rank[di] += wgt;
+            rank[di] += idf;
         }
     }
-    size_t nout = cap < ix->ndocs ? cap : ix->ndocs;
+    for (size_t d = 0; d < ix->ndocs; d++) if (shared[d]) {
+        double norm = 1.0 - b + b * (double)ix->docs[d].bytes / avg;
+        rank[d] *= (k1 + 1.0) / (1.0 + k1 * norm);
+    }
     uint8_t *taken = calloc(ix->ndocs, 1);
     if (!taken) abort();
     size_t wrote = 0;
-    for (size_t h = 0; h < nout; h++) {
+    while (wrote < cap) {
         uint32_t best = 0;
         int any = 0;
         for (size_t d = 0; d < ix->ndocs; d++) {
             if (taken[d] || !shared[d]) continue;
-            if (!any || rank[d] > rank[best] || (rank[d] == rank[best] && shared[d] > shared[best])) {
+            if (!any || rank[d] > rank[best] || (rank[d] == rank[best] && ix->docs[d].bytes < ix->docs[best].bytes)) {
                 best = (uint32_t)d;
                 any = 1;
             }
@@ -815,6 +892,12 @@ size_t lpm_search(Lpm *ix, const char *q, size_t n, LpmHit *out, size_t cap) {
         if (!any) break;
         taken[best] = 1;
         Doc *doc = &ix->docs[best];
+        const char *bp = ix->paths + doc->path;
+        /* One answer per place: a span that overlaps a better one in the same file is that answer again. */
+        int dup = 0;
+        for (size_t k = 0; k < wrote && !dup; k++)
+            if (out[k].line0 <= doc->line1 && doc->line0 <= out[k].line1 && !strcmp(out[k].path, bp)) dup = 1;
+        if (dup) continue;
         LpmHit *hit = &out[wrote++];
         memset(hit, 0, sizeof *hit);
         memcpy(hit->id, doc->id, 16);
@@ -824,7 +907,7 @@ size_t lpm_search(Lpm *ix, const char *q, size_t n, LpmHit *out, size_t cap) {
         hit->line1 = doc->line1;
         hit->shared = shared[best];
         hit->bytes = doc->bytes;
-        snprintf(hit->path, sizeof hit->path, "%s", ix->paths + doc->path);
+        snprintf(hit->path, sizeof hit->path, "%s", bp);
     }
     free(shared);
     free(rank);
@@ -1395,11 +1478,10 @@ Lpm *lpm_load(const char *path, const char *tier0) {
         rd(f, p, pl);
         p[pl] = 0;
         d->tier = tier;
-        d->path = add_path(ix, p);
+        if (ix->ndocs && !strcmp(ix->paths + ix->docs[ix->ndocs - 1].path, p)) d->path = ix->docs[ix->ndocs - 1].path;
+        else { d->path = add_path(ix, p); ix->files++; }
         free(p);
         ix->ndocs++;
-        ix->files++;
-        ix->bytes += d->bytes;
     }
     uint64_t np;
     rd(f, &np, 8);

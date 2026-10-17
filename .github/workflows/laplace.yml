@@ -35,6 +35,7 @@ jobs:
           "$L" check
           "$L" text 'Sherlock Holmes'
           python3 Laplace-MCP/tests/engine-output.py "$L"
+          python3 Laplace-MCP/tests/code-index.py "$L"
   deploy:
     needs: mcp
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
