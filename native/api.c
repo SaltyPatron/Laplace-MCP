@@ -1754,6 +1754,9 @@ static void on_code_where(int c, const char *body) {
                 buf_add(&out, &on, &ocap, no ? ",{" : "{", no ? 2 : 1);
                 if (line > 0) buf_fmt(&out, &on, &ocap, "\"line\":%ld", line); else buf_add(&out, &on, &ocap, "\"line\":null", 11);
                 if (line0 > 0) buf_fmt(&out, &on, &ocap, ",\"line0\":%ld,\"line1\":%ld", line0, line1);
+                buf_fmt(&out, &on, &ocap, ",\"depth\":%zu", pp->len - 2);
+                if (getenv("LPM_CODE_WHERE_TRACE"))
+                    for (size_t z = 1; z < pp->len; z++) { char *tx = reader_text(rd, &d.n[pp->n[z]].id, 60); fprintf(stderr, "  %zu %s%s\n", z, d.n[pp->n[z]].claim ? "(claim) " : "", tx); free(tx); }
                 buf_add(&out, &on, &ocap, ",\"context\":\"", 12);
                 if (ctx) cw_str(&out, &on, &ocap, ctx);
                 buf_add(&out, &on, &ocap, "\",\"enclosing\":\"", 15);
