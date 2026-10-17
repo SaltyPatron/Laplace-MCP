@@ -5,7 +5,8 @@ embedding collections' rankings fused with it), and the file each order puts the
 mean reciprocal rank at 10, median latency. It needs the semantic configuration code_search is run with
 (LAPLACE_CODE_SEMANTIC, LAPLACE_CODE_QDRANT, LAPLACE_CODE_EMBED_URL, LAPLACE_CODE_COLLECTIONS, ...); without it the eval
 says so and passes, so CI runs it where a runner is configured.
-  tests/code-search-eval.py path/to/lpm [--min-mrr X] [--fusion rerank,rrf] [--explain FILE]
+  tests/code-search-eval.py path/to/lpm [--min-mrr X] [--fusion rerank,rrf@code,rrf] [--explain FILE]
+(rrf@code: rrf with scope code.)
 """
 import argparse, json, os, statistics, subprocess, sys, time
 
@@ -30,8 +31,10 @@ def answers(path, target):
     return p.endswith('/' + target) or p == target or (p.endswith('/' + rel) and ('/' + repo + '/' in '/' + p))
 
 
-def ask(lpm, query, fusion, explain=False):
+def ask(lpm, query, fusion, explain=False, scope=None):
     args = {'query': query, 'limit': 10, 'fusion': fusion}
+    if scope:
+        args['scope'] = scope
     if explain:
         args['explain'] = True
     msgs = [{'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}},
@@ -65,7 +68,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('lpm')
     ap.add_argument('--min-mrr', type=float, default=None, help='fail when the last fusion scores below this')
-    ap.add_argument('--fusion', default='rerank,rrf')
+    ap.add_argument('--fusion', default='rerank,rrf@code,rrf', help='orders to compare; rrf@code asks scope code')
     ap.add_argument('--explain', help='write every candidate with its rankings here (the last fusion)')
     a = ap.parse_args()
     if not os.environ.get('LAPLACE_CODE_SEMANTIC') or os.environ.get('LAPLACE_CODE_SEMANTIC') == '0' or not os.environ.get('LAPLACE_CODE_QDRANT'):
@@ -76,7 +79,8 @@ def main():
     for f in fusions:
         ranks, lat = [], []
         for q, target in QUERIES:
-            o, ms = ask(a.lpm, q, f, explain=bool(a.explain) and f == fusions[-1])
+            fu, _, sc = f.partition('@')
+            o, ms = ask(a.lpm, q, fu, explain=bool(a.explain) and f == fusions[-1], scope=sc or None)
             if a.explain and f == fusions[-1]:
                 explained[q] = o
                 hits = sorted(o['hits'], key=lambda h: h['rank'])
@@ -89,11 +93,11 @@ def main():
                       'median_ms': round(statistics.median(lat))}
         table.append(ranks)
     w = max(len(q) for q, _ in QUERIES)
-    print('code-search-eval   ' + '  '.join(f'{f:>7s}' for f in fusions) + '   target')
+    print('code-search-eval   ' + '  '.join(f'{f:>8s}' for f in fusions) + '   target')
     for i, (q, target) in enumerate(QUERIES):
-        print(f'  {q[:60]:60s} ' + '  '.join(f'{(str(t[i]) if t[i] else "-"):>7s}' for t in table) + '   ' + target)
+        print(f'  {q[:60]:60s} ' + '  '.join(f'{(str(t[i]) if t[i] else "-"):>8s}' for t in table) + '   ' + target)
     for f in fusions:
-        print(f'  {f:8s} ' + json.dumps(summary[f]))
+        print(f'  {f:9s} ' + json.dumps(summary[f]))
     if a.explain:
         with open(a.explain, 'w', encoding='utf-8') as s:
             json.dump({'queries': QUERIES, 'answers': explained}, s)

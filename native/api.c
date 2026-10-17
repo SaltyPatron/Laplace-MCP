@@ -1241,6 +1241,17 @@ static int cand_cmp(const void *a, const void *b) {
     return (int)(x->line1 - x->line0) - (int)(y->line1 - y->line0);
 }
 
+/* A weight from the environment: unset keeps *w; a number in [0, 1] replaces it; anything else is 0 (refused). */
+static int env_weight(const char *name, double *w) {
+    const char *v = getenv(name);
+    if (!v || !*v) return 1;
+    char *e = NULL;
+    double x = strtod(v, &e);
+    if (e == v || *e || !(x >= 0.0 && x <= 1.0)) return 0;
+    *w = x;
+    return 1;
+}
+
 static void on_code_search(int c, const char *body) {
     char query[8192] = "", path[4096] = "";
     if (!jstr(body, "query", query, sizeof query) && !jstr(body, "input", query, sizeof query)) {
@@ -1271,6 +1282,27 @@ static void on_code_search(int c, const char *body) {
     }
     lpm_stats(ix, &st);
 
+    /* scope: which embedding groups are asked. code: the code collections; docs: the prose ones; all: both. */
+    char scope_s[8] = "";
+    if (!jstr(body, "scope", scope_s, sizeof scope_s) || !scope_s[0]) {
+        const char *se = getenv("LAPLACE_CODE_SCOPE");
+        snprintf(scope_s, sizeof scope_s, "%s", se && *se ? se : "all");
+    }
+    int scope = !strcmp(scope_s, "code") ? SEM_CODE : !strcmp(scope_s, "docs") ? SEM_PROSE
+              : !strcmp(scope_s, "all") ? SEM_CODE | SEM_PROSE : 0;
+    if (!scope) {
+        http(c, 400, "{\"error\":\"scope is all, code or docs\"}");
+        return;
+    }
+    /* The weight of a ranking in the fusion. A code collection's counts 1. The Laplace rerank, an overlap of the
+     * query's constituents with the candidate's, and a prose collection, whose model reads documentation rather than
+     * code, count half each by default (LAPLACE_CODE_RERANK_WEIGHT, LAPLACE_CODE_PROSE_WEIGHT; 0 drops the ranking). */
+    double w_rr = 0.5, w_prose = 0.5;
+    if (!env_weight("LAPLACE_CODE_RERANK_WEIGHT", &w_rr) || !env_weight("LAPLACE_CODE_PROSE_WEIGHT", &w_prose)) {
+        http(c, 400, "{\"error\":\"LAPLACE_CODE_RERANK_WEIGHT and LAPLACE_CODE_PROSE_WEIGHT are numbers from 0 to 1\"}");
+        return;
+    }
+
     /* Semantic: the configured collections' nearest chunks join the lexical candidates; failure is an error. */
     int semantic = sem_enabled();
     SemHit *sh = NULL;
@@ -1281,7 +1313,7 @@ static void on_code_search(int c, const char *body) {
         uint64_t s0 = nsec();
         const char *pc = getenv("LAPLACE_CODE_SEMANTIC_CANDIDATES");
         size_t per = pc && atoi(pc) > 0 ? (size_t)atoi(pc) : (size_t)limit * 3;
-        if (sem_search(query, per, &sh, &ns, err, sizeof err)) {
+        if (sem_search(query, per, scope, &sh, &ns, err, sizeof err)) {
             json_esc(err, ee, sizeof ee);
             char out[2400];
             snprintf(out, sizeof out, "{\"error\":\"semantic retrieval failed: %s\"}", ee);
@@ -1314,11 +1346,12 @@ static void on_code_search(int c, const char *body) {
     }
     /* Each collection is a ranking of its own (its model's cosines are not another's): a hit's rank within its collection. */
     const char *coll[8] = { 0 };
+    int coll_prose[8] = { 0 };
     int ncoll = 0, *in_coll = calloc(ns + 1, sizeof *in_coll), *crank = calloc(ns + 1, sizeof *crank), seen_in[8] = { 0 };
     for (size_t i = 0; i < ns; i++) {
         int ci = 0;
         while (ci < ncoll && strcmp(coll[ci], sh[i].collection)) ci++;
-        if (ci == ncoll && ncoll < 8) coll[ncoll++] = sh[i].collection;
+        if (ci == ncoll && ncoll < 8) { coll_prose[ncoll] = sh[i].prose; coll[ncoll++] = sh[i].collection; }
         if (ci == 8) ci = 7;
         in_coll[i] = ci;
         crank[i] = ++seen_in[ci];
@@ -1390,8 +1423,8 @@ static void on_code_search(int c, const char *body) {
     for (size_t i = 0; i < nc; i++) {
         CodeCand *k = byr[i];
         k->rr_rank = (int)i + 1;
-        k->fused = 1.0 / (K + k->rr_rank);
-        for (int ci = 0; ci < ncoll; ci++) if (k->sem_rank[ci]) k->fused += 1.0 / (K + k->sem_rank[ci]);
+        k->fused = w_rr / (K + k->rr_rank);
+        for (int ci = 0; ci < ncoll; ci++) if (k->sem_rank[ci]) k->fused += (coll_prose[ci] ? w_prose : 1.0) / (K + k->sem_rank[ci]);
     }
     free(byr);
     if (semantic) qsort(cand, nc, sizeof *cand, by_rerank ? cand_rerank_cmp_v : cand_cmp);   /* lexical alone keeps its retrieval's order */
@@ -1403,9 +1436,15 @@ static void on_code_search(int c, const char *body) {
     size_t un = 0, ucap = 0;
     buf_fmt(&out, &un, &ucap,
             "{\"docs\":%llu,\"entities\":%llu,\"ms\":%.3f,\"semantic\":%s,\"semantic_ms\":%.3f,"
-            "\"fusion\":\"%s\",\"candidates\":{\"lexical\":%zu,\"semantic\":%zu,\"union\":%zu},\"hits\":[",
+            "\"fusion\":\"%s\",\"scope\":\"%s\",\"weights\":{\"rerank\":%g",
             (unsigned long long)st.documents, (unsigned long long)st.entities, ms, semantic ? "true" : "false",
-            sem_ms, semantic && !by_rerank ? "rrf" : "rerank", nh, ns, nc);
+            sem_ms, semantic && !by_rerank ? "rrf" : "rerank", scope_s, w_rr);
+    for (int ci = 0; ci < ncoll; ci++) {
+        char cn[300];
+        json_esc(coll[ci], cn, sizeof cn);
+        buf_fmt(&out, &un, &ucap, ",\"%s\":%g", cn, coll_prose[ci] ? w_prose : 1.0);
+    }
+    buf_fmt(&out, &un, &ucap, "},\"candidates\":{\"lexical\":%zu,\"semantic\":%zu,\"union\":%zu},\"hits\":[", nh, ns, nc);
     for (size_t i = 0; i < shown; i++) {
         CodeCand *k = &cand[i];
         char id[33], pe[8192], se[24576], ce[300] = "";
@@ -1935,7 +1974,7 @@ static void rpc_id(const char *body, char *out, size_t cap) {
 
 static const char *TOOLS =
     "{\"tools\":["
-    "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates, and the union is ordered by reciprocal rank fusion of each collection's ranking and the Laplace rerank's (fusion rerank: the rerank alone); a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, the fused score and each ranking's rank of the hit, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"fusion\":{\"type\":\"string\",\"enum\":[\"rrf\",\"rerank\"]},\"explain\":{\"type\":\"boolean\",\"description\":\"every candidate of the union, not only the first limit\"}},\"required\":[\"query\"]}},"
+    "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates, and the union is ordered by reciprocal rank fusion of each collection's ranking and the Laplace rerank's (fusion rerank: the rerank alone); a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, the fused score and each ranking's rank of the hit, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"fusion\":{\"type\":\"string\",\"enum\":[\"rrf\",\"rerank\"]},\"scope\":{\"type\":\"string\",\"enum\":[\"all\",\"code\",\"docs\"],\"description\":\"which embedding collections are asked: code, prose (docs), or both (all, the default)\"},\"explain\":{\"type\":\"boolean\",\"description\":\"every candidate of the union, not only the first limit\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code (query) stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment above it, nothing from a working tree. Each file that holds it, by the pathname its record gives: defines, the declaration kinds its recipe said of the name there (function_definition, class_declaration...), files that define it first; occurrences, how many places in its syntax tree hold it; at, up to occurrences (default 3) of them: the line, the innermost enclosing node of at least context bytes (default 120), and the enclosing declaration's first line with its span line0..line1. defines true: only files that define it. path: a substring the file path must contain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"defines\":{\"type\":\"boolean\"},\"limit\":{\"type\":\"integer\"},\"occurrences\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"sources\",\"description\":\"The sources the Laplace database holds: each witness ID, its name and trust.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
