@@ -46,6 +46,9 @@ src = {
              'double wait_for(int attempt){\n    return backoff_delay(attempt, 0.1, 2.0);\n}\n',
     'jitter.py': 'import random\n\n\ndef jitter(delay, fraction):\n    """a delay moved by up to fraction of itself"""\n'
                  '    return delay * (1 + (random.random() * 2 - 1) * fraction)\n\n\ndef spread(delays):\n    return [jitter(d, 0.1) for d in delays]\n\n\nprint(spread([1.0, 2.0]))\n',
+    # one declaration: the file's one claim is its own record (Laplace-Engine#67)
+    'alone.py': 'def lonely_backoff(attempt):\n    return 2 ** attempt\n',
+    'once.py': 'def once_jitter(delay):\n    return delay\n\n\nprint(once_jitter(1.0))\n',
 }
 created = False
 with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
@@ -94,6 +97,15 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         if not py or 'function_definition' not in py[0]['defines'] or not any((a['line'], a['line0'], a['line1'], a['enclosing']) == (10, 9, 10, 'def spread(delays):') for a in py[0]['at']):
             fail(f'jitter: {r["hits"]}')
 
+        for ident, file in (('lonely_backoff', 'alone.py'), ('once_jitter', 'once.py')):
+            r = call('code_where', {'query': ident})
+            got = [h for h in r['hits'] if h['path'].endswith('/' + file)]
+            if not got or got[0]['defines'] != ['function_definition']:
+                fail(f'{ident}: a file of one declaration does not define it: {r["hits"]}')
+        r = call('code_where', {'query': 'once_jitter', 'defines': True})
+        if [Path(h['path']).name for h in r['hits']] != ['once.py'] or not any(a['line'] == 5 for a in r['hits'][0]['at']):
+            fail(f'once_jitter: {r["hits"]}')
+
         r = call('code_where', {'query': 'exponential_retry_that_is_nowhere'})
         if r['files'] or r['hits']:
             fail(f'an absent name: {r}')
@@ -101,7 +113,7 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         s = call('sources', {})
         if s['database'] != name or not s['sources']:
             fail(f'sources: {s}')
-        print('code-where ok: backoff_delay defined at retry.c:3 (3..7), called at use.c:3 in wait_for; jitter defined in jitter.py and called at :10 in spread; '
+        print('code-where ok: backoff_delay defined at retry.c:3 (3..7), called at use.c:3 in wait_for; jitter defined in jitter.py and called at :10 in spread; a file of one def defines it; '
               f'{len(s["sources"])} witnesses')
     finally:
         if created:
