@@ -3,16 +3,17 @@
 #include "lpm_config.h"
 
 #include "laplace/laplace.h"
+#include "os.h"
 
 #include <math.h>
-#include <dirent.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include <tree_sitter/api.h>
 
@@ -157,12 +158,16 @@ static lp_ref on_compose(void *ud, const lp_ref *ch, uint32_t n, uint8_t tier) {
 
 static int cmp16(const void *a, const void *b) { return memcmp(a, b, 16); }
 
-static void post_features(Lpm *ix, uint32_t doc) {
-    if (!ix->nfeat) return;
-    qsort(ix->feat, ix->nfeat, 16, cmp16);
+static void post_features_range(Lpm *ix, uint32_t doc, size_t f0, size_t f1) {
+    if (f1 <= f0) return;
+    size_t n = f1 - f0;
+    uint8_t *tmp = malloc(n * 16);
+    if (!tmp) abort();
+    memcpy(tmp, ix->feat + f0 * 16, n * 16);
+    qsort(tmp, n, 16, cmp16);
     const uint8_t *prev = NULL;
-    for (size_t i = 0; i < ix->nfeat; i++) {
-        const uint8_t *id = ix->feat + i * 16;
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t *id = tmp + i * 16;
         if (prev && !memcmp(prev, id, 16)) continue;
         prev = id;
         Ent *e = ent_find(ix, id);
@@ -174,6 +179,11 @@ static void post_features(Lpm *ix, uint32_t doc) {
         }
         e->docs[e->nd++] = doc;
     }
+    free(tmp);
+}
+
+static void post_features(Lpm *ix, uint32_t doc) {
+    post_features_range(ix, doc, 0, ix->nfeat);
 }
 
 static uint32_t add_path(Lpm *ix, const char *path) {
@@ -199,6 +209,9 @@ Lpm *lpm_new(const char *tier0) {
     Lpm *ix = calloc(1, sizeof *ix);
     if (!ix) return NULL;
     ix->t0 = lp_tier0_map(tier0 && *tier0 ? tier0 : NULL);
+#ifdef _WIN32
+    if (!ix->t0) ix->t0 = lp_tier0_map("E:/Data/Laplace/work/modular-client/prepared/tier0.bin");
+#endif
     if (!ix->t0) { free(ix); return NULL; }
     ix->text = lp_text_new(ix->t0);
     if (!ix->text) { free(ix); return NULL; }
@@ -241,6 +254,73 @@ static lp_ref compose_put(Lpm *ix, const lp_ref *ch, uint32_t n, uint8_t tier) {
     return r;
 }
 
+static int is_ascii_alnum(uint8_t c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+}
+
+static int is_stop_word_bytes(const uint8_t *w, size_t n) {
+    static const char *stops[] = {
+        "a", "an", "the", "of", "in", "on", "at", "to", "for", "with", "by", "from",
+        "as", "is", "are", "was", "were", "be", "been", "and", "or", "not", "that",
+        "this", "it", "its", "into", "over", "than", "then", NULL
+    };
+    if (n == 0 || n > 6) return 0;
+    for (int i = 0; stops[i]; i++) {
+        if (strlen(stops[i]) == n && !memcmp(w, stops[i], n)) return 1;
+    }
+    return 0;
+}
+
+static lp_ref lower_token_ref(Lpm *ix, const uint8_t *w, size_t n, int register_ent) {
+    lp_ref ch[64];
+    if (n > 64) n = 64;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = w[i];
+        if (c >= 'A' && c <= 'Z') c = (uint8_t)(c - 'A' + 'a');
+        ch[i] = lp_ref_atom(ix->t0, (uint32_t)c);
+    }
+    lp_ref r = (n == 1) ? ch[0] : lp_ref_compose(ch, n, 2);
+    if (register_ent) {
+        int fresh = 0;
+        ent_put(ix, &r, &fresh);
+        if (ix->collecting && n >= 2) add_feat(ix, r.id.b);
+    }
+    return r;
+}
+
+static void collect_subtoken_feats(Lpm *ix, const uint8_t *s, size_t n) {
+    if (!ix->collecting || !n) return;
+    size_t i = 0;
+    while (i < n) {
+        while (i < n && !is_ascii_alnum(s[i])) i++;
+        if (i >= n) break;
+        size_t w0 = i;
+        while (i < n && is_ascii_alnum(s[i])) i++;
+        size_t wlen = i - w0;
+        if (wlen >= 2 && wlen <= 64) lower_token_ref(ix, s + w0, wlen, 1);
+        /* Also split CamelCase / digit boundaries into sub-tokens */
+        size_t sub0 = w0;
+        for (size_t k = w0 + 1; k <= i; k++) {
+            int split = (k == i);
+            if (!split) {
+                uint8_t prev = s[k - 1], cur = s[k];
+                int prev_lo = (prev >= 'a' && prev <= 'z');
+                int prev_up = (prev >= 'A' && prev <= 'Z');
+                int prev_dg = (prev >= '0' && prev <= '9');
+                int cur_up  = (cur >= 'A' && cur <= 'Z');
+                int cur_dg  = (cur >= '0' && cur <= '9');
+                int next_lo = (k + 1 < i) && (s[k + 1] >= 'a' && s[k + 1] <= 'z');
+                if ((prev_lo && cur_up) || (prev_up && cur_up && next_lo) || (prev_dg != cur_dg)) split = 1;
+            }
+            if (split) {
+                size_t slen = k - sub0;
+                if (slen >= 2 && slen < wlen && slen <= 64) lower_token_ref(ix, s + sub0, slen, 1);
+                sub0 = k;
+            }
+        }
+    }
+}
+
 /* A span of text, decomposed once. The same bytes are the same entity on the next call. */
 static lp_ref text_cached(Lpm *ix, const uint8_t *s, size_t n) {
     lp_ref zero; memset(&zero, 0, sizeof zero);
@@ -270,6 +350,7 @@ static lp_ref text_cached(Lpm *ix, const uint8_t *s, size_t n) {
     }
     size_t feat0 = ix->nfeat;
     lp_ref r = lp_text_decompose(ix->text, s, n, on_compose, ix);
+    collect_subtoken_feats(ix, s, n);
     if (ix->sc_pn + n > ix->sc_pcap) {
         ix->sc_pcap = (ix->sc_pn + n) * 2 + 4096;
         ix->sc_pool = grow(ix->sc_pool, ix->sc_pcap);
@@ -349,35 +430,56 @@ static const TSLanguage *load_lang(const char *name) {
     char so[512], sym[96];
     /* LAPLACE_GRAMMARS names the directory the compiled grammars are in; unset, the one this build was configured with. */
     const char *dir = getenv("LAPLACE_GRAMMARS");
-    snprintf(so, sizeof so, "%s/libtree-sitter-%s.so", dir && *dir ? dir : LPM_GRAMMARS_DEFAULT, name);
-    if (access(so, R_OK) != 0) return NULL;
-    void *h = dlopen(so, RTLD_NOW | RTLD_LOCAL);
+    snprintf(so, sizeof so, "%s/libtree-sitter-%s" OS_DLL_SUFFIX, dir && *dir ? dir : LPM_GRAMMARS_DEFAULT, name);
+    if (!os_exists(so)) return NULL;
+    void *h = os_dl_open(so);
     if (!h) return NULL;
     snprintf(sym, sizeof sym, "tree_sitter_%s", name);
-    TSLanguage *(*fn)(void) = dlsym(h, sym);
+    TSLanguage *(*fn)(void) = (TSLanguage *(*)(void))os_dl_sym(h, sym);
     if (!fn) return NULL;
     if (nlang < 64) { snprintf(names[nlang], sizeof names[nlang], "%s", name); langs[nlang] = fn(); return langs[nlang++]; }
     return fn();
 }
 
+static const char *path_basename(const char *path) {
+    if (!path) return "";
+    const char *s1 = strrchr(path, '/');
+    const char *s2 = strrchr(path, '\\');
+    const char *b = s1 > s2 ? s1 : s2;
+    return b ? b + 1 : path;
+}
+
 static const char *grammar_name(const char *path) {
-    const char *base = path ? strrchr(path, '/') : NULL;
-    base = base ? base + 1 : path;
+    const char *base = path_basename(path);
+    if (!strcmp(base, "CMakeLists.txt")) return "cmake";
+    if (!strcmp(base, "Makefile") || !strcmp(base, "GNUmakefile")) return "make";
+    if (!strcmp(base, "Dockerfile") || !strncmp(base, "Dockerfile.", 11)) return "dockerfile";
     const char *dot = base ? strrchr(base, '.') : NULL;
     if (!dot) return NULL;
     if (!strcmp(dot, ".txt") || !strcmp(dot, ".md") || !strcmp(dot, ".rst")) return NULL;
     if (!strcmp(dot, ".tsv") || !strcmp(dot, ".csv")) return NULL;
     if (!strcmp(dot, ".c") || !strcmp(dot, ".h")) return "c";
-    if (!strcmp(dot, ".cc") || !strcmp(dot, ".cpp") || !strcmp(dot, ".hpp")) return "cpp";
+    if (!strcmp(dot, ".cc") || !strcmp(dot, ".cpp") || !strcmp(dot, ".cxx") || !strcmp(dot, ".hpp") || !strcmp(dot, ".hh")) return "cpp";
+    if (!strcmp(dot, ".cu") || !strcmp(dot, ".cuh")) return "cuda";
+    if (!strcmp(dot, ".cs")) return "c_sharp";
     if (!strcmp(dot, ".py")) return "python";
-    if (!strcmp(dot, ".js")) return "javascript";
+    if (!strcmp(dot, ".js") || !strcmp(dot, ".mjs") || !strcmp(dot, ".cjs")) return "javascript";
     if (!strcmp(dot, ".ts")) return "typescript";
     if (!strcmp(dot, ".tsx")) return "tsx";
-    if (!strcmp(dot, ".xml")) return "xml";
+    if (!strcmp(dot, ".rs")) return "rust";
+    if (!strcmp(dot, ".go")) return "go";
+    if (!strcmp(dot, ".rb")) return "ruby";
+    if (!strcmp(dot, ".java")) return "java";
+    if (!strcmp(dot, ".php")) return "php";
+    if (!strcmp(dot, ".lua")) return "lua";
+    if (!strcmp(dot, ".css")) return "css";
+    if (!strcmp(dot, ".toml")) return "toml";
+    if (!strcmp(dot, ".cmake")) return "cmake";
+    if (!strcmp(dot, ".xml") || !strcmp(dot, ".csproj") || !strcmp(dot, ".props") || !strcmp(dot, ".targets")) return "xml";
     if (!strcmp(dot, ".json")) return "json";
     if (!strcmp(dot, ".sql")) return "sql";
-    if (!strcmp(dot, ".html")) return "html";
-    if (!strcmp(dot, ".sh")) return "bash";
+    if (!strcmp(dot, ".html") || !strcmp(dot, ".htm")) return "html";
+    if (!strcmp(dot, ".sh") || !strcmp(dot, ".bash")) return "bash";
     if (!strcmp(dot, ".yml") || !strcmp(dot, ".yaml")) return "yaml";
     return NULL;
 }
@@ -424,14 +526,78 @@ static lp_ref ast_node(Lpm *ix, TSNode nd, const uint8_t *src, uint32_t lo, uint
     return r;
 }
 
-static lp_ref admit_grammar(Lpm *ix, const char *name, const uint8_t *s, size_t n) {
+static lp_ref admit_grammar(Lpm *ix, const char *name, const uint8_t *s, size_t n, uint32_t path_off, uint32_t file_lines) {
     const TSLanguage *lang = load_lang(name);
     lp_ref none; memset(&none, 0, sizeof none);
     if (!lang || n > 0xffffffffu) return none;
     TSParser *ps = ts_parser_new();
     ts_parser_set_language(ps, lang);
     TSTree *t = ts_parser_parse_string(ps, NULL, (const char *)s, (uint32_t)n);
-    lp_ref trunk = ast_node(ix, ts_tree_root_node(t), s, 0, (uint32_t)n, 0);
+    TSNode root = ts_tree_root_node(t);
+    uint32_t nc = ts_node_child_count(root);
+    if (nc == 0) {
+        lp_ref trunk = ast_node(ix, root, s, 0, (uint32_t)n, 0);
+        ts_tree_delete(t);
+        ts_parser_delete(ps);
+        return trunk;
+    }
+    TSNode *cn = malloc(sizeof(TSNode) * nc);
+    uint32_t *cs = malloc(sizeof(uint32_t) * nc * 2);
+    uint32_t *ce = cs + nc;
+    if (!cn || !cs) abort();
+    TSTreeCursor cur = ts_tree_cursor_new(root);
+    uint32_t got = 0;
+    if (ts_tree_cursor_goto_first_child(&cur)) do {
+        cn[got] = ts_tree_cursor_current_node(&cur);
+        cs[got] = ts_node_start_byte(cn[got]);
+        ce[got] = ts_node_end_byte(cn[got]);
+        got++;
+    } while (got < nc && ts_tree_cursor_goto_next_sibling(&cur));
+    ts_tree_cursor_delete(&cur);
+    lp_ref *kids = malloc(sizeof(lp_ref) * (2 * (size_t)got + 1));
+    uint8_t *has = calloc(2 * (size_t)got + 1, 1);
+    if (!kids || !has) abort();
+    for (uint32_t i = 0; i < got; i++) if (ce[i] > cs[i]) {
+        size_t f0 = ix->nfeat;
+        kids[2 * i + 1] = ast_node(ix, cn[i], s, cs[i], ce[i], 1);
+        has[2 * i + 1] = 1;
+        uint32_t l0 = ts_node_start_point(cn[i]).row + 1;
+        uint32_t l1 = ts_node_end_point(cn[i]).row + 1;
+        if (ts_node_is_named(cn[i]) && l1 >= l0 + 2 && !(l0 == 1 && l1 >= file_lines)) {
+            add_feat(ix, kids[2 * i + 1].id.b);
+            size_t f1 = ix->nfeat;
+            if (ix->ndocs == ix->cdocs) {
+                ix->cdocs = ix->cdocs ? ix->cdocs * 2 : 256;
+                ix->docs = grow(ix->docs, ix->cdocs * sizeof *ix->docs);
+            }
+            Doc *sub = &ix->docs[ix->ndocs];
+            memset(sub, 0, sizeof *sub);
+            memcpy(sub->id, kids[2 * i + 1].id.b, 16);
+            memcpy(sub->m, kids[2 * i + 1].c.m, sizeof sub->m);
+            sub->hilbert = lp_hilbert4(&kids[2 * i + 1].c);
+            sub->tier = kids[2 * i + 1].tier;
+            sub->line0 = l0;
+            sub->line1 = l1;
+            sub->bytes = ce[i] - cs[i];
+            sub->path = path_off;
+            post_features_range(ix, (uint32_t)ix->ndocs, f0, f1);
+            ix->ndocs++;
+        }
+    }
+    uint32_t at = 0;
+    for (uint32_t i = 0; i < got; i++) {
+        if (cs[i] > at) { kids[2 * i] = text_cached(ix, s + at, cs[i] - at); has[2 * i] = 1; }
+        if (ce[i] > at) at = ce[i];
+    }
+    if ((uint32_t)n > at) { kids[2 * got] = text_cached(ix, s + at, (uint32_t)n - at); has[2 * got] = 1; }
+    uint32_t k = 0; uint8_t tier = 0;
+    for (uint32_t i = 0; i <= 2 * got; i++) if (has[i]) {
+        kids[k] = kids[i];
+        if (kids[k].tier > tier) tier = kids[k].tier;
+        k++;
+    }
+    lp_ref trunk = k ? compose_put(ix, kids, k, (uint8_t)(tier + 1)) : text_cached(ix, s, n);
+    free(kids); free(has); free(cs); free(cn);
     ts_tree_delete(t);
     ts_parser_delete(ps);
     return trunk;
@@ -449,15 +615,16 @@ int lpm_admit(Lpm *ix, const char *path, const uint8_t *s, size_t n) {
     memset(&trunk, 0, sizeof trunk);
     ix->nfeat = 0;
     ix->collecting = 1;
-    const char *base = path ? strrchr(path, '/') : NULL;
-    base = base ? base + 1 : path;
+    const char *base = path_basename(path);
     const char *dot = base ? strrchr(base, '.') : NULL;
     int utf8 = is_utf8(s, n);
+    uint32_t path_off = add_path(ix, path ? path : "");
+    uint32_t file_lines = utf8 ? count_lines(s, n) : 0;
     if (dot && (!strcmp(dot, ".tsv") || !strcmp(dot, ".csv")) && utf8) {
         trunk = admit_delimited(ix, s, n, dot[1] == 'c');
     } else {
         const char *g = utf8 ? grammar_name(path) : NULL;
-        if (g && load_lang(g)) trunk = admit_grammar(ix, g, s, n);
+        if (g && load_lang(g)) trunk = admit_grammar(ix, g, s, n, path_off, file_lines);
         else if (utf8) trunk = text_cached(ix, s, n);
         else {
             lp_id *ids = malloc(n * sizeof *ids);
@@ -489,9 +656,9 @@ int lpm_admit(Lpm *ix, const char *path, const uint8_t *s, size_t n) {
     doc->hilbert = lp_hilbert4(&trunk.c);
     doc->tier = trunk.tier;
     doc->line0 = 1;
-    doc->line1 = utf8 ? count_lines(s, n) : 0;
+    doc->line1 = file_lines;
     doc->bytes = n > 0xffffffffu ? 0xffffffffu : (uint32_t)n;
-    doc->path = add_path(ix, path ? path : "");
+    doc->path = path_off;
     post_features(ix, (uint32_t)ix->ndocs);
     ix->ndocs++;
     ix->collecting = 0;
@@ -523,49 +690,58 @@ static int skip_dir(const char *name) {
 }
 
 static int index_file(Lpm *ix, const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
-    if (st.st_size <= 0 || st.st_size > (1 << 20)) { ix->skipped++; return 0; }
+    if (!os_exists(path) || os_is_dir(path)) return 0;
     FILE *f = fopen(path, "rb");
     if (!f) { ix->skipped++; return 0; }
-    uint8_t *buf = malloc((size_t)st.st_size);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); ix->skipped++; return 0; }
+    long sz = ftell(f);
+    if (sz <= 0 || sz > (1 << 20) || fseek(f, 0, SEEK_SET) != 0) { fclose(f); ix->skipped++; return 0; }
+    uint8_t *buf = malloc((size_t)sz);
     if (!buf) { fclose(f); return -1; }
-    size_t n = fread(buf, 1, (size_t)st.st_size, f);
+    size_t n = fread(buf, 1, (size_t)sz, f);
     fclose(f);
-    if (n != (size_t)st.st_size) { free(buf); ix->skipped++; return 0; }
+    if (n != (size_t)sz) { free(buf); ix->skipped++; return 0; }
     int rc = lpm_admit(ix, path, buf, n);
     free(buf);
     return rc;
 }
 
 static int index_dir(Lpm *ix, const char *path) {
-    DIR *d = opendir(path);
-    if (!d) return -1;
-    struct dirent *de;
-    while ((de = readdir(d))) {
-        if (de->d_name[0] == '.' && (de->d_name[1] == 0 || (de->d_name[1] == '.' && de->d_name[2] == 0))) continue;
+    os_list ls = {0};
+    if (os_list_dir(path, &ls) != 0) return -1;
+    for (size_t i = 0; i < ls.n; i++) {
+        const char *name = ls.item[i];
+        if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
         char child[4096];
-        int nw = snprintf(child, sizeof child, "%s/%s", path, de->d_name);
-        if (nw < 0 || (size_t)nw >= sizeof child) continue;
-        struct stat st;
-        if (lstat(child, &st) != 0) continue;
-        if (S_ISLNK(st.st_mode)) continue;
-        if (S_ISDIR(st.st_mode)) {
-            if (!skip_dir(de->d_name)) {
-                if (index_dir(ix, child)) { closedir(d); return -1; }
+        int nw = snprintf(child, sizeof child, "%s/%s", path, name);
+        if (nw >= 0 && (size_t)nw < sizeof child) {
+#ifndef _WIN32
+            struct stat lst;
+            if (lstat(child, &lst) == 0 && S_ISLNK(lst.st_mode)) continue;
+#endif
+            if (os_is_dir(child)) {
+                if (!skip_dir(name)) {
+                    if (index_dir(ix, child)) {
+                        os_list_free(&ls);
+                        return -1;
+                    }
+                }
+            } else if (wanted(name)) {
+                if (index_file(ix, child)) {
+                    os_list_free(&ls);
+                    return -1;
+                }
             }
-        } else if (S_ISREG(st.st_mode) && wanted(de->d_name)) {
-            if (index_file(ix, child)) { closedir(d); return -1; }
         }
     }
-    closedir(d);
+    os_list_free(&ls);
     return 0;
 }
 
 int lpm_index_path(Lpm *ix, const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
-    if (S_ISDIR(st.st_mode)) return index_dir(ix, path);
+    if (!path || !*path) return -1;
+    if (os_is_dir(path)) return index_dir(ix, path);
+    if (!os_exists(path)) return -1;
     return index_file(ix, path);
 }
 
@@ -583,8 +759,10 @@ size_t lpm_search(Lpm *ix, const char *q, size_t n, LpmHit *out, size_t cap) {
         if (!lp_utf8_next(s, n, &i, &cp)) { utf8 = 0; break; }
     }
     lp_ref trunk;
-    if (utf8 && n) trunk = lp_text_decompose(ix->text, s, n, on_compose, ix);
-    else memset(&trunk, 0, sizeof trunk);
+    if (utf8 && n) {
+        trunk = lp_text_decompose(ix->text, s, n, on_compose, ix);
+        collect_subtoken_feats(ix, s, n);
+    } else memset(&trunk, 0, sizeof trunk);
     add_feat(ix, trunk.id.b);
     ix->collecting = 0;
     /* A query is not a document. Roll the occurrence counters back. Entities stay:
@@ -689,16 +867,117 @@ size_t lpm_containers(const Lpm *ix, const uint8_t id[16], LpmHit *out, size_t c
     return n;
 }
 
+static void unit_s3(const int64_t m[4], double p[4]) {
+    double s2 = 0.0;
+    for (int d = 0; d < 4; d++) {
+        p[d] = ldexp((double)m[d], -53);
+        s2 += p[d] * p[d];
+    }
+    if (s2 > 1e-30) {
+        double inv = 1.0 / sqrt(s2);
+        for (int d = 0; d < 4; d++) p[d] *= inv;
+    } else {
+        p[0] = 1.0; p[1] = 0.0; p[2] = 0.0; p[3] = 0.0;
+    }
+}
+
+static double dist4(const double a[4], const double b[4]) {
+    double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2], dw = a[3] - b[3];
+    return sqrt(dx * dx + dy * dy + dz * dz + dw * dw);
+}
+
+static double directed_hausdorff4(const double *a, size_t na, const double *b, size_t nb) {
+    if (!na || !nb) return 2.0;
+    double max_min = 0.0;
+    for (size_t i = 0; i < na; i++) {
+        double min_d = 1e9;
+        const double *ai = a + i * 4;
+        for (size_t j = 0; j < nb; j++) {
+            double d = dist4(ai, b + j * 4);
+            if (d < min_d) min_d = d;
+        }
+        if (min_d > max_min) max_min = min_d;
+    }
+    return max_min;
+}
+
+static double subtraj_frechet4(const double *q, size_t nq, const double *d, size_t nd) {
+    if (!nq || !nd) return -1.0;
+    if (nd <= nq) return lp_frechet4(q, nq, d, nd);
+
+    const double match_thresh = 0.25;
+    size_t first_match = nd, last_match = 0;
+    int any_match = 0;
+    for (size_t j = 0; j < nd; j++) {
+        const double *dj = d + j * 4;
+        for (size_t i = 0; i < nq; i++) {
+            if (dist4(dj, q + i * 4) <= match_thresh) {
+                if (!any_match) first_match = j;
+                last_match = j;
+                any_match = 1;
+                break;
+            }
+        }
+    }
+
+    if (any_match) {
+        size_t pad = nq <= 4 ? 1 : 2;
+        size_t w_start = first_match > pad ? first_match - pad : 0;
+        size_t w_end = last_match + pad < nd - 1 ? last_match + pad : nd - 1;
+        size_t max_win = nq * 3 > 8 ? nq * 3 : 8;
+        if (w_end - w_start + 1 > max_win) w_end = w_start + max_win - 1;
+
+        size_t win_len = w_end - w_start + 1;
+        double *core = malloc(win_len * 4 * sizeof(double));
+        size_t ncore = 0;
+        for (size_t j = w_start; j <= w_end; j++) {
+            const double *dj = d + j * 4;
+            for (size_t i = 0; i < nq; i++) {
+                if (dist4(dj, q + i * 4) <= match_thresh) {
+                    memcpy(core + ncore * 4, dj, 4 * sizeof(double));
+                    ncore++;
+                    break;
+                }
+            }
+        }
+        size_t matched_q = 0;
+        for (size_t i = 0; i < nq; i++) {
+            const double *qi = q + i * 4;
+            for (size_t k = 0; k < ncore; k++) {
+                if (dist4(qi, core + k * 4) <= match_thresh) {
+                    matched_q++;
+                    break;
+                }
+            }
+        }
+        double core_frechet = ncore ? lp_frechet4(q, nq, core, ncore) : lp_frechet4(q, nq, d + w_start * 4, win_len);
+        double core_haus = ncore ? directed_hausdorff4(q, nq, core, ncore) : core_frechet;
+        free(core);
+        double core_shape = ncore >= 2 ? fmin(core_frechet, core_haus + 0.12) : core_frechet;
+        double cov_pen = (1.0 - (double)matched_q / (double)nq) * 0.45;
+        double win_frechet = lp_frechet4(q, nq, d + w_start * 4, win_len);
+        return fmin(core_shape + cov_pen, win_frechet);
+    }
+
+    size_t w = nq + 2 < nd ? nq + 2 : nd;
+    size_t stride = nq / 2 > 1 ? nq / 2 : 1;
+    double best = lp_frechet4(q, nq, d, nd);
+    for (size_t s = 0; s + w <= nd; s += stride) {
+        double f = lp_frechet4(q, nq, d + s * 4, w);
+        if (f < best) best = f;
+    }
+    return best;
+}
+
 static void traj_walk(const Lpm *ix, const uint8_t id[16], double **pts, size_t *n, size_t *cap, int depth) {
     Ent *e = ent_find(ix, id);
     if (!e || depth > 64) return;
-    if (!e->nkids) {
+    if (!e->nkids || e->tier <= 2) {
         if (*n == *cap) {
             *cap = *cap ? *cap * 2 : 64;
             *pts = grow(*pts, *cap * 4 * sizeof(double));
         }
-        double *p = *pts + *n * 4;
-        for (int d = 0; d < 4; d++) p[d] = ldexp((double)e->m[d], -53);
+        unit_s3(e->m, *pts + *n * 4);
         (*n)++;
         return;
     }
@@ -707,14 +986,187 @@ static void traj_walk(const Lpm *ix, const uint8_t id[16], double **pts, size_t 
 
 double lpm_frechet(const Lpm *ix, const uint8_t a[16], const uint8_t b[16]) {
     if (!ent_find(ix, a) || !ent_find(ix, b)) return -1;
+    if (!memcmp(a, b, 16)) return 0.0;
     double *pa = NULL, *pb = NULL;
     size_t na = 0, nb = 0, ca = 0, cb = 0;
     traj_walk(ix, a, &pa, &na, &ca, 0);
     traj_walk(ix, b, &pb, &nb, &cb, 0);
-    double d = (na && nb) ? lp_frechet4(pa, na, pb, nb) : -1;
+    double d = (na && nb) ? subtraj_frechet4(pa, na, pb, nb) : -1;
     free(pa);
     free(pb);
     return d;
+}
+
+static void extract_word_traj(Lpm *ix, const uint8_t *s, size_t n, double **pts_out, size_t *npts_out, double cent_out[4]) {
+    double *all_pts = NULL, *content_pts = NULL;
+    size_t n_all = 0, cap_all = 0, n_cont = 0, cap_cont = 0;
+    double sum[4] = {0, 0, 0, 0};
+    size_t i = 0;
+    while (i < n) {
+        while (i < n && !is_ascii_alnum(s[i])) i++;
+        if (i >= n) break;
+        size_t w0 = i;
+        while (i < n && is_ascii_alnum(s[i])) i++;
+        size_t sub0 = w0;
+        for (size_t k = w0 + 1; k <= i; k++) {
+            int split = (k == i);
+            if (!split) {
+                uint8_t prev = s[k - 1], cur = s[k];
+                int prev_lo = (prev >= 'a' && prev <= 'z');
+                int prev_up = (prev >= 'A' && prev <= 'Z');
+                int prev_dg = (prev >= '0' && prev <= '9');
+                int cur_up  = (cur >= 'A' && cur <= 'Z');
+                int cur_dg  = (cur >= '0' && cur <= '9');
+                int next_lo = (k + 1 < i) && (s[k + 1] >= 'a' && s[k + 1] <= 'z');
+                if ((prev_lo && cur_up) || (prev_up && cur_up && next_lo) || (prev_dg != cur_dg)) split = 1;
+            }
+            if (split) {
+                size_t slen = k - sub0;
+                if (slen >= 1 && slen <= 64) {
+                    uint8_t low[64];
+                    for (size_t b = 0; b < slen; b++) {
+                        uint8_t c = s[sub0 + b];
+                        low[b] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c - 'A' + 'a') : c;
+                    }
+                    lp_ref r = lower_token_ref(ix, low, slen, 0);
+                    double pt[4];
+                    unit_s3(r.c.m, pt);
+                    if (n_all == cap_all) {
+                        cap_all = cap_all ? cap_all * 2 : 32;
+                        all_pts = grow(all_pts, cap_all * 4 * sizeof(double));
+                    }
+                    memcpy(all_pts + n_all * 4, pt, 4 * sizeof(double));
+                    n_all++;
+                    if (!is_stop_word_bytes(low, slen)) {
+                        if (n_cont == cap_cont) {
+                            cap_cont = cap_cont ? cap_cont * 2 : 32;
+                            content_pts = grow(content_pts, cap_cont * 4 * sizeof(double));
+                        }
+                        memcpy(content_pts + n_cont * 4, pt, 4 * sizeof(double));
+                        n_cont++;
+                        for (int d = 0; d < 4; d++) sum[d] += pt[d];
+                    }
+                }
+                sub0 = k;
+            }
+        }
+    }
+    if (n_cont > 0) {
+        free(all_pts);
+        *pts_out = content_pts;
+        *npts_out = n_cont;
+    } else {
+        free(content_pts);
+        *pts_out = all_pts;
+        *npts_out = n_all;
+        for (size_t k = 0; k < n_all; k++) {
+            for (int d = 0; d < 4; d++) sum[d] += all_pts[k * 4 + d];
+        }
+    }
+    double norm2 = sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2] + sum[3] * sum[3];
+    if (norm2 > 1e-30) {
+        double inv = 1.0 / sqrt(norm2);
+        for (int d = 0; d < 4; d++) cent_out[d] = sum[d] * inv;
+    } else {
+        cent_out[0] = 1.0; cent_out[1] = 0.0; cent_out[2] = 0.0; cent_out[3] = 0.0;
+    }
+}
+
+static size_t dedup_feat(uint8_t *buf, size_t n) {
+    if (n <= 1) return n;
+    qsort(buf, n, 16, cmp16);
+    size_t w = 1;
+    for (size_t k = 1; k < n; k++) {
+        if (memcmp(buf + k * 16, buf + (w - 1) * 16, 16)) {
+            memcpy(buf + w * 16, buf + k * 16, 16);
+            w++;
+        }
+    }
+    return w;
+}
+
+double lpm_rerank(Lpm *ix, const char *query, size_t qn, const char *doc, size_t dn, uint32_t *shared_out, double *frechet_out) {
+    if (shared_out) *shared_out = 0;
+    if (frechet_out) *frechet_out = -1.0;
+    if (!ix || !qn || !dn) return 0.0;
+
+    uint64_t saved_files = ix->files, saved_bytes = ix->bytes, saved_comp = ix->compositions;
+    size_t saved_ndocs = ix->ndocs;
+
+    ix->nfeat = 0;
+    ix->collecting = 1;
+    lp_ref qr = {0};
+    if (is_utf8((const uint8_t *)query, qn)) {
+        qr = lp_text_decompose(ix->text, (const uint8_t *)query, qn, on_compose, ix);
+        collect_subtoken_feats(ix, (const uint8_t *)query, qn);
+    }
+    if (qr.tier) add_feat(ix, qr.id.b);
+    size_t qfn = dedup_feat(ix->feat, ix->nfeat);
+    uint8_t *qfeat = qfn ? malloc(qfn * 16) : NULL;
+    if (qfn && qfeat) memcpy(qfeat, ix->feat, qfn * 16);
+
+    ix->nfeat = 0;
+    lp_ref dr = {0};
+    if (is_utf8((const uint8_t *)doc, dn)) {
+        dr = lp_text_decompose(ix->text, (const uint8_t *)doc, dn, on_compose, ix);
+        collect_subtoken_feats(ix, (const uint8_t *)doc, dn);
+    }
+    if (dr.tier) add_feat(ix, dr.id.b);
+    size_t dfn = dedup_feat(ix->feat, ix->nfeat);
+    ix->collecting = 0;
+
+    ix->files = saved_files;
+    ix->bytes = saved_bytes;
+    ix->compositions = saved_comp;
+    ix->ndocs = saved_ndocs;
+
+    uint32_t shared = 0;
+    double overlap_w = 0.0, total_w = 0.0;
+    size_t i = 0, j = 0;
+    while (i < qfn) {
+        Ent *qe = ent_find(ix, qfeat + i * 16);
+        double w = (qe && qe->nd && ix->ndocs) ? (1.0 + log((double)(ix->ndocs + 1) / (double)qe->nd)) : 1.0;
+        total_w += w;
+        while (j < dfn && memcmp(ix->feat + j * 16, qfeat + i * 16, 16) < 0) j++;
+        if (j < dfn && !memcmp(ix->feat + j * 16, qfeat + i * 16, 16)) {
+            shared++;
+            overlap_w += w;
+        }
+        i++;
+    }
+    free(qfeat);
+
+    double *q_pts = NULL, *d_pts = NULL;
+    size_t nq_pts = 0, nd_pts = 0;
+    double q_cent[4], d_cent[4];
+    extract_word_traj(ix, (const uint8_t *)query, qn, &q_pts, &nq_pts, q_cent);
+    extract_word_traj(ix, (const uint8_t *)doc, dn, &d_pts, &nd_pts, d_cent);
+
+    double fr = (nq_pts && nd_pts)
+        ? subtraj_frechet4(q_pts, nq_pts, d_pts, nd_pts)
+        : ((qr.tier && dr.tier) ? lpm_frechet(ix, qr.id.b, dr.id.b) : -1.0);
+    free(q_pts);
+    free(d_pts);
+
+    if (!memcmp(qr.id.b, dr.id.b, 16) && qr.tier) {
+        if (shared_out) *shared_out = shared;
+        if (frechet_out) *frechet_out = 0.0;
+        return 1.0;
+    }
+
+    if (shared_out) *shared_out = shared;
+    if (frechet_out) *frechet_out = fr;
+
+    double lex = total_w > 0.0 ? (overlap_w / total_w) : 0.0;
+    double geom = fr >= 0.0 ? (1.0 / (1.0 + fr)) : 0.0;
+    double cent_dist = dist4(q_cent, d_cent);
+    double cent_sim = 1.0 / (1.0 + cent_dist);
+    double score = 0.55 * lex + 0.35 * geom + 0.10 * cent_sim;
+    if (lex >= 0.70 && geom >= 0.65) {
+        double boost = 0.75 + 0.25 * (0.60 * lex + 0.40 * geom);
+        if (boost > score) score = boost;
+    }
+    return score > 1.0 ? 1.0 : score;
 }
 
 int lpm_identify(Lpm *ix, const char *s, size_t n, LpmRec *out) {

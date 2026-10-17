@@ -4,5 +4,6 @@
 #define LPM_API_H
 
 int api_serve(const char *host, int port);
+int api_mcp_stdio(void);
 
 #endif

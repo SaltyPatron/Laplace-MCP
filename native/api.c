@@ -1,26 +1,46 @@
 #define _GNU_SOURCE
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <io.h>
+#include <fcntl.h>
+#define LAPLACE_WIN_ARPA_INET_H
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+typedef intptr_t ssize_t;
+#define close_sock(s) closesocket(s)
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#define close_sock(s) close(s)
+#endif
+
 #include "api.h"
+#include "lpm.h"
 #include "lpm_config.h"
+#include "os.h"
 
 #include "laplace/laplace.h"
 
-#include <arpa/inet.h>
 #include <libpq-fe.h>
-#include <netinet/in.h>
-#include <poll.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <time.h>
-#include <unistd.h>
 
 const lp_tier0_record *T0;
 static lp_text *TX;
 static PGconn *PG;
+static Lpm *CODE_IX;
 
 /* Where things are when the environment does not say: what this service was built with (lpm_config.h). */
 static const char *CONN_DEFAULT = LPM_CONNINFO_DEFAULT;
@@ -72,6 +92,9 @@ static PGconn *db(void) {
 static int capture;
 static int capture_code;
 static char *capture_body;
+static int stdio_capture;
+static int stdio_code;
+static char *stdio_body;
 
 static void http(int c, int code, const char *body) {
     if (capture) {
@@ -80,13 +103,19 @@ static void http(int c, int code, const char *body) {
         capture_body = strdup(body ? body : "");
         return;
     }
+    if (stdio_capture) {
+        stdio_code = code;
+        free(stdio_body);
+        stdio_body = strdup(body ? body : "");
+        return;
+    }
     const char *why = code == 200 ? "OK" : code == 202 ? "Accepted" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : "Error";
     char hdr[256];
     int n = snprintf(hdr, sizeof hdr,
                      "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
                      code, why, strlen(body));
-    send(c, hdr, (size_t)n, MSG_NOSIGNAL);
-    send(c, body, strlen(body), MSG_NOSIGNAL);
+    send(c, hdr, n, MSG_NOSIGNAL);
+    send(c, body, (int)strlen(body), MSG_NOSIGNAL);
 }
 
 static char *json_esc(const char *s, char *out, size_t cap) {
@@ -233,46 +262,73 @@ static void coord_json(const lp_ref *r, char *out, size_t cap) {
              (double)r->c.m[2] / LP_FIXED_ONE, (double)r->c.m[3] / LP_FIXED_ONE);
 }
 
-static void on_embeddings(int c, const char *body) {
-    char text[8192];
-    if (!jstr(body, "input", text, sizeof text) || !text[0]) {
-        http(c, 400, "{\"error\":\"input\"}");
-        return;
+static void unit_coord_json(const lp_ref *r, char *out, size_t cap) {
+    double v[4] = {
+        (double)r->c.m[0] / LP_FIXED_ONE,
+        (double)r->c.m[1] / LP_FIXED_ONE,
+        (double)r->c.m[2] / LP_FIXED_ONE,
+        (double)r->c.m[3] / LP_FIXED_ONE,
+    };
+    double s2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3];
+    if (s2 > 1e-30) {
+        double inv = 1.0 / sqrt(s2);
+        for (int d = 0; d < 4; d++) v[d] *= inv;
+    } else {
+        v[0] = 1.0; v[1] = 0.0; v[2] = 0.0; v[3] = 0.0;
     }
-    lp_ref trunk, parts[64];
-    size_t np = 0;
-    uint64_t t0 = nsec();
-    if (!name_entity(text, &trunk, parts, 64, &np)) {
-        http(c, 500, "{\"error\":\"tier0\"}");
-        return;
-    }
-    double ms = (double)(nsec() - t0) / 1e6;
-    char id[33], pj[64 * 40], cj[160];
-    hex_id(&trunk.id, id);
-    parts_json(parts, np, pj, sizeof pj);
-    coord_json(&trunk, cj, sizeof cj);
-    char out[8192];
-    snprintf(out, sizeof out,
-             "{\"object\":\"list\",\"model\":\"laplace\",\"data\":[{\"object\":\"record\",\"index\":0,"
-             "\"id\":\"%s\",\"tier\":%u,\"coord\":%s,\"hilbert\":\"%016llx\",\"parts\":[%s]}],"
-             "\"ms\":{\"identity\":%.3f}}",
-             id, trunk.tier, cj, (unsigned long long)lp_hilbert4(&trunk.c), pj, ms);
-    http(c, 200, out);
+    snprintf(out, cap, "[%.17g,%.17g,%.17g,%.17g]", v[0], v[1], v[2], v[3]);
 }
 
-/* holds_above, tier_max, ids_param: Laplace-Engine/src/read.c, linked into this process. */
-typedef struct {
-    lp_id entity; int src; int16_t tier; uint8_t claim, stood;
-    uint8_t *path; int path_len; lp_rating r; int matches;
-} Hold;
-Hold *holds_above(const lp_id *keys, int nkeys, int floor, int each, int standing, int *nout);
-void holds_free(Hold *h, int n);
-int tier_max(const lp_id *ids, int n);
-size_t ids_param(uint8_t *out, const lp_id *ids, uint32_t n);
-/* attested: Laplace-Engine/src/walk.c. Who said a claim is not a row: it is read off the containment above the claim,
- * one row a claim and the trunk that holds it (a trunk in the witness table is a witness, with its trust). */
-typedef struct { lp_id claim, trunk; double games, tokens, score; uint32_t position; double trust; int witness; } Attested;
-Attested *attested(PGconn *pg, const lp_id *claims, int n, int *nout, uint64_t *rows);
+static size_t parse_str_array(const char *body, const char *key, char **items, size_t max_items) {
+    char pat[80];
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    const char *p = strstr(body, pat);
+    if (!p) return 0;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != ':') return 0;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '[') return 0;
+    p++;
+    size_t count = 0;
+    while (*p && count < max_items) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p == ']' || !*p) break;
+        if (*p == '{') {
+            const char *end = strchr(p, '}');
+            if (!end) break;
+            size_t len = (size_t)(end - p + 1);
+            char *sub = malloc(len + 1);
+            memcpy(sub, p, len);
+            sub[len] = 0;
+            char txt[16384] = "";
+            if (jstr(sub, "text", txt, sizeof txt)) items[count++] = strdup(txt);
+            free(sub);
+            p = end + 1;
+            continue;
+        }
+        if (*p != '"') break;
+        p++;
+        size_t cap = 4096, u = 0;
+        char *s = malloc(cap);
+        while (*p && *p != '"') {
+            if (u + 4 >= cap) { cap *= 2; s = realloc(s, cap); }
+            if (*p == '\\' && p[1]) {
+                p++;
+                if (*p == 'n') s[u++] = '\n';
+                else if (*p == 'r') s[u++] = '\r';
+                else if (*p == 't') s[u++] = '\t';
+                else s[u++] = *p;
+                p++;
+            } else s[u++] = *p++;
+        }
+        s[u] = 0;
+        if (*p == '"') p++;
+        items[count++] = s;
+    }
+    return count;
+}
 
 static void buf_add(char **b, size_t *n, size_t *cap, const char *s, size_t m) {
     if (*n + m + 1 > *cap) {
@@ -304,6 +360,63 @@ static void buf_fmt(char **b, size_t *n, size_t *cap, const char *fmt, ...) {
     buf_add(b, n, cap, p, (size_t)w);
     free(p);
 }
+
+static void on_embeddings(int c, const char *body) {
+    char text[8192];
+    uint64_t t0 = nsec();
+    char *inputs[256];
+    size_t ni = parse_str_array(body, "input", inputs, 256);
+    if (!ni) ni = parse_str_array(body, "inputs", inputs, 256);
+    if (!ni) {
+        if (!jstr(body, "input", text, sizeof text) || !text[0]) {
+            http(c, 400, "{\"error\":\"input\"}");
+            return;
+        }
+        inputs[0] = strdup(text);
+        ni = 1;
+    }
+    char *out = NULL;
+    size_t un = 0, ucap = 0;
+    buf_add(&out, &un, &ucap, "{\"object\":\"list\",\"model\":\"laplace\",\"data\":[", strlen("{\"object\":\"list\",\"model\":\"laplace\",\"data\":["));
+    for (size_t i = 0; i < ni; i++) {
+        lp_ref trunk, parts[64];
+        size_t np = 0;
+        if (!name_entity(inputs[i], &trunk, parts, 64, &np)) {
+            for (size_t k = i; k < ni; k++) free(inputs[k]);
+            free(out);
+            http(c, 500, "{\"error\":\"tier0\"}");
+            return;
+        }
+        char id[33], pj[64 * 40], cj[160], uj[160];
+        hex_id(&trunk.id, id);
+        parts_json(parts, np, pj, sizeof pj);
+        coord_json(&trunk, cj, sizeof cj);
+        unit_coord_json(&trunk, uj, sizeof uj);
+        buf_fmt(&out, &un, &ucap,
+                "%s{\"object\":\"embedding\",\"index\":%zu,\"embedding\":%s,"
+                "\"id\":\"%s\",\"tier\":%u,\"coord\":%s,\"hilbert\":\"%016llx\",\"parts\":[%s]}",
+                i ? "," : "", i, uj, id, trunk.tier, cj, (unsigned long long)lp_hilbert4(&trunk.c), pj);
+        free(inputs[i]);
+    }
+    double ms = (double)(nsec() - t0) / 1e6;
+    buf_fmt(&out, &un, &ucap, "],\"usage\":{\"prompt_tokens\":%zu,\"total_tokens\":%zu},\"ms\":{\"identity\":%.3f}}", ni, ni, ms);
+    http(c, 200, out ? out : "{\"object\":\"list\",\"data\":[]}");
+    free(out);
+}
+
+/* holds_above, tier_max, ids_param: Laplace-Engine/src/read.c, linked into this process. */
+typedef struct {
+    lp_id entity; int src; int16_t tier; uint8_t claim, stood;
+    uint8_t *path; int path_len; lp_rating r; int matches;
+} Hold;
+Hold *holds_above(const lp_id *keys, int nkeys, int floor, int each, int standing, int *nout);
+void holds_free(Hold *h, int n);
+int tier_max(const lp_id *ids, int n);
+size_t ids_param(uint8_t *out, const lp_id *ids, uint32_t n);
+/* attested: Laplace-Engine/src/walk.c. Who said a claim is not a row: it is read off the containment above the claim,
+ * one row a claim and the trunk that holds it (a trunk in the witness table is a witness, with its trust). */
+typedef struct { lp_id claim, trunk; double games, tokens, score; uint32_t position; double trust; int witness; } Attested;
+Attested *attested(PGconn *pg, const lp_id *claims, int n, int *nout, uint64_t *rows);
 
 /* One constituent of a mixed-tier path. Tier 0 is a codepoint, tier 1 a grapheme.
  * A higher tier is read the same way as the trunk: the paths that hold it, and their attestations.
@@ -771,76 +884,30 @@ static void on_shape(int c, const char *body) {
     http(c, 200, out);
 }
 
-static void on_ingest(int c, const char *body) {
-    char path[4096];
-    if (!jstr(body, "path", path, sizeof path) || path[0] != '/') {
-        http(c, 400, "{\"error\":\"path\"}");
-        return;
-    }
-    struct stat st;
-    if (stat(path, &st) != 0) {
-        http(c, 400, "{\"error\":\"path not found\"}");
-        return;
-    }
-    int fds[2];
-    if (pipe(fds) != 0) {
-        http(c, 500, "{\"error\":\"pipe\"}");
-        return;
-    }
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(fds[0]);
-        close(fds[1]);
-        http(c, 500, "{\"error\":\"fork\"}");
-        return;
-    }
-    if (pid == 0) {
-        dup2(fds[1], 1);
-        dup2(fds[1], 2);
-        close(fds[0]);
-        close(fds[1]);
-        char *av[] = { (char *)ENGINE, "ingest", path, NULL };
-        execv(ENGINE, av);
-        _exit(127);
-    }
-    close(fds[1]);
-    char log[65536];
-    size_t n = 0;
-    while (n + 1 < sizeof log) {
-        ssize_t r = read(fds[0], log + n, sizeof log - 1 - n);
-        if (r <= 0) break;
-        n += (size_t)r;
-    }
-    close(fds[0]);
-    log[n] = 0;
-    int status = 0;
-    waitpid(pid, &status, 0);
-    int code = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
-    char esc[65536];
-    json_esc(log, esc, sizeof esc);
-    char *out = malloc(strlen(esc) + 128);
-    snprintf(out, strlen(esc) + 128, "{\"exit\":%d,\"engine\":\"laplace ingest\",\"log\":\"%s\"}", code, esc);
-    http(c, code == 0 ? 200 : 500, out);
-    free(out);
-}
-
-static const char *SURFACE =
-    "{\"service\":\"Laplace-MCP\","
-    "\"caller\":\"sends content or an ID; this process holds the database connection\","
-    "\"endpoints\":["
-    "{\"method\":\"POST\",\"path\":\"/v1/embeddings\",\"body\":\"{\\\"input\\\":\\\"text\\\"}\",\"does\":\"names the entity from tier 0\"},"
-    "{\"method\":\"POST\",\"path\":\"/v1/search\",\"body\":\"{\\\"input\\\":\\\"text\\\"} or {\\\"id\\\":\\\"32 hex\\\"}; \\\"text\\\":true renders laplace_text\",\"does\":\"one ID into laplace_containers and laplace_claims\"},"
-    "{\"method\":\"POST\",\"path\":\"/v1/forward\",\"body\":\"{\\\"input\\\":\\\"prompt\\\"}\",\"does\":\"laplace_forward on the prompt constituents\"},"
-    "{\"method\":\"POST\",\"path\":\"/v1/shape\",\"body\":\"{\\\"input\\\":\\\"text\\\",\\\"other\\\":\\\"text\\\"}\",\"does\":\"laplace_frechet4d on stored constituent coordinates\"},"
-    "{\"method\":\"POST\",\"path\":\"/v1/ingest\",\"body\":\"{\\\"path\\\":\\\"/absolute/path\\\"}\",\"does\":\"laplace ingest: decompose, deduplicate, record, attest\"},"
-    "{\"method\":\"GET\",\"path\":\"/v1/surface\"},"
-    "{\"method\":\"POST\",\"path\":\"/mcp\",\"body\":\"same bodies, with \\\"op\\\": embeddings|search|forward|shape|ingest|surface\"}"
-    "],"
-    "\"database_functions\":[\"laplace_containers\",\"laplace_claims\",\"laplace_claims_each\",\"laplace_text\",\"laplace_fills\",\"laplace_forward\",\"laplace_frechet4d\",\"laplace_dtw4d\",\"laplace_edr4d\",\"laplace_distance4d\",\"laplace_couple\",\"laplace_follows\",\"laplace_paths\",\"laplace_attested\",\"laplace_compose\",\"laplace_parts\"],"
-    "\"engine_commands\":[\"tier0\",\"flags\",\"highway\",\"deploy\",\"sources\",\"ingest\",\"forget\",\"sweep\",\"index\",\"structure\",\"tree\",\"text\",\"pull\",\"turn\",\"hop\",\"translate\",\"degrees\",\"fills\",\"status\",\"bench\",\"model\"],"
-    "\"specified_beyond_these_endpoints\":[\"translate\",\"degrees\",\"pull\",\"turn\",\"gaps\",\"file metadata\",\"DTW\",\"EDR\",\"outlier Fréchet\",\"the forward stages RESOLVE COUPLE ORIENT ROUTE SCAN PROPOSE STEER SELECT REALIZE WITNESS\"]}";
-
 static int engine_run(char **av, char **outp, int *code, int timeout_s) {
+#ifdef _WIN32
+    (void)timeout_s;
+    const char *tmpdir = getenv("TEMP");
+    if (!tmpdir || !*tmpdir) tmpdir = getenv("TMP");
+    if (!tmpdir || !*tmpdir) tmpdir = ".";
+    char logpath[1024];
+    snprintf(logpath, sizeof logpath, "%s/lpm-engine-%llu.log", tmpdir, (unsigned long long)nsec());
+    int rc = os_run_logged(av[0], av, logpath, NULL, NULL);
+    if (rc < 0) return 0;
+    *code = rc;
+    FILE *f = fopen(logpath, "rb");
+    size_t cap = 1 << 22, n = 0;
+    char *buf = malloc(cap);
+    if (f && buf) {
+        n = fread(buf, 1, cap - 1, f);
+        fclose(f);
+    }
+    remove(logpath);
+    if (!buf) return 0;
+    buf[n] = '\0';
+    *outp = buf;
+    return 1;
+#else
     int fds[2];
     if (pipe(fds) != 0) return 0;
     pid_t pid = fork();
@@ -890,6 +957,35 @@ static int engine_run(char **av, char **outp, int *code, int timeout_s) {
     *code = timed ? 124 : (WIFEXITED(st) ? WEXITSTATUS(st) : 128);
     *outp = buf;
     return 1;
+#endif
+}
+
+static void on_ingest(int c, const char *body) {
+    char path[4096];
+    if (!jstr(body, "path", path, sizeof path) || !(path[0] == '/' || (path[0] && path[1] == ':'))) {
+        http(c, 400, "{\"error\":\"path\"}");
+        return;
+    }
+    if (!os_exists(path)) {
+        http(c, 400, "{\"error\":\"path not found\"}");
+        return;
+    }
+    char *av[] = { (char *)ENGINE, "ingest", path, NULL };
+    char *log = NULL;
+    int code = 127;
+    if (!engine_run(av, &log, &code, 0)) {
+        http(c, 500, "{\"error\":\"engine\"}");
+        return;
+    }
+    size_t elen = strlen(log) * 6 + 64;
+    char *esc = malloc(elen);
+    json_esc(log, esc, elen);
+    char *out = malloc(strlen(esc) + 128);
+    snprintf(out, strlen(esc) + 128, "{\"exit\":%d,\"engine\":\"laplace ingest\",\"log\":\"%s\"}", code, esc);
+    free(esc);
+    free(log);
+    http(c, code == 0 ? 200 : 500, out);
+    free(out);
 }
 
 static int plain_arg(const char *s) {
@@ -964,6 +1060,230 @@ static void on_degrees(int c, const char *body) {
     on_engine(c, av);
 }
 
+static Lpm *ensure_code_ix(void) {
+    if (CODE_IX) return CODE_IX;
+    const char *rec = getenv("LAPLACE_CODE_RECORDS");
+    if (rec && *rec && os_exists(rec)) {
+        CODE_IX = lpm_load(rec, NULL);
+        if (CODE_IX) return CODE_IX;
+    }
+    CODE_IX = lpm_new(NULL);
+    if (!CODE_IX) return NULL;
+    const char *roots = getenv("LAPLACE_CODE_ROOTS");
+    if (roots && *roots) {
+        char *copy = strdup(roots);
+        char *p = copy;
+        while (p && *p) {
+#ifdef _WIN32
+            char *sep = strchr(p, ';');
+#else
+            char *sep = strchr(p, ':');
+            if (!sep) sep = strchr(p, ';');
+#endif
+            if (sep) *sep = 0;
+            if (*p && os_exists(p)) lpm_index_path(CODE_IX, p);
+            p = sep ? sep + 1 : NULL;
+        }
+        free(copy);
+    }
+    return CODE_IX;
+}
+
+static void read_lines_snippet(const char *path, uint32_t line0, uint32_t line1, char *out, size_t cap) {
+    out[0] = 0;
+    if (!path || !*path || cap < 2) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    if (line0 == 0) line0 = 1;
+    if (line1 < line0 || line1 - line0 > 60) line1 = line0 + 60;
+    uint32_t cur = 1;
+    size_t u = 0;
+    int ch;
+    while ((ch = fgetc(f)) != EOF) {
+        if (cur >= line0 && cur <= line1) {
+            if (ch != '\r' && u + 1 < cap) out[u++] = (char)ch;
+        }
+        if (ch == '\n') {
+            cur++;
+            if (cur > line1) break;
+        }
+    }
+    out[u] = 0;
+    fclose(f);
+}
+
+static void on_code_search(int c, const char *body) {
+    char query[8192] = "", path[4096] = "";
+    if (!jstr(body, "query", query, sizeof query) && !jstr(body, "input", query, sizeof query)) {
+        http(c, 400, "{\"error\":\"query\"}");
+        return;
+    }
+    if (!query[0]) {
+        http(c, 400, "{\"error\":\"empty query\"}");
+        return;
+    }
+    int limit = 15;
+    jint(body, "limit", &limit);
+    jint(body, "top_k", &limit);
+    if (limit < 1) limit = 1;
+    if (limit > 64) limit = 64;
+    uint64_t t0 = nsec();
+    Lpm *ix = ensure_code_ix();
+    if (!ix) {
+        http(c, 500, "{\"error\":\"code index\"}");
+        return;
+    }
+    LpmStats st = {0};
+    lpm_stats(ix, &st);
+    if (jstr(body, "path", path, sizeof path) && path[0] && os_exists(path)) {
+        lpm_index_path(ix, path);
+    } else if (st.documents == 0 && os_exists(".")) {
+        lpm_index_path(ix, ".");
+    }
+    lpm_stats(ix, &st);
+    LpmHit hits[64];
+    size_t nh = lpm_search(ix, query, strlen(query), hits, (size_t)limit);
+    LpmRec qrec = {0};
+    lpm_identify(ix, query, strlen(query), &qrec);
+    double ms = (double)(nsec() - t0) / 1e6;
+    char *out = NULL;
+    size_t un = 0, ucap = 0;
+    buf_fmt(&out, &un, &ucap,
+            "{\"docs\":%llu,\"entities\":%llu,\"ms\":%.3f,\"hits\":[",
+            (unsigned long long)st.documents, (unsigned long long)st.entities, ms);
+    for (size_t i = 0; i < nh; i++) {
+        char id[33], pe[4096], snip[8192], se[24576];
+        static const char H[] = "0123456789abcdef";
+        for (int b = 0; b < 16; b++) {
+            id[b * 2] = H[hits[i].id[b] >> 4];
+            id[b * 2 + 1] = H[hits[i].id[b] & 15];
+        }
+        id[32] = 0;
+        json_esc(hits[i].path, pe, sizeof pe);
+        read_lines_snippet(hits[i].path, hits[i].line0, hits[i].line1, snip, sizeof snip);
+        json_esc(snip, se, sizeof se);
+        double frechet = lpm_frechet(ix, qrec.id, hits[i].id);
+        buf_fmt(&out, &un, &ucap,
+                "%s{\"rank\":%zu,\"path\":\"%s\",\"line0\":%u,\"line1\":%u,"
+                "\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%u,\"frechet\":%.6f,\"snippet\":\"%s\"}",
+                i ? "," : "", i + 1, pe, hits[i].line0, hits[i].line1,
+                id, (unsigned long long)hits[i].hilbert, hits[i].shared, frechet, se);
+    }
+    buf_add(&out, &un, &ucap, "]}", 2);
+    http(c, 200, out ? out : "{\"hits\":[]}");
+    free(out);
+}
+
+static void on_reindex(int c, const char *body) {
+    char path[4096] = "";
+    jstr(body, "path", path, sizeof path);
+    uint64_t t0 = nsec();
+    if (CODE_IX) {
+        lpm_free(CODE_IX);
+        CODE_IX = NULL;
+    }
+    Lpm *ix = ensure_code_ix();
+    if (!ix) {
+        http(c, 500, "{\"error\":\"code index\"}");
+        return;
+    }
+    LpmStats st = {0};
+    lpm_stats(ix, &st);
+    if (path[0] && os_exists(path)) {
+        lpm_index_path(ix, path);
+    } else if (st.documents == 0 && os_exists(".")) {
+        lpm_index_path(ix, ".");
+    }
+    lpm_stats(ix, &st);
+    const char *rec = getenv("LAPLACE_CODE_RECORDS");
+    if (rec && *rec) lpm_save(ix, rec);
+    double ms = (double)(nsec() - t0) / 1e6;
+    char out[256];
+    snprintf(out, sizeof out,
+             "{\"status\":\"indexed\",\"docs\":%llu,\"entities\":%llu,\"ms\":%.3f}",
+             (unsigned long long)st.documents, (unsigned long long)st.entities, ms);
+    http(c, 200, out);
+}
+
+typedef struct {
+    uint32_t index;
+    uint32_t shared;
+    double frechet;
+    double relevance_score;
+} RerankItem;
+
+static int cmp_rerank_item(const void *a, const void *b) {
+    const RerankItem *ra = (const RerankItem *)a;
+    const RerankItem *rb = (const RerankItem *)b;
+    if (ra->relevance_score > rb->relevance_score) return -1;
+    if (ra->relevance_score < rb->relevance_score) return 1;
+    return (ra->index > rb->index) - (ra->index < rb->index);
+}
+
+static void on_rerank(int c, const char *body) {
+    char query[8192] = "";
+    if (!jstr(body, "query", query, sizeof query) && !jstr(body, "input", query, sizeof query)) {
+        http(c, 400, "{\"error\":\"query\"}");
+        return;
+    }
+    char *docs[256];
+    size_t nd = parse_str_array(body, "documents", docs, 256);
+    if (!nd) {
+        http(c, 400, "{\"error\":\"documents\"}");
+        return;
+    }
+    int top_n = (int)nd;
+    if (jint(body, "top_n", &top_n) && (top_n < 1 || (size_t)top_n > nd)) top_n = (int)nd;
+    uint64_t t0 = nsec();
+    Lpm *ix = ensure_code_ix();
+    if (!ix) {
+        for (size_t i = 0; i < nd; i++) free(docs[i]);
+        http(c, 500, "{\"error\":\"tier0\"}");
+        return;
+    }
+    RerankItem items[256];
+    size_t qlen = strlen(query);
+    for (size_t i = 0; i < nd; i++) {
+        items[i].index = (uint32_t)i;
+        items[i].shared = 0;
+        items[i].frechet = -1.0;
+        items[i].relevance_score = lpm_rerank(ix, query, qlen, docs[i], strlen(docs[i]), &items[i].shared, &items[i].frechet);
+        free(docs[i]);
+    }
+    qsort(items, nd, sizeof(RerankItem), cmp_rerank_item);
+    size_t nh = (size_t)top_n < nd ? (size_t)top_n : nd;
+    double ms = (double)(nsec() - t0) / 1e6;
+    char *out = NULL;
+    size_t un = 0, ucap = 0;
+    buf_fmt(&out, &un, &ucap, "{\"model\":\"laplace-frechet4d\",\"ms\":%.3f,\"results\":[", ms);
+    for (size_t i = 0; i < nh; i++) {
+        buf_fmt(&out, &un, &ucap,
+                "%s{\"index\":%u,\"relevance_score\":%.6f,\"shared\":%u,\"frechet\":%.6f}",
+                i ? "," : "", items[i].index, items[i].relevance_score, items[i].shared, items[i].frechet);
+    }
+    buf_add(&out, &un, &ucap, "]}", 2);
+    http(c, 200, out ? out : "{\"results\":[]}");
+    free(out);
+}
+
+static const char *SURFACE =
+    "{\"service\":\"Laplace-MCP\","
+    "\"caller\":\"sends content or an ID; this process holds the database connection and AST/constituent index\","
+    "\"endpoints\":["
+    "{\"method\":\"POST\",\"path\":\"/v1/embeddings\",\"body\":\"{\\\"input\\\":\\\"text\\\"} or {\\\"input\\\":[\\\"a\\\",\\\"b\\\"]}\",\"does\":\"names the entity from tier 0 and returns OpenAI-compatible 4D coordinate embedding + Laplace ID/Hilbert/parts\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/rerank\",\"body\":\"{\\\"query\\\":\\\"text\\\",\\\"documents\\\":[\\\"a\\\",\\\"b\\\"],\\\"top_n\\\":10}\",\"does\":\"deterministic IDF constituent overlap + 4D Frechet trajectory reranker\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/code_search\",\"body\":\"{\\\"query\\\":\\\"text\\\",\\\"path\\\":\\\"optional\\\",\\\"limit\\\":15}\",\"does\":\"Tree-sitter AST declaration + UAX #29 code search with 4D Frechet trajectory ranking\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/reindex\",\"body\":\"{\\\"path\\\":\\\"optional\\\"}\",\"does\":\"rebuilds the AST/constituent code index\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/search\",\"body\":\"{\\\"input\\\":\\\"text\\\"} or {\\\"id\\\":\\\"32 hex\\\"}; \\\"text\\\":true renders laplace_text\",\"does\":\"one ID into laplace_containers and laplace_claims\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/forward\",\"body\":\"{\\\"input\\\":\\\"prompt\\\"}\",\"does\":\"laplace_forward on the prompt constituents\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/shape\",\"body\":\"{\\\"input\\\":\\\"text\\\",\\\"other\\\":\\\"text\\\"}\",\"does\":\"laplace_frechet4d on stored constituent coordinates\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/ingest\",\"body\":\"{\\\"path\\\":\\\"/absolute/path\\\"}\",\"does\":\"laplace ingest: decompose, deduplicate, record, attest\"},"
+    "{\"method\":\"GET\",\"path\":\"/v1/surface\"},"
+    "{\"method\":\"POST\",\"path\":\"/mcp\",\"body\":\"JSON-RPC 2.0 MCP or op: embeddings|rerank|code_search|reindex|search|forward|shape|ingest|surface\"}"
+    "],"
+    "\"database_functions\":[\"laplace_containers\",\"laplace_claims\",\"laplace_claims_each\",\"laplace_text\",\"laplace_fills\",\"laplace_forward\",\"laplace_frechet4d\",\"laplace_dtw4d\",\"laplace_edr4d\",\"laplace_distance4d\",\"laplace_couple\",\"laplace_follows\",\"laplace_paths\",\"laplace_attested\",\"laplace_compose\",\"laplace_parts\"],"
+    "\"engine_commands\":[\"tier0\",\"flags\",\"highway\",\"deploy\",\"sources\",\"ingest\",\"forget\",\"sweep\",\"index\",\"structure\",\"tree\",\"text\",\"pull\",\"turn\",\"hop\",\"translate\",\"degrees\",\"fills\",\"status\",\"bench\",\"model\"]}";
+
 static void rpc_id(const char *body, char *out, size_t cap) {
     const char *p = strstr(body, "\"id\"");
     out[0] = 'n'; out[1] = 'u'; out[2] = 'l'; out[3] = 'l'; out[4] = 0;
@@ -985,8 +1305,11 @@ static void rpc_id(const char *body, char *out, size_t cap) {
 
 static const char *TOOLS =
     "{\"tools\":["
+    "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. Returns matching files, exact line ranges (line0..line1), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
+    "{\"name\":\"reindex\",\"description\":\"Rebuild the Laplace AST and constituent code index (optionally adding a specific file or directory path).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
+    "{\"name\":\"rerank\",\"description\":\"Deterministic Laplace reranker (drop-in replacement for neural cross-encoders). Scores candidate documents against a query using IDF-weighted constituent overlap and 4D discrete Frechet trajectory distance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"documents\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"top_n\":{\"type\":\"integer\"}},\"required\":[\"query\",\"documents\"]}},"
     "{\"name\":\"search\",\"description\":\"Name text on the client from tier 0, or take an ID the caller already holds. The trunk is read with holds_above, and so is every constituent whose tier is above a codepoint or a grapheme. A tier-0 constituent stays in the path, in its place, with its codepoint. fan, when sent, caps how many claims and occurrences are returned; omitted, all of them are.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"fan\":{\"type\":\"integer\"}},\"required\":[]}},"
-    "{\"name\":\"embeddings\",\"description\":\"Same call shape as an embedding endpoint. Returns the Laplace entity ID, tier, coordinate, Hilbert value, and constituent IDs. Does not touch the database.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[\"input\"]}},"
+    "{\"name\":\"embeddings\",\"description\":\"Same call shape as an embedding endpoint. Returns the Laplace entity ID, tier, 4D coordinate (also exposed as OpenAI-compatible embedding array), Hilbert value, and constituent IDs. Does not touch the database.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"inputs\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[]}},"
     "{\"name\":\"shape\",\"description\":\"Discrete Frechet distance between two texts, laplace_frechet4d on the stored coordinates of their constituents.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"other\":{\"type\":\"string\"}},\"required\":[\"input\",\"other\"]}},"
     "{\"name\":\"forward\",\"description\":\"laplace_forward on the constituent IDs of a prompt: which spans are observed and what follows them.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[\"input\"]}},"
     "{\"name\":\"ingest\",\"description\":\"laplace ingest of an absolute filesystem path: decompose, deduplicate, record, attest into the Laplace database.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}},"
@@ -1044,7 +1367,10 @@ static void mcp_rpc(int c, const char *body) {
         capture_code = 500;
         free(capture_body);
         capture_body = NULL;
-        if (!strcmp(name, "search")) on_search(c, body);
+        if (!strcmp(name, "code_search")) on_code_search(c, body);
+        else if (!strcmp(name, "reindex")) on_reindex(c, body);
+        else if (!strcmp(name, "rerank")) on_rerank(c, body);
+        else if (!strcmp(name, "search")) on_search(c, body);
         else if (!strcmp(name, "embeddings")) on_embeddings(c, body);
         else if (!strcmp(name, "shape")) on_shape(c, body);
         else if (!strcmp(name, "forward")) on_by_parts(c, body, FORWARD_SQL, "forward");
@@ -1092,6 +1418,9 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
             return;
         }
         if (!strcmp(op, "embeddings") || !strcmp(op, "embed")) path = "/v1/embeddings";
+        else if (!strcmp(op, "rerank")) path = "/v1/rerank";
+        else if (!strcmp(op, "code_search")) path = "/v1/code_search";
+        else if (!strcmp(op, "reindex")) path = "/v1/reindex";
         else if (!strcmp(op, "search")) path = "/v1/search";
         else if (!strcmp(op, "forward")) path = "/v1/forward";
         else if (!strcmp(op, "shape") || !strcmp(op, "frechet")) path = "/v1/shape";
@@ -1120,7 +1449,10 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
         http(c, 404, "{\"error\":\"not found\"}");
         return;
     }
-    if (!strcmp(path, "/v1/embeddings")) on_embeddings(c, body);
+    if (!strcmp(path, "/v1/embeddings") || !strcmp(path, "/embeddings")) on_embeddings(c, body);
+    else if (!strcmp(path, "/v1/rerank") || !strcmp(path, "/rerank")) on_rerank(c, body);
+    else if (!strcmp(path, "/v1/code_search")) on_code_search(c, body);
+    else if (!strcmp(path, "/v1/reindex")) on_reindex(c, body);
     else if (!strcmp(path, "/v1/search")) on_search(c, body);
     else if (!strcmp(path, "/v1/forward")) on_by_parts(c, body, FORWARD_SQL, "forward");
     else if (!strcmp(path, "/v1/shape")) on_shape(c, body);
@@ -1133,19 +1465,66 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
     else http(c, 404, "{\"error\":\"not found\"}");
 }
 
-int api_serve(const char *host, int port) {
+int api_mcp_stdio(void) {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     engine_resolve();
     T0 = lp_tier0_map(NULL);
+#ifdef _WIN32
+    if (!T0) T0 = lp_tier0_map("E:/Data/Laplace/work/modular-client/prepared/tier0.bin");
+#endif
     if (!T0) {
         fprintf(stderr, "tier 0 did not map\n");
         return 1;
     }
     TX = lp_text_new(T0);
     if (!TX) return 1;
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    size_t cap = 1 << 20;
+    char *line = malloc(cap);
+    if (!line) return 1;
+    while (fgets(line, (int)cap, stdin)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+        if (!len) continue;
+        stdio_capture = 1;
+        stdio_code = 500;
+        free(stdio_body);
+        stdio_body = NULL;
+        mcp_rpc(-1, line);
+        stdio_capture = 0;
+        if (stdio_code != 202 && stdio_body && stdio_body[0]) {
+            fputs(stdio_body, stdout);
+            fputc('\n', stdout);
+            fflush(stdout);
+        }
+    }
+    free(stdio_body);
+    free(line);
+    return 0;
+}
+
+int api_serve(const char *host, int port) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
+#endif
+    engine_resolve();
+    T0 = lp_tier0_map(NULL);
+#ifdef _WIN32
+    if (!T0) T0 = lp_tier0_map("E:/Data/Laplace/work/modular-client/prepared/tier0.bin");
+#endif
+    if (!T0) {
+        fprintf(stderr, "tier 0 did not map\n");
+        return 1;
+    }
+    TX = lp_text_new(T0);
+    if (!TX) return 1;
+    int s = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return 1;
     int one = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
     struct sockaddr_in a;
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
@@ -1158,12 +1537,13 @@ int api_serve(const char *host, int port) {
     if (listen(s, 64) != 0) return 1;
     fprintf(stderr, "Laplace-MCP %s:%d\n", host, port);
     for (;;) {
-        int c = accept(s, NULL, NULL);
+        int c = (int)accept(s, NULL, NULL);
         if (c < 0) continue;
-        char req[1 << 20];
-        size_t got = 0;
-        while (got + 1 < sizeof req) {
-            ssize_t r = recv(c, req + got, sizeof req - 1 - got, 0);
+        char *req = malloc(1 << 20);
+        if (!req) { close_sock(c); continue; }
+        size_t got = 0, rcap = 1 << 20;
+        while (got + 1 < rcap) {
+            ssize_t r = recv(c, req + got, (int)(rcap - 1 - got), 0);
             if (r <= 0) break;
             got += (size_t)r;
             req[got] = 0;
@@ -1183,6 +1563,7 @@ int api_serve(const char *host, int port) {
         char *body = strstr(req, "\r\n\r\n");
         body = body ? body + 4 : "";
         dispatch(c, method, path, body);
-        close(c);
+        free(req);
+        close_sock(c);
     }
 }

@@ -2,17 +2,17 @@
 #include "lpm.h"
 #include "api.h"
 #include "lpm_config.h"
+#include "os.h"
 
 #include "laplace/laplace.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <time.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 static void hex(const uint8_t b[16], char out[33]) {
     static const char H[] = "0123456789abcdef";
@@ -92,17 +92,39 @@ static int cmd_check(void) {
     if (!found) return fail("search missed the admitted text");
     if (!strcmp(hits[0].path, "c.txt")) return fail("the unrelated note ranked first");
 
+    size_t n_sub = lpm_search(ix, "decompose", 9, hits, 8);
+    if (!n_sub || (!strcmp(hits[0].path, "c.txt"))) return fail("subtoken search failed");
+
+    uint32_t sh_good = 0, sh_bad = 0;
+    double fr_good = -1.0, fr_bad = -1.0;
+    const char *q_rerank = "Frechet trajectory distance";
+    const char *d_good = "public static double SubTrajectoryFrechet(ReadOnlySpan<double> q, ReadOnlySpan<double> d) computes the 4-D Frechet trajectory distance on S^3.";
+    const char *d_bad = "PostgreSQL connection pooling and TLS certificate rotation for local development.";
+    double sc_good = lpm_rerank(ix, q_rerank, strlen(q_rerank), d_good, strlen(d_good), &sh_good, &fr_good);
+    double sc_bad = lpm_rerank(ix, q_rerank, strlen(q_rerank), d_bad, strlen(d_bad), &sh_bad, &fr_bad);
+    if (sc_good <= sc_bad || sc_good < 0.70 || fr_good < 0.0 || fr_good > 0.25) {
+        fprintf(stderr, "fail: rerank sc_good=%.4f (fr=%.4f) sc_bad=%.4f (fr=%.4f)\n", sc_good, fr_good, sc_bad, fr_bad);
+        return 1;
+    }
+
     /* the records go to a file of this run's own and are removed: a name fixed in a shared directory is another user's
        to keep, and a second user could then not write it */
-    const char *tmpdir = getenv("TMPDIR");
     char records[1024];
+#ifdef _WIN32
+    const char *tmpdir = getenv("TEMP");
+    if (!tmpdir || !*tmpdir) tmpdir = getenv("TMP");
+    if (!tmpdir || !*tmpdir) tmpdir = ".";
+    snprintf(records, sizeof records, "%s/lpm-check-%llu.lpm", tmpdir, (unsigned long long)now());
+#else
+    const char *tmpdir = getenv("TMPDIR");
     snprintf(records, sizeof records, "%s/lpm-check.XXXXXX", tmpdir && *tmpdir ? tmpdir : "/tmp");
     int rfd = mkstemp(records);
     if (rfd < 0) return fail("no temporary file for the records");
     close(rfd);
-    if (lpm_save(ix, records)) { unlink(records); return fail("save"); }
+#endif
+    if (lpm_save(ix, records)) { remove(records); return fail("save"); }
     Lpm *loaded = lpm_load(records, NULL);
-    unlink(records);
+    remove(records);
     if (!loaded) return fail("load");
     LpmHit hits2[8];
     size_t n2 = lpm_search(loaded, "lp_text_decompose", 17, hits2, 8);
@@ -307,7 +329,7 @@ static int cmd_serve(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: lpm check | id STRING | admit FILE... | fetch FILE ID | index RECORDS PATH... | search RECORDS QUERY | bench PATH...\n");
+        fprintf(stderr, "usage: lpm check | id STRING | admit FILE... | fetch FILE ID | index RECORDS PATH... | search RECORDS QUERY | bench PATH... | serve [HOST [PORT]] | mcp\n");
         return 2;
     }
     if (!strcmp(argv[1], "check")) return cmd_check();
@@ -326,6 +348,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "search")) return cmd_search(argc - 2, argv + 2);
     if (!strcmp(argv[1], "bench")) return cmd_bench(argc - 2, argv + 2);
     if (!strcmp(argv[1], "serve")) return cmd_serve(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "mcp")) return api_mcp_stdio();
     fprintf(stderr, "unknown command %s\n", argv[1]);
     return 2;
 }

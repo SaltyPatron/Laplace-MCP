@@ -27,7 +27,12 @@ endforeach()
 unset(LAPLACE_CONNINFO CACHE)
 set(LAPLACE_CONNINFO "")
 laplace_path(LAPLACE_BUILD "/repos/build" "build trees")
-laplace_path(LAPLACE_ENGINE "${LAPLACE_BUILD}/Laplace-Engine/icx-release/laplace" "the engine program the routes run")
+if(WIN32)
+  set(_default_engine "${LAPLACE_BUILD}/Laplace-Engine/icx-release/laplace.exe")
+else()
+  set(_default_engine "${LAPLACE_BUILD}/Laplace-Engine/icx-release/laplace")
+endif()
+laplace_path(LAPLACE_ENGINE "${_default_engine}" "the engine program the routes run")
 foreach(pair "LAPLACE_MCP_HOST=127.0.0.1" "LAPLACE_MCP_PORT=5188")
   string(REGEX MATCH "^[^=]+" name "${pair}")
   string(REGEX REPLACE "^[^=]+=" "" default "${pair}")
@@ -45,26 +50,44 @@ configure_file(native/config.h.in ${CMAKE_CURRENT_BINARY_DIR}/lpm_config.h @ONLY
 # tree-sitter's runtime at the manifest's pin, as the engine builds it.
 add_library(ts_runtime STATIC ${LAPLACE_TREESITTER}/lib/src/lib.c)
 target_include_directories(ts_runtime PUBLIC ${LAPLACE_TREESITTER}/lib/include PRIVATE ${LAPLACE_TREESITTER}/lib/src ${LAPLACE_TREESITTER}/lib/src/wasm)
-target_compile_options(ts_runtime PRIVATE -w -O3 -fPIC)
+if(WIN32)
+  target_compile_options(ts_runtime PRIVATE /w /O2)
+else()
+  target_compile_options(ts_runtime PRIVATE -w -O3 -fPIC)
+endif()
 
 # liblpm: the in-process client (check, text, admit, index, search); laplace_mcp.py loads it.
-add_library(lpm_lib SHARED native/lpm.c)
-set_target_properties(lpm_lib PROPERTIES OUTPUT_NAME lpm)
-target_include_directories(lpm_lib PUBLIC native PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_NATIVE}/src)
+add_library(lpm_lib SHARED native/lpm.c ${LAPLACE_ENGINE_SRC}/os.c)
+set_target_properties(lpm_lib PROPERTIES OUTPUT_NAME lpm WINDOWS_EXPORT_ALL_SYMBOLS ON)
+target_include_directories(lpm_lib PUBLIC native PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_ENGINE_SRC} ${LAPLACE_NATIVE}/src)
 target_compile_options(lpm_lib PRIVATE ${LP_C_FLAGS})
-target_link_libraries(lpm_lib PRIVATE laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime dl ${LP_SYSLIBS})
+if(WIN32)
+  target_include_directories(lpm_lib BEFORE PRIVATE ${LAPLACE_ENGINE_SRC}/win)
+  target_compile_definitions(lpm_lib PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
+  target_link_libraries(lpm_lib PRIVATE laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime shlwapi ${LP_SYSLIBS})
+else()
+  target_link_libraries(lpm_lib PRIVATE laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime dl ${LP_SYSLIBS})
+endif()
 
 # lpm: the commands and the service (serve).
-add_executable(lpm_program native/main.c native/api.c native/db_bridge.c ${LAPLACE_ENGINE_SRC}/read.c ${LAPLACE_ENGINE_SRC}/pg.c ${LAPLACE_ENGINE_SRC}/walk.c)
+add_executable(lpm_program native/main.c native/api.c native/db_bridge.c ${LAPLACE_ENGINE_SRC}/os.c ${LAPLACE_ENGINE_SRC}/read.c ${LAPLACE_ENGINE_SRC}/pg.c ${LAPLACE_ENGINE_SRC}/walk.c)
 set_target_properties(lpm_program PROPERTIES OUTPUT_NAME lpm)
 target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_ENGINE_SRC} ${LAPLACE_NATIVE}/src
                            ${LAPLACE_BLAKE3_DIR} ${LAPLACE_ICU_DIR}/include ${LAPLACE_PG_DIR}/include)
 target_link_directories(lpm_program PRIVATE ${LAPLACE_PG_DIR}/lib)
 target_compile_options(lpm_program PRIVATE ${LP_C_FLAGS} -Wno-missing-field-initializers)
-target_link_libraries(lpm_program PRIVATE lpm_lib laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime pq OpenMP::OpenMP_C dl ${LP_SYSLIBS})
-set_target_properties(lpm_lib lpm_program PROPERTIES
-  BUILD_RPATH "${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib"
-  INSTALL_RPATH "\$ORIGIN/../lib;${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib")
+if(WIN32)
+  target_sources(lpm_program PRIVATE native/lpm.c)
+  target_include_directories(lpm_program BEFORE PRIVATE ${LAPLACE_ENGINE_SRC}/win)
+  target_compile_definitions(lpm_program PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
+  target_link_libraries(lpm_program PRIVATE laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime
+                        ${LAPLACE_PG_DIR}/lib/libpq.lib OpenMP::OpenMP_C ws2_32 shlwapi ${LP_SYSLIBS})
+else()
+  target_link_libraries(lpm_program PRIVATE lpm_lib laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime pq OpenMP::OpenMP_C dl ${LP_SYSLIBS})
+  set_target_properties(lpm_lib lpm_program PROPERTIES
+    BUILD_RPATH "${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib"
+    INSTALL_RPATH "\$ORIGIN/../lib;${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib")
+endif()
 
 enable_testing()
 add_test(NAME check COMMAND lpm_program check)
