@@ -390,7 +390,7 @@ static int group(const char *query, const char *url, const char *key, const char
     return 0;
 }
 
-int sem_search(const char *query, size_t per_collection, SemHit **out, size_t *n, char *err, size_t errcap) {
+int sem_search(const char *query, size_t per_collection, int scope, SemHit **out, size_t *n, char *err, size_t errcap) {
     *out = NULL; *n = 0;
     const char *qd = need("LAPLACE_CODE_QDRANT", err, errcap);
     if (!qd) return -1;
@@ -400,18 +400,23 @@ int sem_search(const char *query, size_t per_collection, SemHit **out, size_t *n
     if ((url && *url) != (colls && *colls)) { fail(err, errcap, "%s needs %s", url && *url ? "LAPLACE_CODE_EMBED_URL" : "LAPLACE_CODE_COLLECTIONS", url && *url ? "LAPLACE_CODE_COLLECTIONS" : "LAPLACE_CODE_EMBED_URL"); return -1; }
     if ((turl && *turl) != (tcolls && *tcolls)) { fail(err, errcap, "%s needs %s", turl && *turl ? "LAPLACE_CODE_TEXT_EMBED_URL" : "LAPLACE_CODE_TEXT_COLLECTIONS", turl && *turl ? "LAPLACE_CODE_TEXT_COLLECTIONS" : "LAPLACE_CODE_TEXT_EMBED_URL"); return -1; }
     if (!code && !text) { fail(err, errcap, "LAPLACE_CODE_SEMANTIC is set but neither LAPLACE_CODE_EMBED_URL nor LAPLACE_CODE_TEXT_EMBED_URL is", NULL, NULL); return -1; }
+    code = code && (scope & SEM_CODE);
+    text = text && (scope & SEM_PROSE);
+    if (!code && !text) { fail(err, errcap, "no collection is configured for the scope asked (%s)", scope == SEM_CODE ? "code: LAPLACE_CODE_COLLECTIONS" : "docs: LAPLACE_CODE_TEXT_COLLECTIONS", NULL); return -1; }
     const char *qkey = getenv("LAPLACE_CODE_QDRANT_KEY");
     const char *pre = getenv("LAPLACE_CODE_QUERY_PREFIX"), *tpre = getenv("LAPLACE_CODE_TEXT_QUERY_PREFIX");
     SemHit *hits = NULL; size_t nh = 0, cap = 0;
     int rc = 0;
     if (code) rc = group(query, url, getenv("LAPLACE_CODE_EMBED_KEY"), pre ? pre : CODE_PREFIX, colls, qd, qkey,
                          per_collection, &hits, &nh, &cap, err, errcap);
+    size_t ncode = nh;
     if (!rc && text) {
         const char *tkey = getenv("LAPLACE_CODE_TEXT_EMBED_KEY");
         rc = group(query, turl, tkey ? tkey : getenv("LAPLACE_CODE_EMBED_KEY"), tpre ? tpre : TEXT_PREFIX, tcolls,
                    qd, qkey, per_collection, &hits, &nh, &cap, err, errcap);
     }
     if (rc) { sem_free(hits, nh); return -1; }
+    for (size_t i = ncode; i < nh; i++) hits[i].prose = 1;
     *out = hits; *n = nh;
     return 0;
 }
