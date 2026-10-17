@@ -16,7 +16,8 @@ with tempfile.TemporaryDirectory(prefix='laplace-engine-output-') as directory:
     engine = Path(directory) / 'engine'
     engine.write_text('#!/bin/sh\nprintf "%s" "$2"\n')
     engine.chmod(0o700)
-    environment = dict(os.environ, LAPLACE_ENGINE=str(engine), MALLOC_PERTURB_='85')
+    token = 't' * 40
+    environment = dict(os.environ, LAPLACE_ENGINE=str(engine), MALLOC_PERTURB_='85', LAPLACE_MCP_TOKEN=token)
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
@@ -38,7 +39,7 @@ with tempfile.TemporaryDirectory(prefix='laplace-engine-output-') as directory:
             for expected in ('Longer output from the first child process', 'short', 'x'):
                 request = urllib.request.Request('http://127.0.0.1:' + str(port) + '/v1/text',
                     data=json.dumps({'input': expected}).encode(),
-                    headers={'Content-Type': 'application/json'})
+                    headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token})
                 with urllib.request.urlopen(request, timeout=10) as response:
                     result = json.load(response)
                 if result != {'exit': 0, 'log': expected}:

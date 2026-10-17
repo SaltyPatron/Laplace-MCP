@@ -19,6 +19,10 @@ It is built as the engine is (`CMakeLists.txt`): Laplace-Native as part of it, w
 
 One process holds one database connection. `lpm serve` is that process. `laplace_mcp.py` is not.
 
+## Who may call it
+
+`lpm serve` takes a bearer token: `LAPLACE_MCP_TOKEN`, or the `LAPLACE_MCP_TOKEN=` line of the file `LAPLACE_MCP_TOKEN_FILE` names. Without one of at least 32 characters and no whitespace it does not listen; it exits 2. Every request but `GET /health` sends `Authorization: Bearer <token>`; any other gets `401` with `WWW-Authenticate: Bearer` and `{"error":"unauthorized"}`, and nothing is dispatched. On hart-server setup makes the token once, in `/etc/laplace/secrets/modular-mcp.env` (root and `laplace-runner`, 0640), and the unit reads it. `lpm mcp` over stdio takes none: it is the calling user's own process.
+
 ## What a caller sends
 
 Jina's embedding API is `POST https://api.jina.ai/v1/embeddings` with a JSON body of `model` and `input` (a string or a list of strings, and for some models an image or a PDF). The response is a list of float vectors. See [Jina embeddings](https://jina.ai/embeddings/).
@@ -108,6 +112,7 @@ Specified past these routes, and not built as their own endpoints: turn, gaps, f
 ```toml
 [mcp_servers.laplace]
 url = "http://127.0.0.1:5188/mcp"
+headers = { Authorization = "Bearer ${LAPLACE_MODULAR_MCP_TOKEN}" }
 ```
 
 `grok mcp doctor laplace` reported handshake OK, protocol 2025-11-25, 5 tools. A Grok process restricted to `laplace__search` called `search` on `Sherlock Holmes` and received the six containers and three claims. A session that was already open before `grok mcp add` does not gain the tool; `use_tool` in that session returns tool not found until a new session loads the config.
@@ -117,7 +122,7 @@ url = "http://127.0.0.1:5188/mcp"
 ```
 curl -skS --resolve hart-server:8443:127.0.0.1 \
   -X POST https://hart-server:8443/mcp \
-  -H 'Content-Type: application/json' \
+  -H 'Content-Type: application/json' -H "Authorization: Bearer $LAPLACE_MODULAR_MCP_TOKEN" \
   -d '{"op":"search","input":"Sherlock Holmes"}'
 ```
 
