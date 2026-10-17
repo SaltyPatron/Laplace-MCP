@@ -5,10 +5,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import socket
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 
@@ -159,26 +161,56 @@ def verify_package(release):
     return receipt
 
 
-def request(base, path, data=None):
-    req = urllib.request.Request(base + path, data=None if data is None else json.dumps(data).encode(),
-                                 headers={'Content-Type': 'application/json'})
+def service_token(config):
+    """The installed listener's token: LAPLACE_MCP_TOKEN, else the file setup made beside the environment file."""
+    value = os.environ.get('LAPLACE_MCP_TOKEN', '')
+    if not value:
+        path = Path(config.get('token_file') or Path(config['environment_file']).parent / 'secrets/modular-mcp.env')
+        if not path.is_file():
+            raise ValueError('The listener token is absent; setup makes it: ' + str(path))
+        for line in path.read_text().splitlines():
+            if line.startswith('LAPLACE_MCP_TOKEN='):
+                value = line.partition('=')[2].strip().strip('"\'')
+                break
+    if len(value) < 32 or any(c.isspace() for c in value):
+        raise ValueError('The listener token is malformed')
+    return value
+
+
+def request(base, path, data=None, token=None):
+    headers = {'Content-Type': 'application/json'}
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    req = urllib.request.Request(base + path, data=None if data is None else json.dumps(data).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=30) as response:
         if response.status != 200:
             raise ValueError('Unexpected service status: ' + str(response.status))
         return json.load(response)
 
 
-def verify_http(base):
-    surface = request(base, '/v1/surface')
+def refused(base, path, data, token):
+    try:
+        request(base, path, data, token)
+    except urllib.error.HTTPError as error:
+        return error.code == 401
+    return False
+
+
+def verify_http(base, token):
+    # The listener refuses a caller without the token, and one with another, before anything it serves.
+    for path, data in (('/v1/surface', None), ('/mcp', {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})):
+        if not refused(base, path, data, None) or not refused(base, path, data, 'x' * 64):
+            raise ValueError('The listener served a request without its token: ' + path)
+    surface = request(base, '/v1/surface', token=token)
     if surface.get('service') != 'Laplace-MCP':
         raise ValueError('Listener is not the modular MCP service')
-    search = request(base, '/v1/search', {'input': 'Sherlock Holmes'})
+    search = request(base, '/v1/search', {'input': 'Sherlock Holmes'}, token)
     if not all(isinstance(search.get(k), list) for k in ('physicality', 'claims', 'occurrences', 'attestations', 'constituents')):
         raise ValueError('Database search did not return its typed result collections')
     if not search['constituents']:
         raise ValueError('Configured knowledge did not resolve the declared installation readback')
     initialized = request(base, '/mcp', {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
-        'params': {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': 'installation', 'version': '1'}}})
+        'params': {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': 'installation', 'version': '1'}}}, token)
     if 'result' not in initialized or initialized['result'].get('serverInfo', {}).get('name') != 'laplace':
         raise ValueError('MCP initialization failed')
     engine = {}
@@ -189,12 +221,12 @@ def verify_http(base):
         ('degrees', {'input': 'Sherlock Holmes', 'other': 'Sherlock Holmes'}),
         ('pull', {'input': 'Sherlock Holmes'}),
     ):
-        result = request(base, '/v1/' + operation, arguments)
+        result = request(base, '/v1/' + operation, arguments, token)
         if result.get('exit') != 0 or not isinstance(result.get('log'), str) or not result['log']:
             raise ValueError('Installed Engine operation failed: ' + operation)
         engine[operation] = {'exit': result['exit'], 'output_bytes': len(result['log'].encode())}
     return {'surface': 'passed', 'database_search': {k: len(search[k]) for k in ('physicality', 'claims', 'occurrences', 'attestations', 'constituents')},
-            'mcp_initialize': 'passed', 'engine_operations': engine,
+            'mcp_initialize': 'passed', 'unauthenticated': 'refused', 'engine_operations': engine,
             'scope': 'Installed protocol, Engine operations and selected native/database readback; no ingestion or whole-product capability claim'}
 
 
@@ -202,6 +234,9 @@ def probe(config, release):
     verify_package(release)
     environment = runtime_environment(config, release)
     run([Path(release) / 'bin/lpm', 'check'], env=environment, cwd=config['state'])
+    # The candidate listens on a port of its own, with a token of its own.
+    token = secrets.token_hex(32)
+    environment['LAPLACE_MCP_TOKEN'] = token
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
@@ -217,7 +252,7 @@ def probe(config, release):
                         break
                 except OSError:
                     time.sleep(.1)
-            return verify_http('http://127.0.0.1:' + str(port))
+            return verify_http('http://127.0.0.1:' + str(port), token)
         finally:
             process.terminate()
             try:
@@ -240,7 +275,7 @@ def main():
     else:
         release = Path(args.release) if args.release else (Path(config['prefix']) / 'current').resolve()
         verify_package(release)
-        result = probe(config, release) if args.operation == 'probe' else verify_http('http://' + config['bind'] + ':' + str(config['http_port']))
+        result = probe(config, release) if args.operation == 'probe' else verify_http('http://' + config['bind'] + ':' + str(config['http_port']), service_token(config))
         atomic_json(args.output, result)
 
 
