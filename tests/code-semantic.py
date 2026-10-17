@@ -91,7 +91,7 @@ with tempfile.TemporaryDirectory(prefix='lpm-code-semantic-') as directory:
     assert 'caf\u00e9' in by['handler.py']['snippet'], by['handler.py']
     # The fused order: each hit's score is the sum of weight/(60 + rank) over the rankings that hold it, best first;
     # a code collection weighs 1 and the rerank half by default.
-    assert out['fusion'] == 'rrf' and out['scope'] == 'all' and out['weights'] == {'rerank': 0.5, 'code': 1}, out
+    assert out['fusion'] == 'rrf' and out['scope'] == 'code' and out['weights'] == {'rerank': 0.5, 'code': 1}, out
     for h in out['hits']:
         want = sum(out['weights'][k] / (60 + r) for k, r in h['ranks'].items() if k != 'lexical')
         assert abs(h['fused'] - want) < 1e-5 and 'rerank' in h['ranks'], h
@@ -106,7 +106,7 @@ with tempfile.TemporaryDirectory(prefix='lpm-code-semantic-') as directory:
     err, ex = mcp(env, 'ingest_run_journal written', explain=True, limit=1)
     assert not err and len(ex['hits']) == ex['candidates']['union'] >= 2, ex
 
-    # A prose collection: asked under scope all (half weight) and docs, not under code.
+    # A prose collection: asked under scope all (half weight) and docs, not under code, the default.
     penv = dict(env, LAPLACE_CODE_TEXT_EMBED_URL=base + '/v1/embeddings', LAPLACE_CODE_TEXT_COLLECTIONS='prose')
     def asked(**extra):
         before = len(seen)
@@ -114,6 +114,8 @@ with tempfile.TemporaryDirectory(prefix='lpm-code-semantic-') as directory:
         assert not err, o
         return o, {s[0].split('/')[2] for s in seen[before:] if s[0].startswith('/collections/')}
     o, colls = asked()
+    assert colls == {'code'} and o['scope'] == 'code', (colls, o['scope'])
+    o, colls = asked(scope='all')
     assert colls == {'code', 'prose'} and o['weights'] == {'rerank': 0.5, 'code': 1, 'prose': 0.5}, (colls, o['weights'])
     note = [h for h in o['hits'] if h['path'].endswith('notes.md')][0]
     assert note['ranks']['prose'] == 1 and abs(note['fused'] - (0.5 / (60 + note['ranks']['rerank']) + 1 / 62 + 0.5 / 61)) < 1e-5, note
@@ -123,6 +125,8 @@ with tempfile.TemporaryDirectory(prefix='lpm-code-semantic-') as directory:
     assert colls == {'prose'} and 'code' not in o['weights'], (colls, o)
     err, o = mcp(penv, 'ingest_run_journal written', scope='nowhere')
     assert err and 'scope' in o['error'], o
+    err, o = mcp(dict(penv, LAPLACE_CODE_SCOPE='all'), 'ingest_run_journal written')
+    assert not err and o['scope'] == 'all' and 'prose' in o['weights'], o
     err, o = mcp(env, 'ingest_run_journal written', scope='docs')
     assert err and 'LAPLACE_CODE_TEXT_COLLECTIONS' in o['error'], o
     err, o = mcp(dict(env, LAPLACE_CODE_RERANK_WEIGHT='0'), 'ingest_run_journal written')

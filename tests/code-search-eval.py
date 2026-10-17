@@ -5,8 +5,8 @@ embedding collections' rankings fused with it), and the file each order puts the
 mean reciprocal rank at 10, median latency. It needs the semantic configuration code_search is run with
 (LAPLACE_CODE_SEMANTIC, LAPLACE_CODE_QDRANT, LAPLACE_CODE_EMBED_URL, LAPLACE_CODE_COLLECTIONS, ...); without it the eval
 says so and passes, so CI runs it where a runner is configured.
-  tests/code-search-eval.py path/to/lpm [--min-mrr X] [--fusion rerank,rrf@code,rrf] [--explain FILE]
-(rrf@code: rrf with scope code.)
+  tests/code-search-eval.py path/to/lpm [--min-mrr X] [--fusion rerank,rrf@all,rrf] [--explain FILE]
+(rrf@all: rrf with scope all; rrf: the default scope.)
 """
 import argparse, json, os, statistics, subprocess, sys, time
 
@@ -68,7 +68,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('lpm')
     ap.add_argument('--min-mrr', type=float, default=None, help='fail when the last fusion scores below this')
-    ap.add_argument('--fusion', default='rerank,rrf@code,rrf', help='orders to compare; rrf@code asks scope code')
+    ap.add_argument('--fusion', default='rerank,rrf@all,rrf', help='orders to compare; rrf@all asks scope all, rrf the default scope')
     ap.add_argument('--explain', help='write every candidate with its rankings here (the last fusion)')
     a = ap.parse_args()
     if not os.environ.get('LAPLACE_CODE_SEMANTIC') or os.environ.get('LAPLACE_CODE_SEMANTIC') == '0' or not os.environ.get('LAPLACE_CODE_QDRANT'):
