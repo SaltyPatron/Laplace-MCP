@@ -1253,6 +1253,104 @@ static int env_weight(const char *name, double *w) {
     return 1;
 }
 
+/* Query-side vocabulary bridging through the substrate (#19). Each word of the query goes up to its concepts and back
+ * down in the same language, as `laplace translate WORD en en` reads it: along the relations the engine's firmware
+ * names for translate (a word's sense, the sense's synset, the synset's interlingual concept), its first concepts in
+ * the witness's order (`-n`, LAPLACE_CODE_BRIDGE_CONCEPTS, default 2). The words reached are added to the text the
+ * lexical retrieval and the Laplace rerank read; the embeddings are asked the query as written. Nothing here names a
+ * word: what bridges is what the database's wordnets attest. A word the database has no concept of brings nothing. */
+typedef struct { char *text; size_t n, cap; } Bridge;
+static int bridge_word_ok(const char *w) {
+    size_t l = strlen(w);
+    if (l < 2 || l > 48) return 0;
+    for (const char *p = w; *p; p++)
+        if (!isalpha((unsigned char)*p) && *p != ' ' && *p != '-') return 0;
+    return 1;
+}
+static int bridge_has(const char *list, const char *w) {     /* list: "\na\nb\n" */
+    char k[64];
+    snprintf(k, sizeof k, "\n%s\n", w);
+    return strstr(list, k) != NULL;
+}
+/* Returns the bridged text (query, then the words reached), or NULL when nothing was reached; info gets a JSON object
+ * of each query word to the words it reached. */
+static char *bridge_query(const char *query, char *info, size_t icap, double *ms) {
+    uint64_t t0 = nsec();
+    const char *lang = getenv("LAPLACE_CODE_BRIDGE_LANGUAGE"), *nc = getenv("LAPLACE_CODE_BRIDGE_CONCEPTS");
+    if (!lang || !*lang) lang = "en";
+    char concepts[8];
+    snprintf(concepts, sizeof concepts, "%d", nc && atoi(nc) > 0 && atoi(nc) < 100 ? atoi(nc) : 2);
+    size_t ql = strlen(query);
+    char *out = malloc(ql + 8192), *seen = malloc(ql + 8192);
+    if (!out || !seen) { free(out); free(seen); *ms = 0; snprintf(info, icap, "{}"); return NULL; }
+    size_t on = (size_t)snprintf(out, ql + 8192, "%s", query), ocap = ql + 8192, in = 0;
+    strcpy(seen, "\n");
+    in += (size_t)snprintf(info + in, icap - in, "{");
+    int words = 0, added = 0, first = 1;
+    for (const char *p = query; *p && words < 16;) {
+        while (*p && !isalpha((unsigned char)*p)) p++;
+        const char *s = p;
+        while (*p && isalpha((unsigned char)*p)) p++;
+        size_t l = (size_t)(p - s);
+        if (l < 3 || l > 40) continue;
+        char w[48];
+        for (size_t i = 0; i < l; i++) w[i] = (char)tolower((unsigned char)s[i]);
+        w[l] = 0;
+        if (bridge_has(seen, w)) continue;
+        size_t sl = strlen(seen);
+        snprintf(seen + sl, ql + 8192 - sl, "%s\n", w);
+        words++;
+        char *av[] = { (char *)ENGINE, "translate", "-n", concepts, w, (char *)lang, (char *)lang, NULL };
+        char *log = NULL;
+        int code = 0;
+        if (!engine_run(av, &log, &code, 20) || code != 0) { free(log); continue; }
+        int listed = 0;
+        char wj[2048];
+        size_t wn = 0;
+        wj[0] = 0;
+        for (char *line = log; line && *line;) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = 0;
+            /* a concept's words in a language: four spaces, the language, then "a, b, c" */
+            size_t ll = strlen(lang);
+            if (!strncmp(line, "    ", 4) && !strncmp(line + 4, lang, ll) && line[4 + ll] == ' ' && !strstr(line, "(nothing attested)")) {
+                char *q = line + 4 + ll;
+                while (*q) {
+                    while (*q == ' ' || *q == ',') q++;
+                    char *e = q;
+                    while (*e && *e != ',') e++;
+                    char syn[64];
+                    size_t yl = (size_t)(e - q);
+                    while (yl && q[yl - 1] == ' ') yl--;
+                    if (yl && yl < sizeof syn) {
+                        for (size_t i = 0; i < yl; i++) syn[i] = (char)tolower((unsigned char)q[i]);
+                        syn[yl] = 0;
+                        if (bridge_word_ok(syn) && !bridge_has(seen, syn) && listed < 8) {
+                            size_t sl2 = strlen(seen);
+                            if (sl2 + yl + 2 < ql + 8192) snprintf(seen + sl2, ql + 8192 - sl2, "%s\n", syn);
+                            if (on + yl + 2 < ocap) on += (size_t)snprintf(out + on, ocap - on, " %s", syn);
+                            char se[160];
+                            json_esc(syn, se, sizeof se);
+                            if (wn + strlen(se) + 4 < sizeof wj) wn += (size_t)snprintf(wj + wn, sizeof wj - wn, "%s\"%s\"", listed ? "," : "", se);
+                            listed++;
+                            added++;
+                        }
+                    }
+                    q = *e ? e + 1 : e;
+                }
+            }
+            line = nl ? nl + 1 : NULL;
+        }
+        if (listed && in + wn + 64 < icap) { in += (size_t)snprintf(info + in, icap - in, "%s\"%s\":[%s]", first ? "" : ",", w, wj); first = 0; }
+        free(log);
+    }
+    snprintf(info + in, icap - in, "}");
+    free(seen);
+    *ms = (double)(nsec() - t0) / 1e6;
+    if (!added) { free(out); return NULL; }
+    return out;
+}
+
 static void on_code_search(int c, const char *body) {
     char query[8192] = "", path[4096] = "";
     if (!jstr(body, "query", query, sizeof query) && !jstr(body, "input", query, sizeof query)) {
@@ -1327,11 +1425,20 @@ static void on_code_search(int c, const char *body) {
         sem_ms = (double)(nsec() - s0) / 1e6;
     }
 
+    /* bridge (LAPLACE_CODE_BRIDGE): the query's words joined by what the database's wordnets attest of them */
+    const char *be = getenv("LAPLACE_CODE_BRIDGE");
+    int bridge = jbool(body, "bridge", be && *be && strcmp(be, "0"));
+    char binfo[8192] = "{}";
+    double bridge_ms = 0;
+    char *bridged = bridge ? bridge_query(query, binfo, sizeof binfo, &bridge_ms) : NULL;
+    const char *rq = bridged ? bridged : query;
+
     size_t want = semantic ? (size_t)limit * 3 : (size_t)limit;
     LpmHit hits[192];
-    size_t nh = lpm_search(ix, query, strlen(query), hits, want);
+    size_t nh = lpm_search(ix, rq, strlen(rq), hits, want);
     CodeCand *cand = calloc(nh + ns + 1, sizeof *cand);
     if (!cand) {
+        free(bridged);
         sem_free(sh, ns);
         http(c, 500, "{\"error\":\"out of memory\"}");
         return;
@@ -1395,7 +1502,7 @@ static void on_code_search(int c, const char *body) {
         if (!snip[0] && k->semantic) snprintf(snip, sizeof snip, "%s", sh[k->semantic - 1].text);
         k->snippet = strdup(snip);
         k->frechet = -1.0;
-        k->rerank = snip[0] ? lpm_rerank(ix, query, strlen(query), snip, strlen(snip), &k->shared, &k->frechet) : 0.0;
+        k->rerank = snip[0] ? lpm_rerank(ix, rq, strlen(rq), snip, strlen(snip), &k->shared, &k->frechet) : 0.0;
 
         if (!k->lexical) {
             LpmRec r = {0};
@@ -1416,7 +1523,7 @@ static void on_code_search(int c, const char *body) {
     int by_rerank = !strcmp(fusion, "rerank");
     if (strcmp(fusion, "rrf") && !by_rerank) {
         for (size_t i = 0; i < nc; i++) free(cand[i].snippet);
-        free(cand); sem_free(sh, ns);
+        free(cand); sem_free(sh, ns); free(bridged);
         http(c, 400, "{\"error\":\"fusion is rrf or rerank\"}");
         return;
     }
@@ -1448,7 +1555,10 @@ static void on_code_search(int c, const char *body) {
         json_esc(coll[ci], cn, sizeof cn);
         buf_fmt(&out, &un, &ucap, ",\"%s\":%g", cn, coll_prose[ci] ? w_prose : 1.0);
     }
-    buf_fmt(&out, &un, &ucap, "},\"candidates\":{\"lexical\":%zu,\"semantic\":%zu,\"union\":%zu},\"hits\":[", nh, ns, nc);
+    buf_add(&out, &un, &ucap, "}", 1);
+    if (bridge) buf_fmt(&out, &un, &ucap, ",\"bridge\":{\"words\":%s,\"ms\":%.3f}", binfo, bridge_ms);
+    free(bridged);
+    buf_fmt(&out, &un, &ucap, ",\"candidates\":{\"lexical\":%zu,\"semantic\":%zu,\"union\":%zu},\"hits\":[", nh, ns, nc);
     for (size_t i = 0; i < shown; i++) {
         CodeCand *k = &cand[i];
         char id[33], pe[8192], se[24576], ce[300] = "";
@@ -2158,7 +2268,7 @@ static void rpc_id(const char *body, char *out, size_t cap) {
 
 static const char *TOOLS =
     "{\"tools\":["
-    "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates, and the union is ordered by reciprocal rank fusion of each collection's ranking and the Laplace rerank's (fusion rerank: the rerank alone); a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, the fused score and each ranking's rank of the hit, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"fusion\":{\"type\":\"string\",\"enum\":[\"rrf\",\"rerank\"]},\"scope\":{\"type\":\"string\",\"enum\":[\"all\",\"code\",\"docs\"],\"description\":\"which embedding collections are asked: code (the default), prose (docs), or both (all)\"},\"explain\":{\"type\":\"boolean\",\"description\":\"every candidate of the union, not only the first limit\"}},\"required\":[\"query\"]}},"
+    "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates, and the union is ordered by reciprocal rank fusion of each collection's ranking and the Laplace rerank's (fusion rerank: the rerank alone); a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, the fused score and each ranking's rank of the hit, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"fusion\":{\"type\":\"string\",\"enum\":[\"rrf\",\"rerank\"]},\"bridge\":{\"type\":\"boolean\",\"description\":\"add to the query the words the database's wordnets reach from its words (laplace translate), for the lexical retrieval and the rerank\"},\"scope\":{\"type\":\"string\",\"enum\":[\"all\",\"code\",\"docs\"],\"description\":\"which embedding collections are asked: code (the default), prose (docs), or both (all)\"},\"explain\":{\"type\":\"boolean\",\"description\":\"every candidate of the union, not only the first limit\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code (query) stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment above it, nothing from a working tree. Each file that holds it, by the pathname its record gives: defines, the declaration kinds its recipe said of the name there (function_definition, class_declaration...), files that define it first; occurrences, how many places in its syntax tree hold it; at, up to occurrences (default 3) of them: the line, the innermost enclosing node of at least context bytes (default 120), and the enclosing declaration's first line with its span line0..line1. defines true: only files that define it. path: a substring the file path must contain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"defines\":{\"type\":\"boolean\"},\"limit\":{\"type\":\"integer\"},\"occurrences\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"sources\",\"description\":\"The sources the Laplace database holds: each witness ID, its name and trust.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"file_outline\",\"description\":\"What a file in the Laplace database declares: the claims [kind, name] its code recipe said of it, in the file's order, each with the line where its name first stands after the one before. The file by the end of its pathname (path) or its ID (file, as code_where returns it).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"}},\"required\":[]}},"
