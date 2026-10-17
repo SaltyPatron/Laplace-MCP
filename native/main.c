@@ -186,6 +186,36 @@ static int cmd_index(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_update(int argc, char **argv) {
+    if (argc < 2) return fail("usage: lpm update RECORDS PATH...");
+    Lpm *ix = lpm_load(argv[0], NULL);
+    int fresh = !ix;
+    if (!ix) ix = lpm_new(NULL);
+    if (!ix) return fail("tier 0 did not map");
+    uint64_t t0 = now();
+    LpmUpdate u = {0};
+    for (int i = 1; i < argc; i++) {
+        if (lpm_update_path(ix, argv[i], &u)) {
+            fprintf(stderr, "fail: %s\n", argv[i]);
+            return 1;
+        }
+    }
+    uint64_t ns = now() - t0;
+    if ((fresh || u.changed || u.added || u.removed) && lpm_save(ix, argv[0])) return fail("save");
+    LpmStats s;
+    lpm_stats(ix, &s);
+    printf("unchanged    %llu\n", (unsigned long long)u.unchanged);
+    printf("changed      %llu\n", (unsigned long long)u.changed);
+    printf("added        %llu\n", (unsigned long long)u.added);
+    printf("removed      %llu\n", (unsigned long long)u.removed);
+    printf("files        %llu\n", (unsigned long long)s.files);
+    printf("documents    %llu\n", (unsigned long long)s.documents);
+    printf("stale        %llu\n", (unsigned long long)s.stale);
+    printf("seconds      %.4f\n", (double)ns / 1e9);
+    lpm_free(ix);
+    return 0;
+}
+
 static int cmd_search(int argc, char **argv) {
     if (argc < 2) return fail("usage: lpm search RECORDS QUERY");
     Lpm *ix = lpm_load(argv[0], NULL);
@@ -291,10 +321,13 @@ static int cmd_admit(int argc, char **argv) {
 }
 
 static int cmd_fetch(int argc, char **argv) {
-    if (argc < 2) return fail("usage: lpm fetch FILE ID");
-    Lpm *ix = lpm_new(NULL);
-    if (!ix) return fail("tier 0 did not map");
-    if (lpm_index_path(ix, argv[0])) return fail(argv[0]);
+    if (argc < 2) return fail("usage: lpm fetch FILE|RECORDS ID");
+    Lpm *ix = lpm_load(argv[0], NULL);             /* saved records, else the file admitted here */
+    if (!ix) {
+        ix = lpm_new(NULL);
+        if (!ix) return fail("tier 0 did not map");
+        if (lpm_index_path(ix, argv[0])) return fail(argv[0]);
+    }
     uint8_t idb[16];
     if (strlen(argv[1]) != 32) return fail("id is 32 hex characters");
     for (int i = 0; i < 16; i++) {
@@ -329,7 +362,7 @@ static int cmd_serve(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: lpm check | id STRING | admit FILE... | fetch FILE ID | index RECORDS PATH... | search RECORDS QUERY | bench PATH... | serve [HOST [PORT]] | mcp\n");
+        fprintf(stderr, "usage: lpm check | id STRING | admit FILE... | fetch FILE ID | index RECORDS PATH... | update RECORDS PATH... | search RECORDS QUERY | bench PATH... | serve [HOST [PORT]] | mcp\n");
         return 2;
     }
     if (!strcmp(argv[1], "check")) return cmd_check();
@@ -345,6 +378,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "admit")) return cmd_admit(argc - 2, argv + 2);
     if (!strcmp(argv[1], "fetch")) return cmd_fetch(argc - 2, argv + 2);
     if (!strcmp(argv[1], "index")) return cmd_index(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "update")) return cmd_update(argc - 2, argv + 2);
     if (!strcmp(argv[1], "search")) return cmd_search(argc - 2, argv + 2);
     if (!strcmp(argv[1], "bench")) return cmd_bench(argc - 2, argv + 2);
     if (!strcmp(argv[1], "serve")) return cmd_serve(argc - 2, argv + 2);

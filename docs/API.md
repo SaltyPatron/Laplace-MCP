@@ -134,9 +134,12 @@ A query is decomposed the same way. Documents are ranked by BM25 over the query 
 | Name | What |
 |---|---|
 | `LAPLACE_CODE_ROOTS` | directories indexed when there are no records, separated by `;` (or `:` on Linux) |
-| `LAPLACE_CODE_RECORDS` | records file: loaded on the first call when it exists, written by `reindex` |
+| `LAPLACE_CODE_RECORDS` | records file: loaded on the first call when it exists and is this version, else the index is built from the roots and saved; saved again whenever a refresh changes anything |
+| `LAPLACE_CODE_REFRESH_SECONDS` | how often a `code_search` call first brings the index up to date with its roots; `0` never (default `30`) |
 
-`lpm index RECORDS PATH...` builds the same records from the command line and `lpm search RECORDS QUERY` queries them.
+Records (version 2) hold every entity with its constituents, every file with its size, modification time and content hash, every document, and the postings, so a loaded index answers as the one that was saved. A refresh, `reindex`, or `lpm update` stats each file under the roots: a file whose size and time agree is not read, one whose content hash agrees is not admitted again, a changed or new file is admitted, and a file no longer there is removed. Documents of changed and removed files stay in the records as stale and are never answers; when they pass 30% of all documents the index is built again from the roots. On the Laplace workspace (4014 files, 36457 documents) the records are 317 MB, a refresh with nothing changed takes 0.1 s, and loading them about 0.9 s.
+
+`lpm index RECORDS PATH...` builds records from the command line, `lpm update RECORDS PATH...` brings them up to date, `lpm search RECORDS QUERY` queries them, and `lpm fetch RECORDS ID` shows an entity and its constituents.
 
 An agent on the same machine runs the server over stdio (`lpm mcp`, one JSON-RPC message per line). For example, in `~/.codex/config.toml`:
 
@@ -148,3 +151,5 @@ env = { LAPLACE_CODE_RECORDS = "E:/Data/Laplace/work/code-index/workspace.lpm" }
 ```
 
 `code_search` takes `query` (required), `limit` (1 to 64, default 15) and `path` (a file or directory to add before searching). Each hit has `path`, `line0`, `line1`, `id`, `hilbert`, `shared` (query constituents held), `frechet` (4D Fréchet of the query and snippet word trajectories), `rerank` (the `rerank` tool's score of the snippet, 0 to 1) and `snippet` (up to 60 lines read from the file).
+
+`reindex` takes `path` (optional: one file or directory; otherwise every root) and returns `unchanged`, `changed`, `added`, `removed`, `rebuilt`, `files`, `docs`, `stale`, `entities` and `ms`.
