@@ -120,3 +120,31 @@ curl -skS --resolve hart-server:8443:127.0.0.1 \
 ```
 
 `op` is `embeddings`, `search`, `forward`, `shape`, `ingest`, or `surface`.
+
+## Code index
+
+`code_search`, `reindex` and `rerank` work on a local code index held by the process, not on the database. The index is built on the client the way content is admitted: a file whose suffix has a compiled tree-sitter grammar (`LAPLACE_GRAMMARS`) is its syntax tree, `.tsv`/`.csv` are records, anything else that is text is UAX #29. Documents are:
+
+- each declaration-sized grammar node (3 to 120 lines) with no ancestor that is already a document; a larger node, such as a namespace or a class, is not a document and its members are;
+- for text with no grammar and more than 48 lines, blocks of 8 to 48 lines cut at blank lines and before `#` headings;
+- every file as a whole.
+
+A query is decomposed the same way. Documents are ranked by BM25 over the query constituents they hold (presence only, IDF `log(1 + N/df)`, `k1 = 1.2`, `b = 0.75` on document bytes), so a declaration that holds the query ranks above the file around it. A span that overlaps a better hit in the same file is not returned again. Paths are returned with `/` separators.
+
+| Name | What |
+|---|---|
+| `LAPLACE_CODE_ROOTS` | directories indexed when there are no records, separated by `;` (or `:` on Linux) |
+| `LAPLACE_CODE_RECORDS` | records file: loaded on the first call when it exists, written by `reindex` |
+
+`lpm index RECORDS PATH...` builds the same records from the command line and `lpm search RECORDS QUERY` queries them.
+
+An agent on the same machine runs the server over stdio (`lpm mcp`, one JSON-RPC message per line). For example, in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.laplace-code]
+command = "D:/Libraries/build/Laplace/Laplace-MCP/icx-release/lpm.exe"
+args = ["mcp"]
+env = { LAPLACE_CODE_RECORDS = "E:/Data/Laplace/work/code-index/workspace.lpm" }
+```
+
+`code_search` takes `query` (required), `limit` (1 to 64, default 15) and `path` (a file or directory to add before searching). Each hit has `path`, `line0`, `line1`, `id`, `hilbert`, `shared` (query constituents held), `frechet` and `snippet` (up to 60 lines read from the file).
