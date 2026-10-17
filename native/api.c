@@ -1760,11 +1760,12 @@ static void on_code_where(int c, const char *body) {
                 buf_add(&out, &on, &ocap, ",\"context\":\"", 12);
                 if (ctx) cw_str(&out, &on, &ocap, ctx);
                 buf_add(&out, &on, &ocap, "\",\"enclosing\":\"", 15);
-                if (encl) {                                 /* its head: up to its first line's end, at most 240 bytes */
-                    size_t hl = strcspn(encl, "\n");
-                    if (hl > 240) { hl = 240; while (hl && ((uint8_t)encl[hl] & 0xC0) == 0x80) hl--; }
-                    encl[hl] = 0;
-                    cw_str(&out, &on, &ocap, encl);
+                if (encl) {                                 /* its head: its first line that is not blank, at most 240 bytes */
+                    char *hd = encl + strspn(encl, " \t\r\n");
+                    size_t hl = strcspn(hd, "\r\n");
+                    if (hl > 240) { hl = 240; while (hl && ((uint8_t)hd[hl] & 0xC0) == 0x80) hl--; }
+                    hd[hl] = 0;
+                    cw_str(&out, &on, &ocap, hd);
                 }
                 buf_add(&out, &on, &ocap, "\"}", 2);
                 no++;
