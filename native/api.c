@@ -1475,6 +1475,249 @@ static const char *SURFACE =
     "\"database_functions\":[\"laplace_containers\",\"laplace_claims\",\"laplace_claims_each\",\"laplace_text\",\"laplace_fills\",\"laplace_forward\",\"laplace_frechet4d\",\"laplace_dtw4d\",\"laplace_edr4d\",\"laplace_distance4d\",\"laplace_couple\",\"laplace_follows\",\"laplace_paths\",\"laplace_attested\",\"laplace_compose\",\"laplace_parts\"],"
     "\"engine_commands\":[\"tier0\",\"flags\",\"highway\",\"deploy\",\"sources\",\"ingest\",\"forget\",\"sweep\",\"index\",\"structure\",\"tree\",\"text\",\"pull\",\"turn\",\"hop\",\"translate\",\"degrees\",\"fills\",\"status\",\"bench\",\"model\"]}";
 
+/* ---- code from the database (Laplace-MCP#9): what an ingested source's files hold, read off the containment.
+ * A file is a trunk [metadata, content]; a recipe with a grammar records its content as the syntax tree, so the nodes
+ * above a name are its enclosing expressions, statements and declarations, and above them the file. Nothing is read
+ * from a working tree: the path is the file's own pathname record, the text and lines are the recorded content. */
+typedef struct Reader Reader;
+Reader *reader_new(PGconn *pg);
+void reader_free(Reader *);
+char *reader_text(Reader *, const lp_id *id, size_t limit);
+size_t reader_parts(Reader *, const lp_id *id, lp_id *out, size_t cap);
+Hold *holds_any(const lp_id *keys, int nkeys, int *nout);
+
+typedef struct { lp_id id; size_t down; int file; } CwNode;   /* down: the node it was reached from (a step toward the name) */
+typedef struct { CwNode *n; size_t nn, cn; lp_idmap *m; } CwDag;
+static size_t cw_node(CwDag *d, const lp_id *id, size_t down, int *fresh) {
+    bool f;
+    size_t i = lp_idmap_put(d->m, id, &f);
+    if (f) {
+        if (d->nn == d->cn) { d->cn = d->cn ? d->cn * 2 : 1024; CwNode *g = realloc(d->n, d->cn * sizeof *d->n); if (!g) abort(); d->n = g; }
+        d->n[d->nn].id = *id; d->n[d->nn].down = down; d->n[d->nn].file = 0; d->nn++;
+    }
+    if (fresh) *fresh = f;
+    return i;
+}
+
+/* A file's path from the OS's record in its metadata tree: [pathname, its folders], or [filename, NAME]. */
+static char *cw_file_name(Reader *rd, const lp_id *file) {
+    lp_id at = *file, kid[64];
+    for (int depth = 0; depth < 8; depth++) {
+        size_t n = reader_parts(rd, &at, kid, 64);
+        if (!n) break;
+        for (size_t i = 0; i < n && i < 64; i++) {
+            lp_id two[4];
+            size_t m = reader_parts(rd, &kid[i], two, 4);
+            if (m != 2) continue;
+            char *k = reader_text(rd, &two[0], 32);
+            int path = !strcmp(k, "pathname"), name = !strcmp(k, "filename");
+            free(k);
+            if (name) return reader_text(rd, &two[1], 300);
+            if (path) {
+                lp_id seg[128];
+                size_t ns = reader_parts(rd, &two[1], seg, 128);
+                char *o = calloc(1, 4096);
+                size_t ol = 0;
+                for (size_t z = 0; z < ns && z < 128 && ol < 4000; z++) {
+                    char *t = reader_text(rd, &seg[z], 300);
+                    ol += (size_t)snprintf(o + ol, 4096 - ol, "/%s", t);
+                    free(t);
+                }
+                return o;
+            }
+        }
+        at = kid[0];
+    }
+    return strdup("");
+}
+
+/* Up from one name through every path that holds it, to the files: a holder whose first vertex is metadata, reached
+ * through its content, is a file and the walk stops there. A name held only as metadata (a file called so) is not an
+ * occurrence. The front is bounded so a name as common as a keyword answers what it reached and says so. */
+static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, int *cut) {
+    d->m = lp_idmap_new();
+    cw_node(d, name, (size_t)-1, NULL);
+    lp_idmap *front = lp_idmap_new();
+    lp_idmap_put(front, name, NULL);
+    lp_vec(lp_vertex) vx = { 0 };
+    int level = 0, files = 0;
+    *cut = 0;
+    while (lp_idmap_count(front) && level < 128) {
+        int nh = 0;
+        Hold *h = holds_any(lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
+        lp_idmap *next = lp_idmap_new();
+        for (int j = 0; j < nh; j++) {
+            size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
+            if (!nv) continue;
+            lp_vec_reserve(&vx, nv);
+            lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
+            int is_file = vx.v[0].said == LP_SAID_METADATA;
+            for (size_t v = 0; v < nv; v++) {
+                if (vx.v[v].said == LP_SAID_METADATA) continue;
+                ptrdiff_t ci = lp_idmap_find(d->m, &vx.v[v].id);
+                if (ci < 0 || lp_idmap_find(front, &vx.v[v].id) < 0) continue;
+                if (d->nn >= max_nodes) { *cut = 1; break; }
+                int fresh = 0;
+                size_t pi = cw_node(d, &h[j].entity, (size_t)ci, &fresh);
+                if (fresh && is_file) { d->n[pi].file = 1; files++; }
+                else if (fresh) lp_idmap_put(next, &h[j].entity, NULL);
+                break;
+            }
+        }
+        holds_free(h, nh);
+        lp_idmap_free(front);
+        front = next;
+        level++;
+        if (*cut) break;
+    }
+    lp_vec_free(&vx);
+    lp_idmap_free(front);
+    *levels = level;
+    return files;
+}
+
+static size_t cw_lines(const char *text, size_t upto) {
+    size_t l = 1;
+    for (size_t i = 0; i < upto && text[i]; i++) if (text[i] == '\n') l++;
+    return l;
+}
+
+static void on_code_where(int c, const char *body) {
+    char name[2048];
+    if (!jstr(body, "name", name, sizeof name) || !name[0]) {
+        if (!jstr(body, "query", name, sizeof name) || !name[0]) { http(c, 400, "{\"error\":\"name\"}"); return; }
+    }
+    int limit = 20, context = 400;
+    jint(body, "limit", &limit);
+    jint(body, "context", &context);
+    if (limit < 1) limit = 1;
+    if (limit > 200) limit = 200;
+    if (context < 40) context = 40;
+    if (context > 4000) context = 4000;
+    char under[512] = "";
+    jstr(body, "path", under, sizeof under);
+    lp_ref trunk, parts[256];
+    size_t np = 0;
+    if (!name_entity(name, &trunk, parts, 256, &np)) { http(c, 500, "{\"error\":\"tier0\"}"); return; }
+    PGconn *pg = db();
+    if (!pg) {
+        char e[512], b[640];
+        json_esc(PQerrorMessage(PG), e, sizeof e);
+        snprintf(b, sizeof b, "{\"error\":\"database\",\"detail\":\"%s\"}", e);
+        http(c, 503, b);
+        return;
+    }
+    uint64_t t0 = nsec();
+    CwDag d = { 0 };
+    int levels = 0, cut = 0;
+    int nfiles = cw_walk(&trunk.id, &d, 400000, &levels, &cut);
+    double walk_ms = (double)(nsec() - t0) / 1e6;
+    Reader *rd = reader_new(pg);
+    char idh[33];
+    hex_id(&trunk.id, idh);
+    char *out = NULL, *esc = NULL;
+    size_t on = 0, ocap = 0;
+    buf_fmt(&out, &on, &ocap, "{\"name\":\"%s\",\"id\":\"%s\",\"database\":\"%s\",\"levels\":%d,\"nodes\":%zu,\"files\":%d,\"cut\":%s,\"ms\":{\"walk\":%.3f},\"hits\":[",
+            json_esc(name, (esc = malloc(sizeof name * 6 + 8)), sizeof name * 6 + 8), idh, PQdb(pg), levels, d.nn, nfiles, cut ? "true" : "false", walk_ms);
+    free(esc);
+    int shown = 0;
+    for (size_t i = 0; i < d.nn && shown < limit; i++) {
+        if (!d.n[i].file) continue;
+        char *path = cw_file_name(rd, &d.n[i].id);
+        if (under[0] && !strstr(path, under)) { free(path); continue; }
+        /* the chain down from the file to the name: its content, then the syntax nodes that enclose the name */
+        size_t chain[160], nc = 0;
+        for (size_t k = d.n[i].down; k != (size_t)-1 && nc < 160; k = d.n[k].down) chain[nc++] = k;
+        /* the innermost node of at least `context` bytes is the context; the outermost below the file under 8 KiB the
+         * enclosing declaration */
+        char *ctx = NULL, *encl = NULL;
+        for (size_t k = nc; k-- > 0;) {
+            char *t = reader_text(rd, &d.n[chain[k]].id, (size_t)context * 4);
+            if (strlen(t) >= (size_t)context || k == 0) { ctx = t; break; }
+            free(t);
+        }
+        for (size_t k = 1; k < nc; k++) {
+            char *t = reader_text(rd, &d.n[chain[k]].id, 8193);
+            if (strlen(t) <= 8192) { encl = t; break; }
+            free(t);
+        }
+        /* lines: where the enclosing text stands in the file's recorded content, and the name in it */
+        long line = -1, line0 = -1, line1 = -1;
+        const char *span = encl ? encl : ctx;
+        if (nc && span) {
+            char *whole = reader_text(rd, &d.n[chain[0]].id, (size_t)8 << 20);
+            const char *at = strstr(whole, span);
+            if (at) {
+                size_t len = strlen(span);
+                line0 = (long)cw_lines(whole, (size_t)(at - whole));
+                line1 = line0 + (long)cw_lines(at, len) - 1;
+                const char *nm = strstr(at, name);
+                if (nm && (size_t)(nm - at) < len) line = line0 + (long)cw_lines(at, (size_t)(nm - at)) - 1;
+            }
+            free(whole);
+        }
+        buf_fmt(&out, &on, &ocap, "%s{\"path\":\"", shown ? "," : "");
+        { size_t pl = strlen(path) * 6 + 8; esc = malloc(pl); buf_add(&out, &on, &ocap, json_esc(path, esc, pl), strlen(esc)); free(esc); }
+        if (line > 0) buf_fmt(&out, &on, &ocap, "\",\"line\":%ld", line); else buf_add(&out, &on, &ocap, "\",\"line\":null", 13);
+        if (line0 > 0) buf_fmt(&out, &on, &ocap, ",\"line0\":%ld,\"line1\":%ld", line0, line1); else buf_add(&out, &on, &ocap, ",\"line0\":null,\"line1\":null", 26);
+        char fh[33];
+        hex_id(&d.n[i].id, fh);
+        buf_fmt(&out, &on, &ocap, ",\"file\":\"%s\",\"depth\":%zu,\"context\":\"", fh, nc);
+        if (ctx) { size_t l = strlen(ctx) * 6 + 8; esc = malloc(l); buf_add(&out, &on, &ocap, json_esc(ctx, esc, l), strlen(esc)); free(esc); }
+        buf_add(&out, &on, &ocap, "\",\"enclosing\":\"", strlen("\",\"enclosing\":\""));
+        if (encl) { size_t l = strlen(encl) * 6 + 8; esc = malloc(l); buf_add(&out, &on, &ocap, json_esc(encl, esc, l), strlen(esc)); free(esc); }
+        buf_add(&out, &on, &ocap, "\"}", 2);
+        free(ctx); free(encl); free(path);
+        shown++;
+    }
+    buf_fmt(&out, &on, &ocap, "],\"shown\":%d,\"ms_total\":%.3f}", shown, (double)(nsec() - t0) / 1e6);
+    reader_free(rd);
+    lp_idmap_free(d.m);
+    free(d.n);
+    http(c, 200, out ? out : "{\"error\":\"memory\"}");
+    free(out);
+}
+
+/* The sources the database holds: each witness, its name (the first part of its trunk, the record its source file
+ * names) and its trust. */
+static void on_sources(int c, const char *body) {
+    (void)body;
+    PGconn *pg = db();
+    if (!pg) { http(c, 503, "{\"error\":\"database\"}"); return; }
+    PGresult *r = PQexecParams(pg, "SELECT id, trust FROM witness", 0, NULL, NULL, NULL, NULL, 1);
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+        char e[512], b[640];
+        json_esc(PQerrorMessage(pg), e, sizeof e);
+        snprintf(b, sizeof b, "{\"error\":\"witness\",\"detail\":\"%s\"}", e);
+        PQclear(r);
+        http(c, 500, b);
+        return;
+    }
+    Reader *rd = reader_new(pg);
+    char *out = NULL;
+    size_t on = 0, ocap = 0;
+    buf_fmt(&out, &on, &ocap, "{\"database\":\"%s\",\"sources\":[", PQdb(pg));
+    for (int i = 0; i < PQntuples(r); i++) {
+        lp_id id;
+        memcpy(id.b, PQgetvalue(r, i, 0), 16);
+        double trust;
+        uint64_t tb = lp_be(PQgetvalue(r, i, 1), 8);
+        memcpy(&trust, &tb, 8);
+        lp_id first[2];
+        size_t m = reader_parts(rd, &id, first, 2);
+        char *nm = m ? reader_text(rd, &first[0], 200) : strdup("");
+        char idh[33], e[1300];
+        hex_id(&id, idh);
+        buf_fmt(&out, &on, &ocap, "%s{\"id\":\"%s\",\"name\":\"%s\",\"trust\":%.3f}", i ? "," : "", idh, json_esc(nm, e, sizeof e), trust);
+        free(nm);
+    }
+    buf_add(&out, &on, &ocap, "]}", 2);
+    PQclear(r);
+    reader_free(rd);
+    http(c, 200, out);
+    free(out);
+}
+
 static void rpc_id(const char *body, char *out, size_t cap) {
     const char *p = strstr(body, "\"id\"");
     out[0] = 'n'; out[1] = 'u'; out[2] = 'l'; out[3] = 'l'; out[4] = 0;
@@ -1497,6 +1740,8 @@ static void rpc_id(const char *body, char *out, size_t cap) {
 static const char *TOOLS =
     "{\"tools\":["
     "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates and Laplace rerank orders the union; a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
+    "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment: every file whose recorded syntax tree holds it, its pathname as the file's record gives it, the line it is on, the innermost enclosing node of at least context bytes, and the enclosing declaration (the outermost node under 8 KiB below the file) with its line span. path filters by a substring of the file path. Nothing is read from a working tree.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"name\"]}},"
+    "{\"name\":\"sources\",\"description\":\"The sources the Laplace database holds: each witness ID, its name and trust.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"rerank\",\"description\":\"Deterministic Laplace reranker (drop-in replacement for neural cross-encoders). Scores candidate documents against a query using IDF-weighted constituent overlap and 4D discrete Frechet trajectory distance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"documents\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"top_n\":{\"type\":\"integer\"}},\"required\":[\"query\",\"documents\"]}},"
     "{\"name\":\"search\",\"description\":\"Name text on the client from tier 0, or take an ID the caller already holds. The trunk is read with holds_above, and so is every constituent whose tier is above a codepoint or a grapheme. A tier-0 constituent stays in the path, in its place, with its codepoint. fan, when sent, caps how many claims and occurrences are returned; omitted, all of them are.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"fan\":{\"type\":\"integer\"}},\"required\":[]}},"
@@ -1560,6 +1805,8 @@ static void mcp_rpc(int c, const char *body) {
         capture_body = NULL;
         if (!strcmp(name, "code_search")) on_code_search(c, body);
         else if (!strcmp(name, "reindex")) on_reindex(c, body);
+        else if (!strcmp(name, "code_where")) on_code_where(c, body);
+        else if (!strcmp(name, "sources")) on_sources(c, body);
         else if (!strcmp(name, "rerank")) on_rerank(c, body);
         else if (!strcmp(name, "search")) on_search(c, body);
         else if (!strcmp(name, "embeddings")) on_embeddings(c, body);
@@ -1612,6 +1859,8 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
         else if (!strcmp(op, "rerank")) path = "/v1/rerank";
         else if (!strcmp(op, "code_search")) path = "/v1/code_search";
         else if (!strcmp(op, "reindex")) path = "/v1/reindex";
+        else if (!strcmp(op, "code_where")) path = "/v1/code_where";
+        else if (!strcmp(op, "sources")) path = "/v1/sources";
         else if (!strcmp(op, "search")) path = "/v1/search";
         else if (!strcmp(op, "forward")) path = "/v1/forward";
         else if (!strcmp(op, "shape") || !strcmp(op, "frechet")) path = "/v1/shape";
@@ -1644,6 +1893,8 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
     else if (!strcmp(path, "/v1/rerank") || !strcmp(path, "/rerank")) on_rerank(c, body);
     else if (!strcmp(path, "/v1/code_search")) on_code_search(c, body);
     else if (!strcmp(path, "/v1/reindex")) on_reindex(c, body);
+    else if (!strcmp(path, "/v1/code_where")) on_code_where(c, body);
+    else if (!strcmp(path, "/v1/sources")) on_sources(c, body);
     else if (!strcmp(path, "/v1/search")) on_search(c, body);
     else if (!strcmp(path, "/v1/forward")) on_by_parts(c, body, FORWARD_SQL, "forward");
     else if (!strcmp(path, "/v1/shape")) on_shape(c, body);
