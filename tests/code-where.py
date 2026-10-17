@@ -19,11 +19,11 @@ def fail(msg):
     sys.exit(1)
 
 
-def call(tool, args):
+def call(tool, args, **more):
     msgs = [{'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}},
             {'jsonrpc': '2.0', 'id': 1, 'method': tool and 'tools/call' or 'tools/list',
              'params': {'name': tool, 'arguments': args} if tool else {}}]
-    env = dict(os.environ, LAPLACE_CONNINFO=conninfo, LAPLACE_ENGINE=str(Path(engine).resolve()))
+    env = dict(os.environ, LAPLACE_CONNINFO=conninfo, LAPLACE_ENGINE=str(Path(engine).resolve()), **more)
     p = subprocess.run([lpm, 'mcp'], input='\n'.join(json.dumps(m) for m in msgs) + '\n', env=env,
                        capture_output=True, text=True, timeout=120)
     lines = [l for l in p.stdout.splitlines() if l.strip()]
@@ -69,7 +69,7 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
             fail('ingest: ' + i.stdout[-3000:] + i.stderr[-2000:])
 
         tools = {t['name'] for t in call(None, {})['tools']}
-        if not {'code_where', 'sources', 'file_outline', 'recipe_plan'} <= tools:
+        if not {'code_where', 'code_callers', 'code_callees', 'sources', 'ingest_status', 'file_outline', 'recipe_plan'} <= tools:
             fail(f'tools/list: {sorted(tools)}')
 
         r = call('code_where', {'query': 'backoff_delay', 'occurrences': 4, 'context': 40})
@@ -138,6 +138,38 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         if call('file_outline', {'path': 'proj/nowhere.c'})['files']:
             fail('outline of an absent file')
 
+        # code_callers: the declarations whose code uses a name; a use outside every declaration is the top level, and a
+        # declaration's own name is not a use (Laplace-MCP#27)
+        cr = call('code_callers', {'query': 'backoff_delay'})
+        if {(Path(x['path']).name, x['name'], x['kind']) for x in cr['callers']} != {('use.c', 'wait_for', 'function_definition')} \
+                or [x['at'] for x in cr['callers']] != [[3]] or cr['callers'][0]['line'] != 2:
+            fail(f'callers of backoff_delay: {cr}')
+        cr = call('code_callers', {'query': 'jitter'})
+        tops = {Path(x['path']).name: x['at'] for x in cr['top_level']}
+        if [(Path(x['path']).name, x['name'], x['at']) for x in cr['callers']] != [('jitter.py', 'spread', [10])] or 3 not in tops.get('call.py', []):
+            fail(f'callers of jitter: {cr}')
+        if call('code_callers', {'query': 'jitter', 'path': 'call.py'})['callers']:
+            fail('callers of jitter in call.py')
+        cr = call('code_callers', {'query': 'spread'})
+        if cr['callers'] or [x['at'] for x in cr['top_level'] if x['path'].endswith('/jitter.py')] != [[13]]:
+            fail(f'callers of spread: {cr}')
+
+        # code_callees: what a declaration calls that a code recipe declared, and where; the rest is outside
+        ce = call('code_callees', {'query': 'spread'})
+        defs = ce['definitions']
+        if len(defs) != 1 or (defs[0]['line0'], defs[0]['line1']) != (9, 10) or defs[0]['kind'] != 'function_definition' \
+                or [(x['name'], x['kind'], [Path(f['path']).name for f in x['files']]) for x in defs[0]['callees']] != [('jitter', 'function_definition', ['jitter.py'])]:
+            fail(f'callees of spread: {ce}')
+        ce = call('code_callees', {'query': 'wait_for'})
+        got = {x['name']: {Path(f['path']).name for f in x['files']} for x in ce['definitions'][0]['callees']} if ce['definitions'] else {}
+        if 'retry.c' not in got.get('backoff_delay', set()) or (ce['definitions'][0]['line0'], ce['definitions'][0]['line1']) != (2, 4):
+            fail(f'callees of wait_for: {ce}')
+        ce = call('code_callees', {'query': 'jitter'})
+        if len(ce['definitions']) != 1 or ce['definitions'][0]['callees'] or 'random' not in ce['definitions'][0]['outside']:
+            fail(f'callees of jitter: {ce}')
+        if call('code_callees', {'query': 'backoff_delay'})['definitions'][0]['callees']:
+            fail('backoff_delay calls nothing declared')
+
         # recipe_plan: which recipe reads a file, nothing read in
         p = call('recipe_plan', {'input': str(root / 'retry.c')})
         if p['exit'] != 0 or '1 files' not in p['log']:
@@ -150,7 +182,25 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         s = call('sources', {})
         if s['database'] != name or not s['sources']:
             fail(f'sources: {s}')
-        print('code-where ok: backoff_delay defined at retry.c:3 (3..7), called at use.c:3 in wait_for; jitter defined in jitter.py and called at :10 in spread; a file of one def defines it; outlines and a plan; '
+
+        # ingest_status: each witness with its parts and readings, the busy sessions, the engine's ingest logs
+        logs = Path(tmp) / 'ingest-logs'
+        logs.mkdir()
+        (logs / 'older.log').write_text('reading\n')
+        os.utime(logs / 'older.log', (1, 1))
+        (logs / 'demo.log').write_text('reading demo\ndemo: 6 files, done\n\n')
+        st = call('ingest_status', {}, LAPLACE_INGEST_LOGS=str(logs))
+        if st['database'] != name or {w['id'] for w in st['sources']} != {w['id'] for w in s['sources']} \
+                or any(w['readings'] != 1 or w['parts'] < 1 for w in st['sources']) \
+                or not isinstance(st['activity'], list):
+            fail(f'ingest_status: {st}')
+        if [(x['source'], x['last']) for x in st['logs']['runs']] != [('demo', 'demo: 6 files, done'), ('older', 'reading')]:
+            fail(f'ingest_status logs: {st["logs"]}')
+        just = call('ingest_status', {'source': 'demo'}, LAPLACE_INGEST_LOGS=str(logs))
+        if just['sources'] or [x['source'] for x in just['logs']['runs']] != ['demo']:
+            fail(f'ingest_status of demo: {just}')
+        print('code-where ok: backoff_delay defined at retry.c:3 (3..7), called at use.c:3 in wait_for; jitter defined in jitter.py and called at :10 in spread; a file of one def defines it; '
+              'callers and callees; outlines and a plan; ingest status; '
               f'{len(s["sources"])} witnesses')
     finally:
         if created:
