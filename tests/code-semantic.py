@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""code_search with LAPLACE_CODE_SEMANTIC: an embeddings endpoint and Qdrant collections add candidates, Laplace
-rerank orders the union, and a configured service that fails is an error, never a lexical-only answer."""
+"""code_search with LAPLACE_CODE_SEMANTIC: an embeddings endpoint and Qdrant collections add candidates, the union is
+ordered by reciprocal rank fusion of each collection's ranking and the Laplace rerank's (fusion "rerank": the rerank
+alone), and a configured service that fails is an error, never a lexical-only answer."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -43,10 +44,10 @@ class Fake(BaseHTTPRequestHandler):
         return self.reply(404, {'status': {'error': "Not found: Collection doesn't exist!"}})
 
 
-def mcp(env, query):
+def mcp(env, query, **extra):
     lines = [{'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}},
              {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
-              'params': {'name': 'code_search', 'arguments': {'query': query, 'limit': 5}}}]
+              'params': {'name': 'code_search', 'arguments': dict(dict(query=query, limit=5), **extra)}}]
     run = subprocess.run([str(binary), 'mcp'], input=''.join(json.dumps(m) + '\n' for m in lines), env=env,
                          capture_output=True, text=True, encoding='utf-8', timeout=120)
     replies = [json.loads(l) for l in run.stdout.splitlines() if l.strip()]
@@ -84,8 +85,21 @@ with tempfile.TemporaryDirectory(prefix='lpm-code-semantic-') as directory:
     assert by['handler.py']['source'] == 'semantic' and by['handler.py']['collection'] == 'code', by['handler.py']
     assert Path(by['handler.py']['path']) == root / 'handler.py', by['handler.py']['path']
     assert 'caf\u00e9' in by['handler.py']['snippet'], by['handler.py']
-    assert out['hits'][0]['path'].endswith('notes.md'), out['hits']           # Laplace rerank orders the union
-    assert [h['rerank'] for h in out['hits']] == sorted((h['rerank'] for h in out['hits']), reverse=True)
+    # The fused order: each hit's score is the sum of 1/(60 + rank) over the rankings that hold it, best first.
+    assert out['fusion'] == 'rrf', out
+    for h in out['hits']:
+        want = sum(1 / (60 + r) for k, r in h['ranks'].items() if k != 'lexical')
+        assert abs(h['fused'] - want) < 1e-5 and 'rerank' in h['ranks'], h
+    assert by['handler.py']['ranks']['code'] == 1 and by['notes.md']['ranks']['code'] == 2, by
+    assert by['notes.md']['ranks']['lexical'] >= 1 and 'lexical' not in by['handler.py']['ranks'], by
+    assert [h['fused'] for h in out['hits']] == sorted((h['fused'] for h in out['hits']), reverse=True)
+    # The rerank alone, as before: notes.md, which shares the query's words, first.
+    err, old = mcp(env, 'ingest_run_journal written', fusion='rerank')
+    assert not err and old['fusion'] == 'rerank' and old['hits'][0]['path'].endswith('notes.md'), old['hits']
+    assert [h['rerank'] for h in old['hits']] == sorted((h['rerank'] for h in old['hits']), reverse=True)
+    # explain: every candidate of the union, with its rankings.
+    err, ex = mcp(env, 'ingest_run_journal written', explain=True, limit=1)
+    assert not err and len(ex['hits']) == ex['candidates']['union'] >= 2, ex
 
     # Configured and failing: an error naming the cause, not lexical hits.
     for change, cause in ((dict(LAPLACE_CODE_COLLECTIONS='missing'), 'HTTP 404'),

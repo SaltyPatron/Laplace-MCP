@@ -1188,6 +1188,9 @@ typedef struct {
     char path[4096];
     uint32_t line0, line1;
     int lexical, semantic;          /* semantic: index of the best semantic hit + 1 */
+    int lex_rank, rr_rank;          /* where the lexical retrieval and the Laplace rerank put it, from 1; 0: not there */
+    int sem_rank[8];                /* where each semantic collection put it, from 1; 0: not there */
+    double fused;
     uint8_t id[16];
     uint64_t hilbert;
     uint32_t shared;
@@ -1220,8 +1223,19 @@ static int resolve_label(const char *label, char *out, size_t cap) {
     return m.found;
 }
 
+static int cand_rerank_cmp(const void *a, const void *b) {
+    const CodeCand *x = *(CodeCand *const *)a, *y = *(CodeCand *const *)b;
+    if (x->rerank != y->rerank) return x->rerank < y->rerank ? 1 : -1;
+    if (x->cosine != y->cosine) return x->cosine < y->cosine ? 1 : -1;
+    return (int)(x->line1 - x->line0) - (int)(y->line1 - y->line0);
+}
+static int cand_rerank_cmp_v(const void *a, const void *b) {
+    const CodeCand *x = a, *y = b;
+    return cand_rerank_cmp(&x, &y);
+}
 static int cand_cmp(const void *a, const void *b) {
     const CodeCand *x = a, *y = b;
+    if (x->fused != y->fused) return x->fused < y->fused ? 1 : -1;
     if (x->rerank != y->rerank) return x->rerank < y->rerank ? 1 : -1;
     if (x->cosine != y->cosine) return x->cosine < y->cosine ? 1 : -1;
     return (int)(x->line1 - x->line0) - (int)(y->line1 - y->line0);
@@ -1292,10 +1306,22 @@ static void on_code_search(int c, const char *body) {
         snprintf(k->path, sizeof k->path, "%s", hits[i].path);
         k->line0 = hits[i].line0; k->line1 = hits[i].line1;
         k->lexical = 1;
+        k->lex_rank = (int)i + 1;
         memcpy(k->id, hits[i].id, 16);
         k->hilbert = hits[i].hilbert;
         k->shared = hits[i].shared;
         k->cosine = -1;
+    }
+    /* Each collection is a ranking of its own (its model's cosines are not another's): a hit's rank within its collection. */
+    const char *coll[8] = { 0 };
+    int ncoll = 0, *in_coll = calloc(ns + 1, sizeof *in_coll), *crank = calloc(ns + 1, sizeof *crank), seen_in[8] = { 0 };
+    for (size_t i = 0; i < ns; i++) {
+        int ci = 0;
+        while (ci < ncoll && strcmp(coll[ci], sh[i].collection)) ci++;
+        if (ci == ncoll && ncoll < 8) coll[ncoll++] = sh[i].collection;
+        if (ci == 8) ci = 7;
+        in_coll[i] = ci;
+        crank[i] = ++seen_in[ci];
     }
     for (size_t i = 0; i < ns; i++) {
         char abs[4096];
@@ -1304,7 +1330,9 @@ static void on_code_search(int c, const char *body) {
         for (size_t j = 0; j < nc && !same; j++)
             if (!strcmp(cand[j].path, abs) && cand[j].line0 <= sh[i].line1 && sh[i].line0 <= cand[j].line1)
                 same = &cand[j];
-        if (same) {    /* the same lines: keep the smaller span, remember the best cosine */
+        if (same) {    /* the same lines: keep the smaller span, remember the best cosine and each collection's best rank */
+            int *r = &same->sem_rank[in_coll[i]];
+            if (!*r || crank[i] < *r) *r = crank[i];
             if (sh[i].cosine > same->cosine) { same->cosine = sh[i].cosine; same->semantic = (int)i + 1; }
             if (!same->lexical && sh[i].line1 - sh[i].line0 < same->line1 - same->line0) {
                 same->line0 = sh[i].line0; same->line1 = sh[i].line1;
@@ -1316,7 +1344,10 @@ static void on_code_search(int c, const char *body) {
         k->line0 = sh[i].line0; k->line1 = sh[i].line1;
         k->semantic = (int)i + 1;
         k->cosine = sh[i].cosine;
+        k->sem_rank[in_coll[i]] = crank[i];
     }
+    free(in_coll);
+    free(crank);
 
     /* Laplace orders the union: rerank of each candidate's text against the query. */
     for (size_t i = 0; i < nc; i++) {
@@ -1328,6 +1359,7 @@ static void on_code_search(int c, const char *body) {
         k->snippet = strdup(snip);
         k->frechet = -1.0;
         k->rerank = snip[0] ? lpm_rerank(ix, query, strlen(query), snip, strlen(snip), &k->shared, &k->frechet) : 0.0;
+
         if (!k->lexical) {
             LpmRec r = {0};
             lpm_identify(ix, snip, strlen(snip), &r);
@@ -1335,16 +1367,45 @@ static void on_code_search(int c, const char *body) {
             k->hilbert = r.hilbert;
         }
     }
-    if (semantic) qsort(cand, nc, sizeof *cand, cand_cmp);
-    size_t shown = nc < (size_t)limit ? nc : (size_t)limit;
+    /* The order: reciprocal rank fusion (Cormack, Clarke and Buettcher 2009) of every collection's ranking and the Laplace
+     * rerank's, sum 1/(K + rank) over the rankings that hold a candidate. The embeddings' order and Laplace's each count,
+     * neither replaces the other, and no score is compared across models. LAPLACE_CODE_FUSION=rerank orders by the
+     * Laplace rerank alone, as before. The lexical retrieval brings candidates; the rerank already weighs what they share. */
+    char fusion[16] = "";
+    if (!jstr(body, "fusion", fusion, sizeof fusion) || !fusion[0]) {
+        const char *fe = getenv("LAPLACE_CODE_FUSION");
+        snprintf(fusion, sizeof fusion, "%s", fe && *fe ? fe : "rrf");
+    }
+    int by_rerank = !strcmp(fusion, "rerank");
+    if (strcmp(fusion, "rrf") && !by_rerank) {
+        for (size_t i = 0; i < nc; i++) free(cand[i].snippet);
+        free(cand); sem_free(sh, ns);
+        http(c, 400, "{\"error\":\"fusion is rrf or rerank\"}");
+        return;
+    }
+    const double K = 60.0;
+    CodeCand **byr = malloc(sizeof *byr * (nc + 1));
+    for (size_t i = 0; i < nc; i++) byr[i] = &cand[i];
+    qsort(byr, nc, sizeof *byr, cand_rerank_cmp);
+    for (size_t i = 0; i < nc; i++) {
+        CodeCand *k = byr[i];
+        k->rr_rank = (int)i + 1;
+        k->fused = 1.0 / (K + k->rr_rank);
+        for (int ci = 0; ci < ncoll; ci++) if (k->sem_rank[ci]) k->fused += 1.0 / (K + k->sem_rank[ci]);
+    }
+    free(byr);
+    if (semantic) qsort(cand, nc, sizeof *cand, by_rerank ? cand_rerank_cmp_v : cand_cmp);   /* lexical alone keeps its retrieval's order */
+    int explain = 0;
+    explain = jbool(body, "explain", 0);
+    size_t shown = explain ? nc : nc < (size_t)limit ? nc : (size_t)limit;
     double ms = (double)(nsec() - t0) / 1e6;
     char *out = NULL;
     size_t un = 0, ucap = 0;
     buf_fmt(&out, &un, &ucap,
             "{\"docs\":%llu,\"entities\":%llu,\"ms\":%.3f,\"semantic\":%s,\"semantic_ms\":%.3f,"
-            "\"candidates\":{\"lexical\":%zu,\"semantic\":%zu,\"union\":%zu},\"hits\":[",
+            "\"fusion\":\"%s\",\"candidates\":{\"lexical\":%zu,\"semantic\":%zu,\"union\":%zu},\"hits\":[",
             (unsigned long long)st.documents, (unsigned long long)st.entities, ms, semantic ? "true" : "false",
-            sem_ms, nh, ns, nc);
+            sem_ms, semantic && !by_rerank ? "rrf" : "rerank", nh, ns, nc);
     for (size_t i = 0; i < shown; i++) {
         CodeCand *k = &cand[i];
         char id[33], pe[8192], se[24576], ce[300] = "";
@@ -1364,6 +1425,14 @@ static void on_code_search(int c, const char *body) {
                 i ? "," : "", i + 1, pe, k->line0, k->line1, src, id, (unsigned long long)k->hilbert, k->shared,
                 k->frechet, k->rerank);
         if (k->semantic) buf_fmt(&out, &un, &ucap, ",\"cosine\":%.6f,\"collection\":\"%s\"", k->cosine, ce);
+        buf_fmt(&out, &un, &ucap, ",\"fused\":%.6f,\"ranks\":{\"rerank\":%d", k->fused, k->rr_rank);
+        if (k->lex_rank) buf_fmt(&out, &un, &ucap, ",\"lexical\":%d", k->lex_rank);
+        for (int ci = 0; ci < ncoll; ci++) if (k->sem_rank[ci]) {
+            char cn[300];
+            json_esc(coll[ci], cn, sizeof cn);
+            buf_fmt(&out, &un, &ucap, ",\"%s\":%d", cn, k->sem_rank[ci]);
+        }
+        buf_add(&out, &un, &ucap, "}", 1);
         buf_fmt(&out, &un, &ucap, ",\"snippet\":\"%s\"}", se);
     }
     buf_add(&out, &un, &ucap, "]}", 2);
@@ -1866,7 +1935,7 @@ static void rpc_id(const char *body, char *out, size_t cap) {
 
 static const char *TOOLS =
     "{\"tools\":["
-    "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates and Laplace rerank orders the union; a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
+    "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates, and the union is ordered by reciprocal rank fusion of each collection's ranking and the Laplace rerank's (fusion \"rerank\": the rerank alone); a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, the fused score and each ranking's rank of the hit, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"fusion\":{\"type\":\"string\",\"enum\":[\"rrf\",\"rerank\"]},\"explain\":{\"type\":\"boolean\",\"description\":\"every candidate of the union, not only the first limit\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code (query) stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment above it, nothing from a working tree. Each file that holds it, by the pathname its record gives: defines, the declaration kinds its recipe said of the name there (function_definition, class_declaration...), files that define it first; occurrences, how many places in its syntax tree hold it; at, up to occurrences (default 3) of them: the line, the innermost enclosing node of at least context bytes (default 120), and the enclosing declaration's first line with its span line0..line1. defines true: only files that define it. path: a substring the file path must contain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"defines\":{\"type\":\"boolean\"},\"limit\":{\"type\":\"integer\"},\"occurrences\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"sources\",\"description\":\"The sources the Laplace database holds: each witness ID, its name and trust.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
