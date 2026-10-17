@@ -236,6 +236,47 @@ static int cmd_search(int argc, char **argv) {
     return n ? 0 : 1;
 }
 
+/* lpm rerank RECORDS QUERY FILE[:L0-L1]...: Laplace rerank of each file (or its lines) against the query, with
+ * the terms of the score. */
+static int cmd_rerank(int argc, char **argv) {
+    if (argc < 3) return fail("usage: lpm rerank RECORDS QUERY FILE[:L0-L1]...");
+    Lpm *ix = lpm_load(argv[0], NULL);
+    if (!ix) return fail("load");
+    const char *q = argv[1];
+    printf("score     lexical   geometric centroid  frechet   shared  bytes   candidate\n");
+    for (int a = 2; a < argc; a++) {
+        char path[4096];
+        snprintf(path, sizeof path, "%s", argv[a]);
+        unsigned l0 = 0, l1 = 0;
+        char *colon = strrchr(path, ':');
+        if (colon && colon > path + 1 && sscanf(colon + 1, "%u-%u", &l0, &l1) == 2) *colon = 0;
+        else l0 = l1 = 0;
+        FILE *f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "%s: cannot open\n", path); lpm_free(ix); return 1; }
+        size_t cap = 1 << 16, n = 0;
+        char *text = malloc(cap), line[65536];
+        unsigned ln = 0;
+        while (text && fgets(line, sizeof line, f)) {
+            ln++;
+            if (l0 && (ln < l0 || ln > l1)) continue;
+            size_t k = strlen(line);
+            if (n + k + 1 > cap) { while (n + k + 1 > cap) cap *= 2; text = realloc(text, cap); if (!text) break; }
+            memcpy(text + n, line, k);
+            n += k;
+        }
+        fclose(f);
+        if (!text) { lpm_free(ix); return fail("out of memory"); }
+        text[n] = 0;
+        LpmRerank r;
+        lpm_rerank_parts(ix, q, strlen(q), text, n, &r);
+        printf("%.6f  %.6f  %.6f  %.6f  %8.5f  %6u  %6zu  %s\n", r.score, r.lexical, r.geometric, r.centroid,
+               r.frechet, r.shared, n, argv[a]);
+        free(text);
+    }
+    lpm_free(ix);
+    return 0;
+}
+
 static int cmd_bench(int argc, char **argv) {
     if (argc < 1) return fail("usage: lpm bench PATH...");
     Lpm *ix = lpm_new(NULL);
@@ -362,7 +403,7 @@ static int cmd_serve(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: lpm check | id STRING | admit FILE... | fetch FILE ID | index RECORDS PATH... | update RECORDS PATH... | search RECORDS QUERY | bench PATH... | serve [HOST [PORT]] | mcp\n");
+        fprintf(stderr, "usage: lpm check | id STRING | admit FILE... | fetch FILE ID | index RECORDS PATH... | update RECORDS PATH... | search RECORDS QUERY | rerank RECORDS QUERY FILE[:L0-L1]... | bench PATH... | serve [HOST [PORT]] | mcp\n");
         return 2;
     }
     if (!strcmp(argv[1], "check")) return cmd_check();
@@ -380,6 +421,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "index")) return cmd_index(argc - 2, argv + 2);
     if (!strcmp(argv[1], "update")) return cmd_update(argc - 2, argv + 2);
     if (!strcmp(argv[1], "search")) return cmd_search(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "rerank")) return cmd_rerank(argc - 2, argv + 2);
     if (!strcmp(argv[1], "bench")) return cmd_bench(argc - 2, argv + 2);
     if (!strcmp(argv[1], "serve")) return cmd_serve(argc - 2, argv + 2);
     if (!strcmp(argv[1], "mcp")) return api_mcp_stdio();

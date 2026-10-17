@@ -152,6 +152,8 @@ env = { LAPLACE_CODE_RECORDS = "E:/Data/Laplace/work/code-index/workspace.lpm" }
 
 `code_search` takes `query` (required), `limit` (1 to 64, default 15) and `path` (a file or directory to add before searching). Each hit has `path`, `line0`, `line1`, `id`, `hilbert`, `shared` (query constituents held), `frechet` (4D Fréchet of the query and snippet word trajectories), `rerank` (the `rerank` tool's score of the snippet, 0 to 1) and `snippet` (up to 60 lines read from the file).
 
+`rerank` scores a candidate text against the query in [0, 1]. Each query constituent the candidate holds counts with its IDF weight times the chance that holding it is not an accident of length: in a text of L bytes, a constituent found in a fraction r of the index's documents (mean length A) is present by chance with probability 1 - (1 - r)^(L/A), so the match is worth its weight times (1 - that). The lexical evidence is the sum over the weight of all query constituents; the 4D Fréchet shape of the query inside the candidate and the centroid distance scale it (`lexical * (0.55 + 0.35 shape + 0.10 centroid)`), so text with none of the query scores 0 and the same evidence in a longer text scores lower. `lpm rerank RECORDS QUERY FILE[:L0-L1]...` prints the score and its terms.
+
 `reindex` takes `path` (optional: one file or directory; otherwise every root) and returns `unchanged`, `changed`, `added`, `removed`, `rebuilt`, `files`, `docs`, `stale`, `entities` and `ms`.
 ### Semantic candidates
 

@@ -79,6 +79,8 @@ struct Lpm {
     uint32_t *fmap;     /* path -> file index + 1, open addressing; dead files stay in it and are skipped */
     size_t nfmap;
     size_t dead_docs;
+    size_t live_n, live_at_ndocs, live_at_dead;   /* live_stats cache */
+    double live_avg;
     uint32_t cur_file;
     int have_meta;      /* index_file and update_file say what they read; lpm_admit of a bare buffer does not */
     uint64_t meta_size, meta_hash;
@@ -309,6 +311,22 @@ static long file_find(const Lpm *ix, const char *p) {
         k = (k + 1) & (ix->nfmap - 1);
     }
     return -1;
+}
+
+/* Live documents and their mean length in bytes, recomputed when documents were added or killed. */
+static size_t live_stats(Lpm *ix, double *avg) {
+    if (ix->live_at_ndocs != ix->ndocs || ix->live_at_dead != ix->dead_docs) {
+        double sum = 0;
+        size_t live = 0;
+        for (size_t d = 0; d < ix->ndocs; d++)
+            if (!ix->fl[ix->docs[d].file].dead) { sum += ix->docs[d].bytes; live++; }
+        ix->live_n = live;
+        ix->live_avg = live && sum / (double)live >= 1 ? sum / (double)live : 1;
+        ix->live_at_ndocs = ix->ndocs;
+        ix->live_at_dead = ix->dead_docs;
+    }
+    *avg = ix->live_avg;
+    return ix->live_n;
 }
 
 static void file_kill(Lpm *ix, uint32_t i) {
@@ -1042,12 +1060,9 @@ size_t lpm_search(Lpm *ix, const char *q, size_t n, LpmHit *out, size_t cap) {
     /* BM25 with presence only: each shared constituent adds its IDF, and a document's sum is scaled by its
      * length against the mean, so a declaration that holds the query outranks the whole file around it. */
     const double k1 = 1.2, b = 0.75;
-    double avg = 0;
-    size_t live = 0;
-    for (size_t d = 0; d < ix->ndocs; d++) if (!ix->fl[ix->docs[d].file].dead) { avg += ix->docs[d].bytes; live++; }
+    double avg;
+    size_t live = live_stats(ix, &avg);
     if (!live) { free(shared); free(rank); return 0; }
-    avg = avg / (double)live;
-    if (avg < 1) avg = 1;
     for (size_t f = 0; f < ix->nfeat; f++) {
         Ent *e = ent_find(ix, ix->feat + f * 16);
         if (!e || !e->nd) continue;
@@ -1355,10 +1370,16 @@ static size_t dedup_feat(uint8_t *buf, size_t n) {
     return w;
 }
 
-double lpm_rerank(Lpm *ix, const char *query, size_t qn, const char *doc, size_t dn, uint32_t *shared_out, double *frechet_out) {
-    if (shared_out) *shared_out = 0;
-    if (frechet_out) *frechet_out = -1.0;
-    if (!ix || !qn || !dn) return 0.0;
+void lpm_rerank_parts(Lpm *ix, const char *query, size_t qn, const char *doc, size_t dn, LpmRerank *out) {
+    memset(out, 0, sizeof *out);
+    out->frechet = -1.0;
+    uint32_t *shared_out = &out->shared;
+    double *frechet_out = &out->frechet;
+    if (!ix || !qn || !dn) return;
+    /* Corpus statistics before the query and the candidate are decomposed into the index's entities. */
+    double avg;
+    size_t live = live_stats(ix, &avg);
+    size_t all_docs = ix->ndocs;
 
     uint64_t saved_files = ix->files, saved_bytes = ix->bytes, saved_comp = ix->compositions;
     size_t saved_ndocs = ix->ndocs;
@@ -1390,17 +1411,27 @@ double lpm_rerank(Lpm *ix, const char *query, size_t qn, const char *doc, size_t
     ix->compositions = saved_comp;
     ix->ndocs = saved_ndocs;
 
+    /* Lexical evidence. A query constituent the candidate holds counts with its IDF weight times the chance that
+     * holding it is not an accident of length: a document of L bytes holds a constituent found in a fraction r
+     * of the index's documents (mean length A bytes) with probability p = 1 - (1 - r)^(L/A), so the match is
+     * worth w * (1 - p). A short span that holds the query keeps nearly all its weight; a long one that holds
+     * the same constituents keeps less, and a constituent every document holds is worth nothing. */
     uint32_t shared = 0;
     double overlap_w = 0.0, total_w = 0.0;
+    double len_ratio = live ? (double)dn / avg : 0.0;
     size_t i = 0, j = 0;
     while (i < qfn) {
         Ent *qe = ent_find(ix, qfeat + i * 16);
-        double w = (qe && qe->nd && ix->ndocs) ? (1.0 + log((double)(ix->ndocs + 1) / (double)qe->nd)) : 1.0;
+        int known = qe && qe->nd && all_docs;
+        double w = known ? (1.0 + log((double)(all_docs + 1) / (double)qe->nd)) : 1.0;
+        double rate = known ? (double)qe->nd / (double)all_docs : 0.0;
+        if (rate > 1.0) rate = 1.0;
+        double chance = rate > 0.0 && len_ratio > 0.0 ? 1.0 - pow(1.0 - rate, len_ratio) : 0.0;
         total_w += w;
         while (j < dfn && memcmp(ix->feat + j * 16, qfeat + i * 16, 16) < 0) j++;
         if (j < dfn && !memcmp(ix->feat + j * 16, qfeat + i * 16, 16)) {
             shared++;
-            overlap_w += w;
+            overlap_w += w * (1.0 - chance);
         }
         i++;
     }
@@ -1421,7 +1452,8 @@ double lpm_rerank(Lpm *ix, const char *query, size_t qn, const char *doc, size_t
     if (!memcmp(qr.id.b, dr.id.b, 16) && qr.tier) {
         if (shared_out) *shared_out = shared;
         if (frechet_out) *frechet_out = 0.0;
-        return 1.0;
+        out->score = out->lexical = out->geometric = out->centroid = 1.0;
+        return;
     }
 
     if (shared_out) *shared_out = shared;
@@ -1431,12 +1463,21 @@ double lpm_rerank(Lpm *ix, const char *query, size_t qn, const char *doc, size_t
     double geom = fr >= 0.0 ? (1.0 / (1.0 + fr)) : 0.0;
     double cent_dist = dist4(q_cent, d_cent);
     double cent_sim = 1.0 / (1.0 + cent_dist);
-    double score = 0.55 * lex + 0.35 * geom + 0.10 * cent_sim;
-    if (lex >= 0.70 && geom >= 0.65) {
-        double boost = 0.75 + 0.25 * (0.60 * lex + 0.40 * geom);
-        if (boost > score) score = boost;
-    }
-    return score > 1.0 ? 1.0 : score;
+    /* Shape and centroid say how well the evidence is arranged, so they scale it: with no lexical evidence the
+     * score is 0 whatever the length, instead of the constant the shape terms give any text. */
+    double score = lex * (0.55 + 0.35 * geom + 0.10 * cent_sim);
+    out->lexical = lex;
+    out->geometric = geom;
+    out->centroid = cent_sim;
+    out->score = score > 1.0 ? 1.0 : score;
+}
+
+double lpm_rerank(Lpm *ix, const char *query, size_t qn, const char *doc, size_t dn, uint32_t *shared_out, double *frechet_out) {
+    LpmRerank r;
+    lpm_rerank_parts(ix, query, qn, doc, dn, &r);
+    if (shared_out) *shared_out = r.shared;
+    if (frechet_out) *frechet_out = r.frechet;
+    return r.score;
 }
 
 int lpm_identify(Lpm *ix, const char *s, size_t n, LpmRec *out) {
