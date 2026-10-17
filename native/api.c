@@ -1060,31 +1060,85 @@ static void on_degrees(int c, const char *body) {
     on_engine(c, av);
 }
 
-static Lpm *ensure_code_ix(void) {
-    if (CODE_IX) return CODE_IX;
-    const char *rec = getenv("LAPLACE_CODE_RECORDS");
-    if (rec && *rec && os_exists(rec)) {
-        CODE_IX = lpm_load(rec, NULL);
-        if (CODE_IX) return CODE_IX;
-    }
-    CODE_IX = lpm_new(NULL);
-    if (!CODE_IX) return NULL;
+/* LAPLACE_CODE_ROOTS, each existing root in turn. */
+static void code_roots(void (*fn)(const char *root, void *ud), void *ud) {
     const char *roots = getenv("LAPLACE_CODE_ROOTS");
-    if (roots && *roots) {
-        char *copy = strdup(roots);
-        char *p = copy;
-        while (p && *p) {
+    if (!roots || !*roots) return;
+    char *copy = strdup(roots);
+    char *p = copy;
+    while (p && *p) {
 #ifdef _WIN32
-            char *sep = strchr(p, ';');
+        char *sep = strchr(p, ';');
 #else
-            char *sep = strchr(p, ':');
-            if (!sep) sep = strchr(p, ';');
+        char *sep = strchr(p, ':');
+        if (!sep) sep = strchr(p, ';');
 #endif
-            if (sep) *sep = 0;
-            if (*p && os_exists(p)) lpm_index_path(CODE_IX, p);
-            p = sep ? sep + 1 : NULL;
+        if (sep) *sep = 0;
+        if (*p && os_exists(p)) fn(p, ud);
+        p = sep ? sep + 1 : NULL;
+    }
+    free(copy);
+}
+
+static void root_index(const char *root, void *ud) { lpm_index_path((Lpm *)ud, root); }
+
+typedef struct { Lpm *ix; LpmUpdate u; } RootUpdate;
+static void root_update(const char *root, void *ud) {
+    RootUpdate *r = ud;
+    lpm_update_path(r->ix, root, &r->u);
+}
+
+static Lpm *code_build(void) {
+    Lpm *ix = lpm_new(NULL);
+    if (ix) code_roots(root_index, ix);
+    return ix;
+}
+
+static time_t CODE_CHECKED;
+
+/* Bring the index up to date with its roots. Unchanged files are not read. When the documents of changed and
+ * removed files pass 30% of all of them, the index is built again from the roots. Saved when anything moved. */
+static int code_refresh(LpmUpdate *u, int *rebuilt) {
+    RootUpdate r = { CODE_IX, {0} };
+    code_roots(root_update, &r);
+    *u = r.u;
+    *rebuilt = 0;
+    LpmStats st;
+    lpm_stats(CODE_IX, &st);
+    if (st.stale * 10 > (st.documents + st.stale) * 3) {
+        Lpm *fresh = code_build();
+        if (!fresh) return -1;
+        lpm_free(CODE_IX);
+        CODE_IX = fresh;
+        *rebuilt = 1;
+    }
+    const char *rec = getenv("LAPLACE_CODE_RECORDS");
+    if (rec && *rec && (u->changed || u->added || u->removed || *rebuilt) && lpm_save(CODE_IX, rec)) return -1;
+    CODE_CHECKED = time(NULL);
+    return 0;
+}
+
+/* The code index: the saved records when they load, else built from the roots (and saved). It is brought up to
+ * date with its roots when it loads and then at most every LAPLACE_CODE_REFRESH_SECONDS (default 30; 0 never). */
+static Lpm *ensure_code_ix(void) {
+    const char *rec = getenv("LAPLACE_CODE_RECORDS");
+    if (!CODE_IX) {
+        if (rec && *rec && os_exists(rec)) CODE_IX = lpm_load(rec, NULL);
+        if (!CODE_IX) {
+            CODE_IX = code_build();
+            if (!CODE_IX) return NULL;
+            if (rec && *rec) lpm_save(CODE_IX, rec);
+            CODE_CHECKED = time(NULL);
+            return CODE_IX;
         }
-        free(copy);
+        CODE_CHECKED = 0;
+    }
+    const char *ev = getenv("LAPLACE_CODE_REFRESH_SECONDS");
+    long every = ev && *ev ? strtol(ev, NULL, 10) : 30;
+    if (every > 0 && time(NULL) - CODE_CHECKED >= every) {
+        LpmUpdate u;
+        int rebuilt;
+        if (code_refresh(&u, &rebuilt)) return NULL;
     }
     return CODE_IX;
 }
@@ -1184,30 +1238,38 @@ static void on_reindex(int c, const char *body) {
     char path[4096] = "";
     jstr(body, "path", path, sizeof path);
     uint64_t t0 = nsec();
-    if (CODE_IX) {
-        lpm_free(CODE_IX);
-        CODE_IX = NULL;
-    }
     Lpm *ix = ensure_code_ix();
     if (!ix) {
         http(c, 500, "{\"error\":\"code index\"}");
         return;
     }
-    LpmStats st = {0};
-    lpm_stats(ix, &st);
-    if (path[0] && os_exists(path)) {
-        lpm_index_path(ix, path);
-    } else if (st.documents == 0 && os_exists(".")) {
-        lpm_index_path(ix, ".");
+    LpmUpdate u = {0};
+    int rebuilt = 0;
+    if (path[0]) {
+        if (!os_exists(path)) {
+            http(c, 400, "{\"error\":\"path does not exist\"}");
+            return;
+        }
+        lpm_update_path(CODE_IX, path, &u);
+        const char *rec = getenv("LAPLACE_CODE_RECORDS");
+        if (rec && *rec && (u.changed || u.added || u.removed) && lpm_save(CODE_IX, rec)) {
+            http(c, 500, "{\"error\":\"records not saved\"}");
+            return;
+        }
+    } else if (code_refresh(&u, &rebuilt)) {
+        http(c, 500, "{\"error\":\"code index refresh\"}");
+        return;
     }
-    lpm_stats(ix, &st);
-    const char *rec = getenv("LAPLACE_CODE_RECORDS");
-    if (rec && *rec) lpm_save(ix, rec);
+    LpmStats st = {0};
+    lpm_stats(CODE_IX, &st);
     double ms = (double)(nsec() - t0) / 1e6;
-    char out[256];
+    char out[512];
     snprintf(out, sizeof out,
-             "{\"status\":\"indexed\",\"docs\":%llu,\"entities\":%llu,\"ms\":%.3f}",
-             (unsigned long long)st.documents, (unsigned long long)st.entities, ms);
+             "{\"status\":\"indexed\",\"unchanged\":%llu,\"changed\":%llu,\"added\":%llu,\"removed\":%llu,"
+             "\"rebuilt\":%s,\"files\":%llu,\"docs\":%llu,\"stale\":%llu,\"entities\":%llu,\"ms\":%.3f}",
+             (unsigned long long)u.unchanged, (unsigned long long)u.changed, (unsigned long long)u.added,
+             (unsigned long long)u.removed, rebuilt ? "true" : "false", (unsigned long long)st.files,
+             (unsigned long long)st.documents, (unsigned long long)st.stale, (unsigned long long)st.entities, ms);
     http(c, 200, out);
 }
 
@@ -1312,7 +1374,7 @@ static void rpc_id(const char *body, char *out, size_t cap) {
 static const char *TOOLS =
     "{\"tools\":["
     "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. Returns matching files, exact line ranges (line0..line1), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
-    "{\"name\":\"reindex\",\"description\":\"Rebuild the Laplace AST and constituent code index (optionally adding a specific file or directory path).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
+    "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"rerank\",\"description\":\"Deterministic Laplace reranker (drop-in replacement for neural cross-encoders). Scores candidate documents against a query using IDF-weighted constituent overlap and 4D discrete Frechet trajectory distance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"documents\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"top_n\":{\"type\":\"integer\"}},\"required\":[\"query\",\"documents\"]}},"
     "{\"name\":\"search\",\"description\":\"Name text on the client from tier 0, or take an ID the caller already holds. The trunk is read with holds_above, and so is every constituent whose tier is above a codepoint or a grapheme. A tier-0 constituent stays in the path, in its place, with its codepoint. fan, when sent, caps how many claims and occurrences are returned; omitted, all of them are.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"fan\":{\"type\":\"integer\"}},\"required\":[]}},"
     "{\"name\":\"embeddings\",\"description\":\"Same call shape as an embedding endpoint. Returns the Laplace entity ID, tier, 4D coordinate (also exposed as OpenAI-compatible embedding array), Hilbert value, and constituent IDs. Does not touch the database.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"inputs\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[]}},"

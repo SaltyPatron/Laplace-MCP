@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #ifndef _WIN32
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -37,7 +38,18 @@ typedef struct Doc {
     uint8_t tier;
     uint32_t line0, line1, bytes;
     uint32_t path;
+    uint32_t file;      /* index into Lpm.fl */
 } Doc;
+
+/* A file as it was admitted: what reindexing compares (size and time, then content), and its documents,
+ * which are contiguous. A file that changed or went away is dead: its documents are no longer answers. */
+typedef struct LFile {
+    uint32_t path;
+    uint32_t doc0, ndoc;
+    uint64_t size, hash;
+    int64_t mtime;      /* nanoseconds */
+    uint8_t dead, seen;
+} LFile;
 
 struct Lpm {
     const lp_tier0_record *t0;
@@ -62,6 +74,15 @@ struct Lpm {
      * when no ancestor already is one and it spans LPM_CHUNK_MIN_LINES..LPM_CHUNK_MAX_LINES lines. */
     int chunk_on;
     uint32_t chunk_path, chunk_lines;
+    LFile *fl;
+    size_t nfl, cfl;
+    uint32_t *fmap;     /* path -> file index + 1, open addressing; dead files stay in it and are skipped */
+    size_t nfmap;
+    size_t dead_docs;
+    uint32_t cur_file;
+    int have_meta;      /* index_file and update_file say what they read; lpm_admit of a bare buffer does not */
+    uint64_t meta_size, meta_hash;
+    int64_t meta_mtime;
 };
 
 /* A document small enough to be the answer: a declaration or a block of text, never a whole large file. */
@@ -243,6 +264,8 @@ void lpm_free(Lpm *ix) {
     free(ix->sc);
     free(ix->sc_pool);
     free(ix->sc_feat);
+    free(ix->fl);
+    free(ix->fmap);
     lp_text_free(ix->text);
     free(ix);
 }
@@ -258,6 +281,72 @@ static uint64_t fnv(const uint8_t *s, size_t n) {
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < n; i++) { h ^= s[i]; h *= 1099511628211ull; }
     return h ? h : 1;
+}
+
+static uint64_t str_hash(const char *s) { return fnv((const uint8_t *)s, strlen(s)); }
+
+static void fmap_rehash(Lpm *ix, size_t cap) {
+    uint32_t *m = calloc(cap, sizeof *m);
+    if (!m) abort();
+    for (size_t i = 0; i < ix->nfl; i++) {
+        if (ix->fl[i].dead) continue;
+        size_t k = str_hash(ix->paths + ix->fl[i].path) & (cap - 1);
+        while (m[k]) k = (k + 1) & (cap - 1);
+        m[k] = (uint32_t)i + 1;
+    }
+    free(ix->fmap);
+    ix->fmap = m;
+    ix->nfmap = cap;
+}
+
+/* The live file stored under this path (normalised as add_path stores it), or -1. */
+static long file_find(const Lpm *ix, const char *p) {
+    if (!ix->nfmap) return -1;
+    size_t k = str_hash(p) & (ix->nfmap - 1);
+    while (ix->fmap[k]) {
+        uint32_t i = ix->fmap[k] - 1;
+        if (!ix->fl[i].dead && !strcmp(ix->paths + ix->fl[i].path, p)) return (long)i;
+        k = (k + 1) & (ix->nfmap - 1);
+    }
+    return -1;
+}
+
+static void file_kill(Lpm *ix, uint32_t i) {
+    if (ix->fl[i].dead) return;
+    ix->fl[i].dead = 1;
+    ix->dead_docs += ix->fl[i].ndoc;
+}
+
+static uint32_t file_add(Lpm *ix, uint32_t path_off, uint64_t size, int64_t mtime, uint64_t hash) {
+    if (ix->nfl == ix->cfl) {
+        ix->cfl = ix->cfl ? ix->cfl * 2 : 256;
+        ix->fl = grow(ix->fl, ix->cfl * sizeof *ix->fl);
+    }
+    uint32_t i = (uint32_t)ix->nfl++;
+    LFile *f = &ix->fl[i];
+    memset(f, 0, sizeof *f);
+    f->path = path_off;
+    f->size = size;
+    f->mtime = mtime;
+    f->hash = hash;
+    f->doc0 = (uint32_t)ix->ndocs;
+    f->seen = 1;
+    if ((ix->nfl + 1) * 2 > ix->nfmap) fmap_rehash(ix, ix->nfmap ? ix->nfmap * 2 : 1024);
+    else {
+        size_t k = str_hash(ix->paths + path_off) & (ix->nfmap - 1);
+        while (ix->fmap[k]) k = (k + 1) & (ix->nfmap - 1);
+        ix->fmap[k] = i + 1;
+    }
+    return i;
+}
+
+static void norm_path(char *out, size_t cap, const char *in) {
+    snprintf(out, cap, "%s", in);
+#ifdef _WIN32
+    for (char *q = out; *q; q++) if (*q == '\\') *q = '/';
+#endif
+    size_t n = strlen(out);
+    while (n > 1 && out[n - 1] == '/') out[--n] = 0;
 }
 
 static lp_ref compose_put(Lpm *ix, const lp_ref *ch, uint32_t n, uint8_t tier) {
@@ -516,6 +605,7 @@ static void push_doc(Lpm *ix, const lp_ref *r, uint32_t l0, uint32_t l1, uint32_
     d->line1 = l1;
     d->bytes = bytes;
     d->path = path_off;
+    d->file = ix->cur_file;
     post_features_range(ix, (uint32_t)ix->ndocs, f0, ix->nfeat);
     ix->ndocs++;
 }
@@ -683,6 +773,12 @@ int lpm_admit(Lpm *ix, const char *path, const uint8_t *s, size_t n) {
     const char *dot = base ? strrchr(base, '.') : NULL;
     int utf8 = is_utf8(s, n);
     uint32_t path_off = add_path(ix, path ? path : "");
+    /* The same path admitted again replaces what it held. */
+    long was = file_find(ix, ix->paths + path_off);
+    if (was >= 0) file_kill(ix, (uint32_t)was);
+    if (ix->have_meta) ix->cur_file = file_add(ix, path_off, ix->meta_size, ix->meta_mtime, ix->meta_hash);
+    else ix->cur_file = file_add(ix, path_off, n, 0, fnv(s, n));
+    ix->have_meta = 0;
     uint32_t file_lines = utf8 ? count_lines(s, n) : 0;
     if (dot && (!strcmp(dot, ".tsv") || !strcmp(dot, ".csv")) && utf8) {
         trunk = admit_delimited(ix, s, n, dot[1] == 'c');
@@ -726,8 +822,10 @@ int lpm_admit(Lpm *ix, const char *path, const uint8_t *s, size_t n) {
     doc->line1 = file_lines;
     doc->bytes = n > 0xffffffffu ? 0xffffffffu : (uint32_t)n;
     doc->path = path_off;
+    doc->file = ix->cur_file;
     post_features(ix, (uint32_t)ix->ndocs);
     ix->ndocs++;
+    ix->fl[ix->cur_file].ndoc = (uint32_t)(ix->ndocs - ix->fl[ix->cur_file].doc0);
     ix->collecting = 0;
     ix->files++;
     ix->bytes += n;
@@ -756,24 +854,85 @@ static int skip_dir(const char *name) {
     return 0;
 }
 
-static int index_file(Lpm *ix, const char *path) {
+static int64_t mtime_ns(const struct statx *x) {
+    return (int64_t)x->stx_mtime.tv_sec * 1000000000LL + (int64_t)x->stx_mtime.tv_nsec;
+}
+
+/* 1 and the bytes in *buf when the file is one to admit, 0 when it is skipped, -1 when memory ran out. */
+static int read_small(Lpm *ix, const char *path, uint8_t **buf, size_t *len) {
+    *buf = NULL;
+    *len = 0;
     if (!os_exists(path) || os_is_dir(path)) return 0;
     FILE *f = fopen(path, "rb");
     if (!f) { ix->skipped++; return 0; }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); ix->skipped++; return 0; }
     long sz = ftell(f);
     if (sz <= 0 || sz > (1 << 20) || fseek(f, 0, SEEK_SET) != 0) { fclose(f); ix->skipped++; return 0; }
-    uint8_t *buf = malloc((size_t)sz);
-    if (!buf) { fclose(f); return -1; }
-    size_t n = fread(buf, 1, (size_t)sz, f);
+    uint8_t *b = malloc((size_t)sz);
+    if (!b) { fclose(f); return -1; }
+    size_t n = fread(b, 1, (size_t)sz, f);
     fclose(f);
-    if (n != (size_t)sz) { free(buf); ix->skipped++; return 0; }
-    int rc = lpm_admit(ix, path, buf, n);
+    if (n != (size_t)sz) { free(b); ix->skipped++; return 0; }
+    *buf = b;
+    *len = n;
+    return 1;
+}
+
+static int admit_read(Lpm *ix, const char *path, const uint8_t *buf, size_t n, int64_t mtime) {
+    ix->have_meta = 1;
+    ix->meta_size = n;
+    ix->meta_mtime = mtime;
+    ix->meta_hash = fnv(buf, n);
+    return lpm_admit(ix, path, buf, n);
+}
+
+static int index_file(Lpm *ix, const char *path) {
+    struct statx x;
+    memset(&x, 0, sizeof x);
+    if (statx(AT_FDCWD, path, 0, STATX_SIZE | STATX_MTIME, &x) != 0) return 0;
+    uint8_t *buf;
+    size_t n;
+    int got = read_small(ix, path, &buf, &n);
+    if (got <= 0) return got;
+    int rc = admit_read(ix, path, buf, n, mtime_ns(&x));
     free(buf);
     return rc;
 }
 
-static int index_dir(Lpm *ix, const char *path) {
+/* A file met again: unchanged when its size and time agree, or its content does; read and admitted again
+ * otherwise, which leaves what it held before dead. */
+static int update_file(Lpm *ix, const char *path, LpmUpdate *u) {
+    char key[4096];
+    norm_path(key, sizeof key, path);
+    struct statx x;
+    memset(&x, 0, sizeof x);
+    if (statx(AT_FDCWD, path, 0, STATX_SIZE | STATX_MTIME, &x) != 0) return 0;
+    int64_t mt = mtime_ns(&x);
+    long f = file_find(ix, key);
+    if (f >= 0 && ix->fl[f].size == x.stx_size && ix->fl[f].mtime == mt) {
+        ix->fl[f].seen = 1;
+        u->unchanged++;
+        return 0;
+    }
+    uint8_t *buf;
+    size_t n;
+    int got = read_small(ix, path, &buf, &n);
+    if (got <= 0) return got;
+    if (f >= 0 && ix->fl[f].size == n && ix->fl[f].hash == fnv(buf, n)) {
+        ix->fl[f].mtime = mt;
+        ix->fl[f].seen = 1;
+        u->unchanged++;
+        free(buf);
+        return 0;
+    }
+    int rc = admit_read(ix, path, buf, n, mt);
+    free(buf);
+    if (f >= 0) u->changed++;
+    else u->added++;
+    return rc;
+}
+
+static int walk_dir(Lpm *ix, const char *path, LpmUpdate *u) {
     os_list ls = {0};
     if (os_list_dir(path, &ls) != 0) return -1;
     for (size_t i = 0; i < ls.n; i++) {
@@ -788,13 +947,13 @@ static int index_dir(Lpm *ix, const char *path) {
 #endif
             if (os_is_dir(child)) {
                 if (!skip_dir(name)) {
-                    if (index_dir(ix, child)) {
+                    if (walk_dir(ix, child, u)) {
                         os_list_free(&ls);
                         return -1;
                     }
                 }
             } else if (wanted(name)) {
-                if (index_file(ix, child)) {
+                if (u ? update_file(ix, child, u) : index_file(ix, child)) {
                     os_list_free(&ls);
                     return -1;
                 }
@@ -807,9 +966,35 @@ static int index_dir(Lpm *ix, const char *path) {
 
 int lpm_index_path(Lpm *ix, const char *path) {
     if (!path || !*path) return -1;
-    if (os_is_dir(path)) return index_dir(ix, path);
+    if (os_is_dir(path)) return walk_dir(ix, path, NULL);
     if (!os_exists(path)) return -1;
     return index_file(ix, path);
+}
+
+static int under(const char *p, const char *root, size_t rl) {
+    return !strncmp(p, root, rl) && (p[rl] == '/' || p[rl] == 0);
+}
+
+int lpm_update_path(Lpm *ix, const char *path, LpmUpdate *u) {
+    if (!path || !*path || !u) return -1;
+    char root[4096];
+    norm_path(root, sizeof root, path);
+    size_t rl = strlen(root);
+    for (size_t i = 0; i < ix->nfl; i++)
+        if (!ix->fl[i].dead && under(ix->paths + ix->fl[i].path, root, rl)) ix->fl[i].seen = 0;
+    int rc = 0;
+    if (os_is_dir(path)) rc = walk_dir(ix, path, u);
+    else if (os_exists(path) && wanted(path_basename(path))) rc = update_file(ix, path, u);
+    if (rc) return rc;
+    /* What was under the root and was not met again is gone. */
+    for (size_t i = 0; i < ix->nfl; i++) {
+        LFile *f = &ix->fl[i];
+        if (!f->dead && !f->seen && under(ix->paths + f->path, root, rl)) {
+            file_kill(ix, (uint32_t)i);
+            u->removed++;
+        }
+    }
+    return 0;
 }
 
 size_t lpm_search(Lpm *ix, const char *q, size_t n, LpmHit *out, size_t cap) {
@@ -858,16 +1043,18 @@ size_t lpm_search(Lpm *ix, const char *q, size_t n, LpmHit *out, size_t cap) {
      * length against the mean, so a declaration that holds the query outranks the whole file around it. */
     const double k1 = 1.2, b = 0.75;
     double avg = 0;
-    for (size_t d = 0; d < ix->ndocs; d++) avg += ix->docs[d].bytes;
-    avg = avg / (double)ix->ndocs;
+    size_t live = 0;
+    for (size_t d = 0; d < ix->ndocs; d++) if (!ix->fl[ix->docs[d].file].dead) { avg += ix->docs[d].bytes; live++; }
+    if (!live) { free(shared); free(rank); return 0; }
+    avg = avg / (double)live;
     if (avg < 1) avg = 1;
     for (size_t f = 0; f < ix->nfeat; f++) {
         Ent *e = ent_find(ix, ix->feat + f * 16);
         if (!e || !e->nd) continue;
-        double idf = log(1.0 + (double)ix->ndocs / (double)e->nd);
+        double idf = log(1.0 + (double)live / (double)e->nd);
         for (uint32_t d = 0; d < e->nd; d++) {
             uint32_t di = e->docs[d];
-            if (di >= ix->ndocs) continue;
+            if (di >= ix->ndocs || ix->fl[ix->docs[di].file].dead) continue;
             shared[di]++;
             rank[di] += idf;
         }
@@ -921,7 +1108,7 @@ size_t lpm_containers(const Lpm *ix, const uint8_t id[16], LpmHit *out, size_t c
     if (e) {
         for (uint32_t i = 0; i < e->nd && n < cap; i++) {
             uint32_t di = e->docs[i];
-            if (di >= ix->ndocs) continue;
+            if (di >= ix->ndocs || ix->fl[ix->docs[di].file].dead) continue;
             Doc *d = &ix->docs[di];
             LpmHit *h = &out[n++];
             memset(h, 0, sizeof *h);
@@ -935,7 +1122,7 @@ size_t lpm_containers(const Lpm *ix, const uint8_t id[16], LpmHit *out, size_t c
         }
     }
     for (size_t di = 0; di < ix->ndocs && n < cap; di++) {
-        if (memcmp(ix->docs[di].id, id, 16)) continue;
+        if (ix->fl[ix->docs[di].file].dead || memcmp(ix->docs[di].id, id, 16)) continue;
         int seen = 0;
         for (size_t k = 0; k < n; k++) if (!strcmp(out[k].path, ix->paths + ix->docs[di].path)) seen = 1;
         if (seen) continue;
@@ -1358,11 +1545,11 @@ int lpm_last(const Lpm *ix, LpmHit *out) {
 
 void lpm_stats(const Lpm *ix, LpmStats *s) {
     memset(s, 0, sizeof *s);
-    s->files = ix->files;
+    for (size_t i = 0; i < ix->nfl; i++) if (!ix->fl[i].dead) { s->files++; s->bytes += ix->fl[i].size; }
     s->skipped = ix->skipped;
-    s->bytes = ix->bytes;
     s->entities = ix->nent;
-    s->documents = ix->ndocs;
+    s->documents = ix->ndocs - ix->dead_docs;
+    s->stale = ix->dead_docs;
     s->compositions = ix->compositions;
     for (size_t i = 0; i < ix->nslot; i++) if (ix->slot[i].used && ix->slot[i].nd) s->words++;
 }
@@ -1371,13 +1558,17 @@ static void wr(FILE *f, const void *p, size_t n) {
     if (fwrite(p, 1, n, f) != n) abort();
 }
 
+/* Records, version 2: entities with their constituents, files with what reindexing compares, documents,
+ * postings. Everything an index held is there when it is loaded. */
 int lpm_save(const Lpm *ix, const char *path) {
-    FILE *f = fopen(path, "wb");
+    char tmp[4200];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
     if (!f) return -1;
     wr(f, "LPM1", 4);
-    uint32_t ver = 1;
+    uint32_t ver = 2;
     wr(f, &ver, 4);
-    uint64_t nent = ix->nent, nd = ix->ndocs;
+    uint64_t nent = ix->nent, nd = ix->ndocs, nf = ix->nfl;
     wr(f, &nent, 8);
     for (size_t i = 0; i < ix->nslot; i++) {
         Ent *e = &ix->slot[i];
@@ -1389,6 +1580,22 @@ int lpm_save(const Lpm *ix, const char *path) {
         wr(f, &e->tier, 1);
         uint8_t pad[3] = {0};
         wr(f, pad, 3);
+        wr(f, &e->nkids, 4);
+        if (e->nkids) wr(f, e->kids, (size_t)e->nkids * 16);
+    }
+    wr(f, &nf, 8);
+    for (size_t i = 0; i < ix->nfl; i++) {
+        const LFile *fl = &ix->fl[i];
+        const char *p = ix->paths + fl->path;
+        uint32_t pl = (uint32_t)strlen(p);
+        wr(f, &pl, 4);
+        wr(f, p, pl);
+        wr(f, &fl->size, 8);
+        wr(f, &fl->mtime, 8);
+        wr(f, &fl->hash, 8);
+        wr(f, &fl->doc0, 4);
+        wr(f, &fl->ndoc, 4);
+        wr(f, &fl->dead, 1);
     }
     wr(f, &nd, 8);
     for (size_t i = 0; i < ix->ndocs; i++) {
@@ -1400,10 +1607,7 @@ int lpm_save(const Lpm *ix, const char *path) {
         wr(f, &d->line1, 4);
         wr(f, &d->bytes, 4);
         wr(f, &d->tier, 1);
-        const char *p = ix->paths + d->path;
-        uint32_t pl = (uint32_t)strlen(p);
-        wr(f, &pl, 4);
-        wr(f, p, pl);
+        wr(f, &d->file, 4);
     }
     uint64_t np = 0;
     for (size_t i = 0; i < ix->nslot; i++) if (ix->slot[i].used && ix->slot[i].nd) np++;
@@ -1415,47 +1619,87 @@ int lpm_save(const Lpm *ix, const char *path) {
         wr(f, &e->nd, 4);
         wr(f, e->docs, e->nd * 4);
     }
-    fclose(f);
-    return 0;
+    if (fclose(f) != 0) return -1;
+    remove(path);
+    return rename(tmp, path) == 0 ? 0 : -1;
 }
 
-static void rd(FILE *f, void *p, size_t n) {
-    if (fread(p, 1, n, f) != n) abort();
+static int rd(FILE *f, void *p, size_t n) {
+    return fread(p, 1, n, f) == n;
 }
 
+/* NULL when the file is missing, not records, another version, or cut short. */
 Lpm *lpm_load(const char *path, const char *tier0) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     char mag[4];
-    rd(f, mag, 4);
-    if (memcmp(mag, "LPM1", 4)) { fclose(f); return NULL; }
-    uint32_t ver;
-    rd(f, &ver, 4);
-    if (ver != 1) { fclose(f); return NULL; }
+    uint32_t ver = 0;
+    if (!rd(f, mag, 4) || memcmp(mag, "LPM1", 4) || !rd(f, &ver, 4) || ver != 2) { fclose(f); return NULL; }
     Lpm *ix = lpm_new(tier0);
     if (!ix) { fclose(f); return NULL; }
     uint64_t nent;
-    rd(f, &nent, 8);
+    if (!rd(f, &nent, 8)) goto bad;
     for (uint64_t i = 0; i < nent; i++) {
         lp_ref r;
         memset(&r, 0, sizeof r);
-        uint32_t seen;
+        uint32_t seen, nk;
         uint8_t tier, pad[3];
-        rd(f, r.id.b, 16);
-        rd(f, r.c.m, 32);
         uint64_t hilbert;
-        rd(f, &hilbert, 8);
-        rd(f, &seen, 4);
-        rd(f, &tier, 1);
-        rd(f, pad, 3);
+        if (!rd(f, r.id.b, 16) || !rd(f, r.c.m, 32) || !rd(f, &hilbert, 8) || !rd(f, &seen, 4) || !rd(f, &tier, 1) ||
+            !rd(f, pad, 3) || !rd(f, &nk, 4)) goto bad;
         r.tier = tier;
         int fresh = 0;
         Ent *e = ent_put(ix, &r, &fresh);
         e->seen = seen;
         e->hilbert = hilbert;
+        if (nk) {
+            uint8_t *k = malloc((size_t)nk * 16);
+            if (!k) abort();
+            if (!rd(f, k, (size_t)nk * 16)) { free(k); goto bad; }
+            free(e->kids);
+            e->kids = k;
+            e->nkids = nk;
+        }
     }
+    uint64_t nf;
+    if (!rd(f, &nf, 8)) goto bad;
+    for (uint64_t i = 0; i < nf; i++) {
+        uint32_t pl;
+        if (!rd(f, &pl, 4) || pl > 65535) goto bad;
+        char *p = malloc((size_t)pl + 1);
+        if (!p) abort();
+        if (!rd(f, p, pl)) { free(p); goto bad; }
+        p[pl] = 0;
+        uint64_t size, hash;
+        int64_t mtime;
+        uint32_t doc0, ndoc;
+        uint8_t dead;
+        if (!rd(f, &size, 8) || !rd(f, &mtime, 8) || !rd(f, &hash, 8) || !rd(f, &doc0, 4) || !rd(f, &ndoc, 4) ||
+            !rd(f, &dead, 1)) { free(p); goto bad; }
+        uint32_t off = add_path(ix, p);
+        free(p);
+        if (ix->nfl == ix->cfl) {
+            ix->cfl = ix->cfl ? ix->cfl * 2 : 256;
+            ix->fl = grow(ix->fl, ix->cfl * sizeof *ix->fl);
+        }
+        LFile *fl = &ix->fl[ix->nfl++];
+        memset(fl, 0, sizeof *fl);
+        fl->path = off;
+        fl->size = size;
+        fl->mtime = mtime;
+        fl->hash = hash;
+        fl->doc0 = doc0;
+        fl->ndoc = ndoc;
+        fl->dead = dead;
+        fl->seen = 1;
+        if (dead) ix->dead_docs += ndoc;
+        else ix->files++;
+    }
+    size_t cap = 1024;
+    while (cap < (ix->nfl + 1) * 2) cap *= 2;
+    fmap_rehash(ix, cap);
     uint64_t nd;
-    rd(f, &nd, 8);
+    if (!rd(f, &nd, 8)) goto bad;
     for (uint64_t i = 0; i < nd; i++) {
         if (ix->ndocs == ix->cdocs) {
             ix->cdocs = ix->cdocs ? ix->cdocs * 2 : 256;
@@ -1463,41 +1707,32 @@ Lpm *lpm_load(const char *path, const char *tier0) {
         }
         Doc *d = &ix->docs[ix->ndocs];
         memset(d, 0, sizeof *d);
-        uint32_t pl;
         uint8_t tier;
-        rd(f, d->id, 16);
-        rd(f, d->m, 32);
-        rd(f, &d->hilbert, 8);
-        rd(f, &d->line0, 4);
-        rd(f, &d->line1, 4);
-        rd(f, &d->bytes, 4);
-        rd(f, &tier, 1);
-        rd(f, &pl, 4);
-        char *p = malloc(pl + 1);
-        if (!p) abort();
-        rd(f, p, pl);
-        p[pl] = 0;
+        if (!rd(f, d->id, 16) || !rd(f, d->m, 32) || !rd(f, &d->hilbert, 8) || !rd(f, &d->line0, 4) ||
+            !rd(f, &d->line1, 4) || !rd(f, &d->bytes, 4) || !rd(f, &tier, 1) || !rd(f, &d->file, 4)) goto bad;
+        if (d->file >= ix->nfl) goto bad;
         d->tier = tier;
-        if (ix->ndocs && !strcmp(ix->paths + ix->docs[ix->ndocs - 1].path, p)) d->path = ix->docs[ix->ndocs - 1].path;
-        else { d->path = add_path(ix, p); ix->files++; }
-        free(p);
+        d->path = ix->fl[d->file].path;
         ix->ndocs++;
     }
     uint64_t np;
-    rd(f, &np, 8);
+    if (!rd(f, &np, 8)) goto bad;
     for (uint64_t i = 0; i < np; i++) {
         uint8_t id[16];
         uint32_t count;
-        rd(f, id, 16);
-        rd(f, &count, 4);
+        if (!rd(f, id, 16) || !rd(f, &count, 4)) goto bad;
         Ent *e = ent_find(ix, id);
-        if (!e) abort();
+        if (!e) goto bad;
         e->cd = count;
-        e->docs = malloc(count * sizeof *e->docs);
+        e->docs = malloc((count ? count : 1) * sizeof *e->docs);
         if (!e->docs) abort();
-        rd(f, e->docs, count * 4);
+        if (!rd(f, e->docs, (size_t)count * 4)) goto bad;
         e->nd = count;
     }
     fclose(f);
     return ix;
+bad:
+    fclose(f);
+    lpm_free(ix);
+    return NULL;
 }

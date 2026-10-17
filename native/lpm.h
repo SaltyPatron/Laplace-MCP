@@ -11,7 +11,12 @@ typedef struct Lpm Lpm;
 
 typedef struct {
     uint64_t files, skipped, bytes, entities, documents, words, compositions, ns;
+    uint64_t stale;     /* documents of files that changed or went away since they were admitted */
 } LpmStats;
+
+typedef struct {
+    uint64_t unchanged, changed, added, removed;
+} LpmUpdate;
 
 typedef struct {
     uint8_t id[16];
@@ -40,8 +45,11 @@ void lpm_free(Lpm *);
  * A field, a leaf, and a file with no recipe are text. Same bytes, same entity. */
 int lpm_admit(Lpm *, const char *path, const uint8_t *s, size_t n);
 
-/* A file, or a directory walked as a repository. */
+/* A file, or a directory walked as a repository. A path admitted again replaces what it held. */
 int lpm_index_path(Lpm *, const char *path);
+/* Bring what the index holds under path up to date: files whose size and time (or else content) agree are not
+ * read; changed and new files are admitted; files no longer there are removed. Counts accumulate in *u. */
+int lpm_update_path(Lpm *, const char *path, LpmUpdate *u);
 
 /* Rank documents by how many of the query's constituent IDs they contain. */
 size_t lpm_search(Lpm *, const char *q, size_t n, LpmHit *out, size_t cap);
