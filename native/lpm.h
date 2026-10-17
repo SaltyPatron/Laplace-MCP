@@ -50,6 +50,10 @@ size_t lpm_containers(const Lpm *, const uint8_t id[16], LpmHit *out, size_t cap
 /* Fréchet of the two records' trajectories (ordered constituent coordinates). -1 if either ID is absent. */
 double lpm_frechet(const Lpm *, const uint8_t a[16], const uint8_t b[16]);
 
+/* Deterministic CPU reranking of a candidate document against a query: combines constituent IDF/overlap
+ * and 4D Fréchet trajectory similarity over tier-0/tier-2 coordinates into a relevance score in [0, 1]. */
+double lpm_rerank(Lpm *, const char *query, size_t qn, const char *doc, size_t dn, uint32_t *shared_out, double *frechet_out);
+
 /* The entity and physicality of a UTF-8 string, from the text decomposition. */
 int lpm_identify(Lpm *, const char *s, size_t n, LpmRec *out);
 
