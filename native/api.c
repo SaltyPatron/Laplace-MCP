@@ -29,6 +29,7 @@ typedef intptr_t ssize_t;
 
 #include "laplace/laplace.h"
 
+#include <ctype.h>
 #include <libpq-fe.h>
 #include <math.h>
 #include <stdarg.h>
@@ -1636,8 +1637,178 @@ static int cw_file_cmp(const void *a, const void *b) {
     return strcmp(x->path, y->path);
 }
 
-static void on_code_where(int c, const char *body) {
-    char name[2048];
+/* ---- file_outline: what a file declares, from the database. The file is found by its name: up from the name through
+ * the OS's record of it (its metadata) to the trunk whose first vertex is that record, and its pathname ends in the path
+ * asked for (or the file is named by its ID, as code_where returns it). What a code recipe says of a file is a record
+ * of claims [kind, name], one a declaration, in the file's order (or one claim, its own record). Each is at the first
+ * line at or after the one before it where its name stands as a word in the file's recorded text. */
+static int fo_hex(const char *s, lp_id *id) {
+    if (strlen(s) != 32) return 0;
+    for (int b = 0; b < 16; b++) {
+        unsigned v;
+        if (sscanf(s + b * 2, "%2x", &v) != 1) return 0;
+        id->b[b] = (uint8_t)v;
+    }
+    return 1;
+}
+/* One entity's vertices, as laplace_paths gives its path. */
+static size_t fo_vertices(PGconn *pg, const lp_id *id, lp_vertex *out, size_t cap) {
+    char h[33], arr[40];
+    hex_id(id, h);
+    snprintf(arr, sizeof arr, "{%s}", h);
+    const char *v[1] = { arr };
+    PGresult *r = PQexecParams(pg, "SELECT path::text FROM laplace_paths($1::blake3[])", 1, NULL, v, NULL, NULL, 0);
+    size_t n = 0;
+    if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0) {
+        const char *hx = PQgetvalue(r, 0, 0);
+        size_t hl = strlen(hx) / 2;
+        uint8_t *b = malloc(hl + 1);
+        for (size_t i = 0; i < hl; i++) { unsigned x; sscanf(hx + i * 2, "%2x", &x); b[i] = (uint8_t)x; }
+        n = lp_path_vertices(b, hl, out, cap);
+        if (n > cap) n = cap;
+        free(b);
+    }
+    PQclear(r);
+    return n;
+}
+static int fo_word(char c) { return isalnum((unsigned char)c) || c == '_' || (unsigned char)c >= 0x80; }
+static void on_file_outline(int c, const char *body) {
+    char want[2048] = "", fid[64] = "";
+    jstr(body, "path", want, sizeof want);
+    jstr(body, "file", fid, sizeof fid);
+    if (!want[0] && !fid[0]) { http(c, 400, "{\"error\":\"path or file\"}"); return; }
+    PGconn *pg = db();
+    if (!pg) {
+        char e[512], b[640];
+        json_esc(PQerrorMessage(PG), e, sizeof e);
+        snprintf(b, sizeof b, "{\"error\":\"database\",\"detail\":\"%s\"}", e);
+        http(c, 503, b);
+        return;
+    }
+    uint64_t t0 = nsec();
+    Reader *rd = reader_new(pg);
+    lp_vec(lp_id) files = { 0 };
+    if (fid[0]) {
+        lp_id f;
+        if (!fo_hex(fid, &f)) { reader_free(rd); http(c, 400, "{\"error\":\"file is a 32-digit ID\"}"); return; }
+        lp_push(&files, f);
+    } else {
+        const char *base = strrchr(want, '/');
+        base = base ? base + 1 : want;
+        lp_ref trunk, parts[256];
+        size_t np = 0;
+        if (!*base || !name_entity(base, &trunk, parts, 256, &np)) { reader_free(rd); http(c, 400, "{\"error\":\"path\"}"); return; }
+        lp_idmap *seen = lp_idmap_new(), *front = lp_idmap_new();
+        lp_idmap_put(front, &trunk.id, NULL);
+        lp_vec(lp_vertex) vx = { 0 };
+        for (int level = 0; level < 10 && lp_idmap_count(front) && lp_idmap_count(seen) < 20000; level++) {
+            int nh = 0;
+            Hold *h = holds_any(lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
+            lp_idmap *next = lp_idmap_new();
+            for (int j = 0; j < nh; j++) {
+                size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
+                if (!nv) continue;
+                lp_vec_reserve(&vx, nv);
+                lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
+                bool fresh;
+                lp_idmap_put(seen, &h[j].entity, &fresh);
+                if (!fresh) continue;
+                /* a trunk whose first vertex is the OS's record, reached through that record: a file */
+                if (vx.v[0].said == LP_SAID_METADATA && lp_idmap_find(front, &vx.v[0].id) >= 0) {
+                    char *path = cw_file_name(rd, &h[j].entity);
+                    size_t pl = strlen(path), wl = strlen(want);
+                    if (pl >= wl && !strcmp(path + pl - wl, want) && (pl == wl || want[0] == '/' || path[pl - wl - 1] == '/'))
+                        lp_push(&files, h[j].entity);
+                    free(path);
+                } else if (vx.v[0].said != LP_SAID_METADATA) lp_idmap_put(next, &h[j].entity, NULL);
+            }
+            holds_free(h, nh);
+            lp_idmap_free(front);
+            front = next;
+        }
+        lp_vec_free(&vx);
+        lp_idmap_free(front);
+        lp_idmap_free(seen);
+    }
+    char *out = NULL;
+    size_t on = 0, ocap = 0;
+    buf_fmt(&out, &on, &ocap, "{\"database\":\"%s\",\"files\":[", PQdb(pg));
+    static lp_vertex fv[4096], rv[4096];
+    for (size_t f = 0; f < files.n && f < 16; f++) {
+        size_t nv = fo_vertices(pg, &files.v[f], fv, 4096);
+        /* the recorded text: every part but the OS's record and what is said of the file */
+        size_t tn = 0, tcap = 1 << 16;
+        char *text = malloc(tcap);
+        text[0] = 0;
+        lp_vec(lp_id) claims = { 0 };
+        for (size_t v = 0; v < nv; v++) {
+            uint32_t sd = fv[v].said;
+            if (sd == LP_SAID_METADATA) continue;
+            if (sd == LP_SAID_RECORD || sd == LP_SAID_CLAIM) {
+                size_t nr = sd == LP_SAID_RECORD ? fo_vertices(pg, &fv[v].id, rv, 4096) : 0;
+                int has = 0;
+                for (size_t k = 0; k < nr; k++) if (rv[k].said == LP_SAID_CLAIM) { has = 1; lp_push(&claims, rv[k].id); }
+                if (!has) lp_push(&claims, fv[v].id);      /* a claim said alone: its own record */
+                continue;
+            }
+            for (uint32_t k = 0; k < (fv[v].run ? fv[v].run : 1); k++) {
+                char *t = reader_text(rd, &fv[v].id, (size_t)8 << 20);
+                size_t l = strlen(t);
+                if (tn + l + 1 > tcap) { while (tn + l + 1 > tcap) tcap *= 2; text = realloc(text, tcap); }
+                memcpy(text + tn, t, l + 1);
+                tn += l;
+                free(t);
+            }
+        }
+        char *path = cw_file_name(rd, &files.v[f]), pe[8192], fh[33];
+        json_esc(path, pe, sizeof pe);
+        hex_id(&files.v[f], fh);
+        buf_fmt(&out, &on, &ocap, "%s{\"path\":\"%s\",\"file\":\"%s\",\"bytes\":%zu,\"declarations\":[", f ? "," : "", pe, fh, tn);
+        free(path);
+        size_t at = 0, line = 1, shown = 0;
+        for (size_t k = 0; k < claims.n; k++) {
+            lp_id two[4];
+            if (reader_parts(rd, &claims.v[k], two, 4) != 2) continue;
+            char *kind = reader_text(rd, &two[0], 120), *name = reader_text(rd, &two[1], 400);
+            size_t nl = strlen(name), found = 0, fl = 0;
+            for (size_t p = at, ln = line; nl && p + nl <= tn; p++) {
+                if (p > at && text[p - 1] == '\n') ln++;
+                if (!memcmp(text + p, name, nl) && (p == 0 || !fo_word(text[p - 1])) && !fo_word(text[p + nl])) { found = p + 1; fl = ln; break; }
+            }
+            char ke[300], ne[900];
+            json_esc(kind, ke, sizeof ke);
+            json_esc(name, ne, sizeof ne);
+            buf_fmt(&out, &on, &ocap, "%s{\"kind\":\"%s\",\"name\":\"%s\"", shown ? "," : "", ke, ne);
+            if (found) {
+                buf_fmt(&out, &on, &ocap, ",\"line\":%zu", fl);
+                at = found - 1; line = fl;
+            }
+            buf_add(&out, &on, &ocap, "}", 1);
+            shown++;
+            free(kind);
+            free(name);
+        }
+        buf_add(&out, &on, &ocap, "]}", 2);
+        lp_vec_free(&claims);
+        free(text);
+    }
+    buf_fmt(&out, &on, &ocap, "],\"ms\":%.3f}", (double)(nsec() - t0) / 1e6);
+    lp_vec_free(&files);
+    reader_free(rd);
+    http(c, 200, out);
+    free(out);
+}
+
+/* recipe_plan: which recipe reads what, as laplace ingest --plan answers it; nothing is read into the database. */
+static void on_recipe_plan(int c, const char *body) {
+    char what[4096] = "";
+    jstr(body, "input", what, sizeof what);
+    if (what[0] && !plain_arg(what)) { http(c, 400, "{\"error\":\"input is a source name or a path\"}"); return; }
+    char *av[] = { (char *)ENGINE, "ingest", "--plan", what[0] ? what : NULL, NULL };
+    on_engine(c, av);
+}
+
+static void on_code_where(int c, const char *body) {    char name[2048];
     /* query, as code_search takes it (a tools/call's own "name" comes first in its body, so the key is not "name") */
     if ((!jstr(body, "query", name, sizeof name) || !name[0]) && (!jstr(body, "input", name, sizeof name) || !name[0])) {
         http(c, 400, "{\"error\":\"query\"}");
@@ -1869,6 +2040,8 @@ static const char *TOOLS =
     "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates and Laplace rerank orders the union; a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code (query) stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment above it, nothing from a working tree. Each file that holds it, by the pathname its record gives: defines, the declaration kinds its recipe said of the name there (function_definition, class_declaration...), files that define it first; occurrences, how many places in its syntax tree hold it; at, up to occurrences (default 3) of them: the line, the innermost enclosing node of at least context bytes (default 120), and the enclosing declaration's first line with its span line0..line1. defines true: only files that define it. path: a substring the file path must contain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"defines\":{\"type\":\"boolean\"},\"limit\":{\"type\":\"integer\"},\"occurrences\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"sources\",\"description\":\"The sources the Laplace database holds: each witness ID, its name and trust.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
+    "{\"name\":\"file_outline\",\"description\":\"What a file in the Laplace database declares: the claims [kind, name] its code recipe said of it, in the file's order, each with the line where its name first stands after the one before. The file by the end of its pathname (path) or its ID (file, as code_where returns it).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"}},\"required\":[]}},"
+    "{\"name\":\"recipe_plan\",\"description\":\"Which recipe reads what, as laplace ingest --plan answers it, without reading anything into the database: a source name or a path (input), else every source in order.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"rerank\",\"description\":\"Deterministic Laplace reranker (drop-in replacement for neural cross-encoders). Scores candidate documents against a query using IDF-weighted constituent overlap and 4D discrete Frechet trajectory distance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"documents\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"top_n\":{\"type\":\"integer\"}},\"required\":[\"query\",\"documents\"]}},"
     "{\"name\":\"search\",\"description\":\"Name text on the client from tier 0, or take an ID the caller already holds. The trunk is read with holds_above, and so is every constituent whose tier is above a codepoint or a grapheme. A tier-0 constituent stays in the path, in its place, with its codepoint. fan, when sent, caps how many claims and occurrences are returned; omitted, all of them are.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"fan\":{\"type\":\"integer\"}},\"required\":[]}},"
@@ -1934,6 +2107,8 @@ static void mcp_rpc(int c, const char *body) {
         else if (!strcmp(name, "reindex")) on_reindex(c, body);
         else if (!strcmp(name, "code_where")) on_code_where(c, body);
         else if (!strcmp(name, "sources")) on_sources(c, body);
+        else if (!strcmp(name, "file_outline")) on_file_outline(c, body);
+        else if (!strcmp(name, "recipe_plan")) on_recipe_plan(c, body);
         else if (!strcmp(name, "rerank")) on_rerank(c, body);
         else if (!strcmp(name, "search")) on_search(c, body);
         else if (!strcmp(name, "embeddings")) on_embeddings(c, body);
@@ -1988,6 +2163,8 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
         else if (!strcmp(op, "reindex")) path = "/v1/reindex";
         else if (!strcmp(op, "code_where")) path = "/v1/code_where";
         else if (!strcmp(op, "sources")) path = "/v1/sources";
+        else if (!strcmp(op, "file_outline")) path = "/v1/file_outline";
+        else if (!strcmp(op, "recipe_plan")) path = "/v1/recipe_plan";
         else if (!strcmp(op, "search")) path = "/v1/search";
         else if (!strcmp(op, "forward")) path = "/v1/forward";
         else if (!strcmp(op, "shape") || !strcmp(op, "frechet")) path = "/v1/shape";
@@ -2022,6 +2199,8 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
     else if (!strcmp(path, "/v1/reindex")) on_reindex(c, body);
     else if (!strcmp(path, "/v1/code_where")) on_code_where(c, body);
     else if (!strcmp(path, "/v1/sources")) on_sources(c, body);
+    else if (!strcmp(path, "/v1/file_outline")) on_file_outline(c, body);
+    else if (!strcmp(path, "/v1/recipe_plan")) on_recipe_plan(c, body);
     else if (!strcmp(path, "/v1/search")) on_search(c, body);
     else if (!strcmp(path, "/v1/forward")) on_by_parts(c, body, FORWARD_SQL, "forward");
     else if (!strcmp(path, "/v1/shape")) on_shape(c, body);

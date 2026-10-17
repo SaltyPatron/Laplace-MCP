@@ -69,7 +69,7 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
             fail('ingest: ' + i.stdout[-3000:] + i.stderr[-2000:])
 
         tools = {t['name'] for t in call(None, {})['tools']}
-        if not {'code_where', 'sources'} <= tools:
+        if not {'code_where', 'sources', 'file_outline', 'recipe_plan'} <= tools:
             fail(f'tools/list: {sorted(tools)}')
 
         r = call('code_where', {'query': 'backoff_delay', 'occurrences': 4, 'context': 40})
@@ -116,6 +116,31 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         if [Path(h['path']).name for h in r['hits']] != ['once.py'] or not any(a['line'] == 5 for a in r['hits'][0]['at']):
             fail(f'once_jitter: {r["hits"]}')
 
+        # file_outline: what each file declares, in order, with its lines, by path or by the file's ID
+        def outline(**args):
+            o = call('file_outline', args)
+            if len(o['files']) != 1:
+                fail(f'file_outline {args}: {o}')
+            return [(d['kind'], d['name'], d.get('line')) for d in o['files'][0]['declarations']], o['files'][0]
+        got, f = outline(path='proj/retry.c')
+        if got != [('function_definition', 'backoff_delay', 3), ('function_definition', 'retry_count', 8)]:
+            fail(f'outline retry.c: {got}')
+        if outline(file=f['file'])[0] != got:
+            fail('outline by file ID differs from by path')
+        got, _ = outline(path='jitter.py')
+        if got != [('function_definition', 'jitter', 4), ('function_definition', 'spread', 9)]:
+            fail(f'outline jitter.py: {got}')
+        got, _ = outline(path='alone.py')
+        if got != [('function_definition', 'lonely_backoff', 1)]:
+            fail(f'outline alone.py: {got}')
+        if call('file_outline', {'path': 'proj/nowhere.c'})['files']:
+            fail('outline of an absent file')
+
+        # recipe_plan: which recipe reads a file, nothing read in
+        p = call('recipe_plan', {'input': str(root / 'retry.c')})
+        if p['exit'] != 0 or '1 files' not in p['log']:
+            fail(f'recipe_plan: {p}')
+
         r = call('code_where', {'query': 'exponential_retry_that_is_nowhere'})
         if r['files'] or r['hits']:
             fail(f'an absent name: {r}')
@@ -123,7 +148,7 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         s = call('sources', {})
         if s['database'] != name or not s['sources']:
             fail(f'sources: {s}')
-        print('code-where ok: backoff_delay defined at retry.c:3 (3..7), called at use.c:3 in wait_for; jitter defined in jitter.py and called at :10 in spread; a file of one def defines it; '
+        print('code-where ok: backoff_delay defined at retry.c:3 (3..7), called at use.c:3 in wait_for; jitter defined in jitter.py and called at :10 in spread; a file of one def defines it; outlines and a plan; '
               f'{len(s["sources"])} witnesses')
     finally:
         if created:
