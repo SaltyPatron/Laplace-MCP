@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""code_search with LAPLACE_CODE_SEMANTIC: an embeddings endpoint and Qdrant collections add candidates, Laplace
+rerank orders the union, and a configured service that fails is an error, never a lexical-only answer."""
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+import socket
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+
+binary = Path(sys.argv[1]).resolve(strict=True)
+seen = []
+
+
+class Fake(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def reply(self, status, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        seen.append((self.path, self.headers.get('Authorization'), body))
+        if self.path == '/v1/embeddings':
+            if self.headers.get('Authorization') != 'Bearer k3y':
+                return self.reply(401, {'error': {'message': 'Invalid API Key'}})
+            return self.reply(200, {'data': [{'embedding': [0.25, -0.5, 1e-3]}]})
+        if self.path == '/collections/code/points/search':
+            return self.reply(200, {'status': 'ok', 'result': [
+                {'id': 1, 'score': 0.91, 'payload': {'repo': 'repo', 'path': 'repo/handler.py', 'start': 1, 'end': 3,
+                                                     'text': 'def on_retry():\n    return "caf\u00e9"\n'}},
+                {'id': 2, 'score': 0.42, 'payload': {'repo': 'repo', 'path': 'repo/notes.md', 'start': 1, 'end': 5,
+                                                     'text': '# Journal\nThe ingest_run_journal row\n'}}]})
+        return self.reply(404, {'status': {'error': "Not found: Collection doesn't exist!"}})
+
+
+def mcp(env, query):
+    lines = [{'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}},
+             {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+              'params': {'name': 'code_search', 'arguments': {'query': query, 'limit': 5}}}]
+    run = subprocess.run([str(binary), 'mcp'], input=''.join(json.dumps(m) + '\n' for m in lines), env=env,
+                         capture_output=True, text=True, encoding='utf-8', timeout=120)
+    replies = [json.loads(l) for l in run.stdout.splitlines() if l.strip()]
+    result = [r for r in replies if r.get('id') == 1][0]['result']
+    return result['isError'], json.loads(result['content'][0]['text'])
+
+
+server = ThreadingHTTPServer(('127.0.0.1', 0), Fake)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+probe = socket.socket()
+probe.bind(('127.0.0.1', 0))
+closed = probe.getsockname()[1]
+probe.close()
+base = f'http://127.0.0.1:{server.server_address[1]}'
+
+with tempfile.TemporaryDirectory(prefix='lpm-code-semantic-') as directory:
+    root = Path(directory) / 'repo'
+    root.mkdir()
+    (root / 'notes.md').write_text('# Journal\n\nThe ingest_run_journal row is written by the run writer.\n')
+    (root / 'handler.py').write_text('def on_retry():\n    return "caf\u00e9"\n', encoding='utf-8')
+    clean = {k: v for k, v in os.environ.items() if not k.startswith('LAPLACE_CODE_')}
+    env = dict(clean, LAPLACE_CODE_RECORDS=str(Path(directory) / 'records.lpm'), LAPLACE_CODE_ROOTS=str(root),
+               LAPLACE_CODE_SEMANTIC='1', LAPLACE_CODE_QDRANT=base, LAPLACE_CODE_EMBED_URL=base + '/v1/embeddings',
+               LAPLACE_CODE_EMBED_KEY='k3y', LAPLACE_CODE_COLLECTIONS='code')
+
+    err, out = mcp(env, 'ingest_run_journal written')
+    assert not err, out
+    assert out['semantic'] is True and out['candidates']['semantic'] == 2, out
+    embed = [s for s in seen if s[0] == '/v1/embeddings'][-1][2]
+    assert embed['input'][0].startswith('Find the most relevant code snippet') and 'ingest_run_journal' in embed['input'][0]
+    qd = [s for s in seen if s[0].startswith('/collections/')][-1][2]
+    assert all(abs(a - b) < 1e-6 for a, b in zip(qd['vector'], [0.25, -0.5, 0.001])) and len(qd['vector']) == 3 and qd['limit'] == 15 and qd['with_payload'] is True, qd
+    by = {Path(h['path']).name: h for h in out['hits']}
+    assert by['notes.md']['source'] == 'both' and abs(by['notes.md']['cosine'] - 0.42) < 1e-6, by['notes.md']
+    assert by['handler.py']['source'] == 'semantic' and by['handler.py']['collection'] == 'code', by['handler.py']
+    assert Path(by['handler.py']['path']) == root / 'handler.py', by['handler.py']['path']
+    assert 'caf\u00e9' in by['handler.py']['snippet'], by['handler.py']
+    assert out['hits'][0]['path'].endswith('notes.md'), out['hits']           # Laplace rerank orders the union
+    assert [h['rerank'] for h in out['hits']] == sorted((h['rerank'] for h in out['hits']), reverse=True)
+
+    # Configured and failing: an error naming the cause, not lexical hits.
+    for change, cause in ((dict(LAPLACE_CODE_COLLECTIONS='missing'), 'HTTP 404'),
+                          (dict(LAPLACE_CODE_EMBED_KEY='wrong'), 'HTTP 401'),
+                          (dict(LAPLACE_CODE_QDRANT=f'http://127.0.0.1:{closed}'), 'connection refused'),
+                          (dict(LAPLACE_CODE_EMBED_URL=''), 'LAPLACE_CODE_EMBED_URL'),
+                          (dict(LAPLACE_CODE_QDRANT=''), 'LAPLACE_CODE_QDRANT')):
+        err, out = mcp(dict(env, **change), 'ingest_run_journal written')
+        assert err and cause in out['error'] and 'hits' not in out, (change, out)
+
+    # Not configured: lexical only, and the services are not asked.
+    before = len(seen)
+    err, out = mcp(dict(env, LAPLACE_CODE_SEMANTIC='0'), 'ingest_run_journal written')
+    assert not err and out['semantic'] is False and all(h['source'] == 'lexical' for h in out['hits']), out
+    assert len(seen) == before
+
+server.shutdown()
+print('code semantic ok')

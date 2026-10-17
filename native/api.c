@@ -25,6 +25,7 @@ typedef intptr_t ssize_t;
 #include "lpm.h"
 #include "lpm_config.h"
 #include "os.h"
+#include "semantic.h"
 
 #include "laplace/laplace.h"
 
@@ -1166,6 +1167,50 @@ static void read_lines_snippet(const char *path, uint32_t line0, uint32_t line1,
     fclose(f);
 }
 
+/* A code_search candidate, from the lexical index, from a semantic collection, or both. */
+typedef struct {
+    char path[4096];
+    uint32_t line0, line1;
+    int lexical, semantic;          /* semantic: index of the best semantic hit + 1 */
+    uint8_t id[16];
+    uint64_t hilbert;
+    uint32_t shared;
+    double cosine, rerank, frechet;
+    char *snippet;
+} CodeCand;
+
+typedef struct { const char *label; char *out; size_t cap; int found; } RootMatch;
+
+static void root_match(const char *root, void *ud) {
+    RootMatch *m = ud;
+    if (m->found) return;
+    size_t rl = strlen(root);
+    while (rl && (root[rl - 1] == '/' || root[rl - 1] == '\\')) rl--;
+    size_t b = rl;
+    while (b && root[b - 1] != '/' && root[b - 1] != '\\') b--;
+    size_t nl = rl - b;
+    if (nl && !strncmp(m->label, root + b, nl) && (m->label[nl] == '/' || m->label[nl] == '\\')) {
+        snprintf(m->out, m->cap, "%.*s%s", (int)rl, root, m->label + nl);
+        for (char *q = m->out; *q; q++) if (*q == '\\') *q = '/';
+        m->found = 1;
+    }
+}
+
+/* A collection's path is the repository label, then the path inside it: the root of that name supplies the rest. */
+static int resolve_label(const char *label, char *out, size_t cap) {
+    RootMatch m = { label, out, cap, 0 };
+    code_roots(root_match, &m);
+    if (!m.found) snprintf(out, cap, "%s", label);
+    return m.found;
+}
+
+static int cand_cmp(const void *a, const void *b) {
+    const CodeCand *x = a, *y = b;
+    if (x->rerank != y->rerank) return x->rerank < y->rerank ? 1 : -1;
+    if (x->cosine != y->cosine) return x->cosine < y->cosine ? 1 : -1;
+    return (int)(x->line1 - x->line0) - (int)(y->line1 - y->line0);
+}
+
 static void on_code_search(int c, const char *body) {
     char query[8192] = "", path[4096] = "";
     if (!jstr(body, "query", query, sizeof query) && !jstr(body, "input", query, sizeof query)) {
@@ -1195,45 +1240,123 @@ static void on_code_search(int c, const char *body) {
         lpm_index_path(ix, ".");
     }
     lpm_stats(ix, &st);
-    LpmHit hits[64];
-    size_t nh = lpm_search(ix, query, strlen(query), hits, (size_t)limit);
-    LpmRec qrec = {0};
-    lpm_identify(ix, query, strlen(query), &qrec);
+
+    /* Semantic: the configured collections' nearest chunks join the lexical candidates; failure is an error. */
+    int semantic = sem_enabled();
+    SemHit *sh = NULL;
+    size_t ns = 0;
+    double sem_ms = 0;
+    if (semantic) {
+        char err[1024] = "", ee[2200];
+        uint64_t s0 = nsec();
+        const char *pc = getenv("LAPLACE_CODE_SEMANTIC_CANDIDATES");
+        size_t per = pc && atoi(pc) > 0 ? (size_t)atoi(pc) : (size_t)limit * 3;
+        if (sem_search(query, per, &sh, &ns, err, sizeof err)) {
+            json_esc(err, ee, sizeof ee);
+            char out[2400];
+            snprintf(out, sizeof out, "{\"error\":\"semantic retrieval failed: %s\"}", ee);
+            http(c, 502, out);
+            return;
+        }
+        sem_ms = (double)(nsec() - s0) / 1e6;
+    }
+
+    size_t want = semantic ? (size_t)limit * 3 : (size_t)limit;
+    LpmHit hits[192];
+    size_t nh = lpm_search(ix, query, strlen(query), hits, want);
+    CodeCand *cand = calloc(nh + ns + 1, sizeof *cand);
+    if (!cand) {
+        sem_free(sh, ns);
+        http(c, 500, "{\"error\":\"out of memory\"}");
+        return;
+    }
+    size_t nc = 0;
+    for (size_t i = 0; i < nh; i++) {
+        CodeCand *k = &cand[nc++];
+        snprintf(k->path, sizeof k->path, "%s", hits[i].path);
+        k->line0 = hits[i].line0; k->line1 = hits[i].line1;
+        k->lexical = 1;
+        memcpy(k->id, hits[i].id, 16);
+        k->hilbert = hits[i].hilbert;
+        k->shared = hits[i].shared;
+        k->cosine = -1;
+    }
+    for (size_t i = 0; i < ns; i++) {
+        char abs[4096];
+        resolve_label(sh[i].path, abs, sizeof abs);
+        CodeCand *same = NULL;
+        for (size_t j = 0; j < nc && !same; j++)
+            if (!strcmp(cand[j].path, abs) && cand[j].line0 <= sh[i].line1 && sh[i].line0 <= cand[j].line1)
+                same = &cand[j];
+        if (same) {    /* the same lines: keep the smaller span, remember the best cosine */
+            if (sh[i].cosine > same->cosine) { same->cosine = sh[i].cosine; same->semantic = (int)i + 1; }
+            if (!same->lexical && sh[i].line1 - sh[i].line0 < same->line1 - same->line0) {
+                same->line0 = sh[i].line0; same->line1 = sh[i].line1;
+            }
+            continue;
+        }
+        CodeCand *k = &cand[nc++];
+        snprintf(k->path, sizeof k->path, "%s", abs);
+        k->line0 = sh[i].line0; k->line1 = sh[i].line1;
+        k->semantic = (int)i + 1;
+        k->cosine = sh[i].cosine;
+    }
+
+    /* Laplace orders the union: rerank of each candidate's text against the query. */
+    for (size_t i = 0; i < nc; i++) {
+        CodeCand *k = &cand[i];
+        char snip[8192] = "";
+        if (k->lexical) read_lines_snippet(k->path, k->line0, k->line1, snip, sizeof snip);
+        if (!snip[0] && k->semantic && os_exists(k->path)) read_lines_snippet(k->path, k->line0, k->line1, snip, sizeof snip);
+        if (!snip[0] && k->semantic) snprintf(snip, sizeof snip, "%s", sh[k->semantic - 1].text);
+        k->snippet = strdup(snip);
+        k->frechet = -1.0;
+        k->rerank = snip[0] ? lpm_rerank(ix, query, strlen(query), snip, strlen(snip), &k->shared, &k->frechet) : 0.0;
+        if (!k->lexical) {
+            LpmRec r = {0};
+            lpm_identify(ix, snip, strlen(snip), &r);
+            memcpy(k->id, r.id, 16);
+            k->hilbert = r.hilbert;
+        }
+    }
+    if (semantic) qsort(cand, nc, sizeof *cand, cand_cmp);
+    size_t shown = nc < (size_t)limit ? nc : (size_t)limit;
     double ms = (double)(nsec() - t0) / 1e6;
     char *out = NULL;
     size_t un = 0, ucap = 0;
     buf_fmt(&out, &un, &ucap,
-            "{\"docs\":%llu,\"entities\":%llu,\"ms\":%.3f,\"hits\":[",
-            (unsigned long long)st.documents, (unsigned long long)st.entities, ms);
-    for (size_t i = 0; i < nh; i++) {
-        char id[33], pe[4096], snip[8192], se[24576];
+            "{\"docs\":%llu,\"entities\":%llu,\"ms\":%.3f,\"semantic\":%s,\"semantic_ms\":%.3f,"
+            "\"candidates\":{\"lexical\":%zu,\"semantic\":%zu,\"union\":%zu},\"hits\":[",
+            (unsigned long long)st.documents, (unsigned long long)st.entities, ms, semantic ? "true" : "false",
+            sem_ms, nh, ns, nc);
+    for (size_t i = 0; i < shown; i++) {
+        CodeCand *k = &cand[i];
+        char id[33], pe[8192], se[24576], ce[300] = "";
         static const char H[] = "0123456789abcdef";
         for (int b = 0; b < 16; b++) {
-            id[b * 2] = H[hits[i].id[b] >> 4];
-            id[b * 2 + 1] = H[hits[i].id[b] & 15];
+            id[b * 2] = H[k->id[b] >> 4];
+            id[b * 2 + 1] = H[k->id[b] & 15];
         }
         id[32] = 0;
-        json_esc(hits[i].path, pe, sizeof pe);
-        read_lines_snippet(hits[i].path, hits[i].line0, hits[i].line1, snip, sizeof snip);
-        json_esc(snip, se, sizeof se);
-        /* Trajectories from the text itself: loaded records hold no entity children, so lpm_frechet of the
-         * two IDs would compare a point with a point. */
-        uint32_t rshared = 0;
-        double frechet = -1.0;
-        double rel = snip[0] ? lpm_rerank(ix, query, strlen(query), snip, strlen(snip), &rshared, &frechet)
-                             : 0.0;
-        if (!snip[0]) frechet = lpm_frechet(ix, qrec.id, hits[i].id);
+        json_esc(k->path, pe, sizeof pe);
+        json_esc(k->snippet ? k->snippet : "", se, sizeof se);
+        if (k->semantic) json_esc(sh[k->semantic - 1].collection, ce, sizeof ce);
+        const char *src = k->lexical && k->semantic ? "both" : k->lexical ? "lexical" : "semantic";
         buf_fmt(&out, &un, &ucap,
-                "%s{\"rank\":%zu,\"path\":\"%s\",\"line0\":%u,\"line1\":%u,"
-                "\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%u,\"frechet\":%.6f,\"rerank\":%.6f,\"snippet\":\"%s\"}",
-                i ? "," : "", i + 1, pe, hits[i].line0, hits[i].line1,
-                id, (unsigned long long)hits[i].hilbert, hits[i].shared, frechet, rel, se);
+                "%s{\"rank\":%zu,\"path\":\"%s\",\"line0\":%u,\"line1\":%u,\"source\":\"%s\","
+                "\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%u,\"frechet\":%.6f,\"rerank\":%.6f",
+                i ? "," : "", i + 1, pe, k->line0, k->line1, src, id, (unsigned long long)k->hilbert, k->shared,
+                k->frechet, k->rerank);
+        if (k->semantic) buf_fmt(&out, &un, &ucap, ",\"cosine\":%.6f,\"collection\":\"%s\"", k->cosine, ce);
+        buf_fmt(&out, &un, &ucap, ",\"snippet\":\"%s\"}", se);
     }
     buf_add(&out, &un, &ucap, "]}", 2);
+    for (size_t i = 0; i < nc; i++) free(cand[i].snippet);
+    free(cand);
+    sem_free(sh, ns);
     http(c, 200, out ? out : "{\"hits\":[]}");
     free(out);
 }
-
 static void on_reindex(int c, const char *body) {
     char path[4096] = "";
     jstr(body, "path", path, sizeof path);
@@ -1373,7 +1496,7 @@ static void rpc_id(const char *body, char *out, size_t cap) {
 
 static const char *TOOLS =
     "{\"tools\":["
-    "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. Returns matching files, exact line ranges (line0..line1), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
+    "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates and Laplace rerank orders the union; a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"rerank\",\"description\":\"Deterministic Laplace reranker (drop-in replacement for neural cross-encoders). Scores candidate documents against a query using IDF-weighted constituent overlap and 4D discrete Frechet trajectory distance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"documents\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"top_n\":{\"type\":\"integer\"}},\"required\":[\"query\",\"documents\"]}},"
     "{\"name\":\"search\",\"description\":\"Name text on the client from tier 0, or take an ID the caller already holds. The trunk is read with holds_above, and so is every constituent whose tier is above a codepoint or a grapheme. A tier-0 constituent stays in the path, in its place, with its codepoint. fan, when sent, caps how many claims and occurrences are returned; omitted, all of them are.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"fan\":{\"type\":\"integer\"}},\"required\":[]}},"

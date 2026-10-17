@@ -74,7 +74,7 @@ else()
 endif()
 
 # lpm: the commands and the service (serve).
-add_executable(lpm_program native/main.c native/api.c native/db_bridge.c ${LAPLACE_ENGINE_SRC}/os.c ${LAPLACE_ENGINE_SRC}/read.c ${LAPLACE_ENGINE_SRC}/pg.c ${LAPLACE_ENGINE_SRC}/walk.c)
+add_executable(lpm_program native/main.c native/api.c native/semantic.c native/db_bridge.c ${LAPLACE_ENGINE_SRC}/os.c ${LAPLACE_ENGINE_SRC}/read.c ${LAPLACE_ENGINE_SRC}/pg.c ${LAPLACE_ENGINE_SRC}/walk.c)
 set_target_properties(lpm_program PROPERTIES OUTPUT_NAME lpm)
 target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_ENGINE_SRC} ${LAPLACE_NATIVE}/src
                            ${LAPLACE_BLAKE3_DIR} ${LAPLACE_ICU_DIR}/include ${LAPLACE_PG_DIR}/include)
