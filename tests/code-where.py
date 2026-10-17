@@ -88,6 +88,13 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         if not calls or calls[0]['enclosing'] != 'double wait_for(int attempt){' or (calls[0]['line0'], calls[0]['line1']) != (2, 4):
             fail(f'use.c: at {hits["use.c"]["at"]}')
 
+        for flag in (True, 'true'):
+            r = call('code_where', {'query': 'backoff_delay', 'defines': flag})
+            if [Path(h['path']).name for h in r['hits']] != ['retry.c']:
+                fail(f'defines {flag!r}: {[h["path"] for h in r["hits"]]}')
+        r = call('code_where', {'query': 'backoff_delay', 'defines': False})
+        if sorted(Path(h['path']).name for h in r['hits']) != ['retry.c', 'use.c']:
+            fail(f'defines false: {[h["path"] for h in r["hits"]]}')
         r = call('code_where', {'query': 'backoff_delay', 'defines': True, 'path': 'retry'})
         if [Path(h['path']).name for h in r['hits']] != ['retry.c']:
             fail(f'defines in retry: {[h["path"] for h in r["hits"]]}')

@@ -163,6 +163,22 @@ static int jstr(const char *body, const char *key, char *out, size_t cap) {
     return 1;
 }
 
+/* A flag: JSON true or false, or the strings "true" and "false". Absent or anything else: dflt. */
+static int jbool(const char *body, const char *key, int dflt) {
+    char pat[80];
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    const char *p = strstr(body, pat);
+    if (!p) return dflt;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != ':') return dflt;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (!strncmp(p, "true", 4) || !strncmp(p, "\"true\"", 6)) return 1;
+    if (!strncmp(p, "false", 5) || !strncmp(p, "\"false\"", 7)) return 0;
+    return dflt;
+}
+
 static int name_entity(const char *text, lp_ref *trunk, lp_ref *parts, size_t cap, size_t *nparts) {
     if (!TX) return 0;
     *trunk = lp_text_parts(TX, (const uint8_t *)text, strlen(text), parts, cap, nparts);
@@ -1637,9 +1653,9 @@ static void on_code_where(int c, const char *body) {
     if (context > 4000) context = 4000;
     if (per < 0) per = 0;
     if (per > 16) per = 16;
-    char under[512] = "", defs[8] = "";
+    char under[512] = "";
     jstr(body, "path", under, sizeof under);
-    int defs_only = jstr(body, "defines", defs, sizeof defs) ? !strcmp(defs, "true") : 0;
+    int defs_only = jbool(body, "defines", 0);
     if (!defs_only && strstr(body, "\"defines\":true")) defs_only = 1;
     lp_ref trunk, parts[256];
     size_t np = 0;
