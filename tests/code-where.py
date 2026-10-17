@@ -47,6 +47,7 @@ src = {
     'jitter.py': 'import random\n\n\ndef jitter(delay, fraction):\n    """a delay moved by up to fraction of itself"""\n'
                  '    return delay * (1 + (random.random() * 2 - 1) * fraction)\n\n\ndef spread(delays):\n    return [jitter(d, 0.1) for d in delays]\n\n\nprint(spread([1.0, 2.0]))\n',
     # one declaration: the file's one claim is its own record (Laplace-Engine#67)
+    'call.py': 'from jitter import jitter\n\nprint(jitter(1.0, 0.1))\n',
     'alone.py': 'def lonely_backoff(attempt):\n    return 2 ** attempt\n',
     'once.py': 'def once_jitter(delay):\n    return delay\n\n\nprint(once_jitter(1.0))\n',
 }
@@ -88,13 +89,15 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         if not calls or calls[0]['enclosing'] != 'double wait_for(int attempt){' or (calls[0]['line0'], calls[0]['line1']) != (2, 4):
             fail(f'use.c: at {hits["use.c"]["at"]}')
 
-        for flag in (True, 'true'):
-            r = call('code_where', {'query': 'backoff_delay', 'defines': flag})
-            if [Path(h['path']).name for h in r['hits']] != ['retry.c']:
+        for flag in (True, 'true'):      # call.py only calls jitter
+            r = call('code_where', {'query': 'jitter', 'defines': flag})
+            names = [Path(h['path']).name for h in r['hits']]
+            if 'jitter.py' not in names or 'call.py' in names or any(not h['defines'] for h in r['hits']):
                 fail(f'defines {flag!r}: {[h["path"] for h in r["hits"]]}')
-        r = call('code_where', {'query': 'backoff_delay', 'defines': False})
-        if sorted(Path(h['path']).name for h in r['hits']) != ['retry.c', 'use.c']:
-            fail(f'defines false: {[h["path"] for h in r["hits"]]}')
+        for args in ({'defines': False}, {}):
+            r = call('code_where', dict(query='jitter', **args))
+            if not {'call.py', 'jitter.py'} <= {Path(h['path']).name for h in r['hits']}:
+                fail(f'jitter {args}: {[h["path"] for h in r["hits"]]}')
         r = call('code_where', {'query': 'backoff_delay', 'defines': True, 'path': 'retry'})
         if [Path(h['path']).name for h in r['hits']] != ['retry.c']:
             fail(f'defines in retry: {[h["path"] for h in r["hits"]]}')
