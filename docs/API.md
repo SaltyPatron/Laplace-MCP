@@ -83,7 +83,7 @@ For `Sherlock Holmes` the service returned, in 16.4 ms, the span of the two word
 
 ## Ingest
 
-`POST /v1/ingest` with `{"path":"/absolute/path"}` runs `/repos/build/Laplace-Engine/icx-release/laplace ingest` on that path. That is the engine pipeline: decompose, deduplicate trunk to leaf, record, attest. The body must be an absolute path that exists. The call blocks until ingest exits.
+`POST /v1/ingest` with `{"path":"/absolute/path"}` runs the engine (`LAPLACE_ENGINE`) as `laplace ingest` on that path. That is the engine pipeline: decompose, deduplicate trunk to leaf, record, attest. The body must be an absolute path that exists. The call blocks until ingest exits.
 
 A proof file `/tmp/lpm-api-proof.txt`, one line `Sherlock Holmes kept his pipe on the mantel.` plus a newline, exited 0 in 0.2 s: 1 file, 15 compositions, 4 new entities, 11 subtrees already recorded, 0 attestations. Searching the exact bytes, ID `f27bdacd15c996339ccee43dd4153450`, returned one container, `221c6d0ef03f1be62c3625e9625f32db`, tier 4, whose text is the filename and that line.
 
@@ -91,15 +91,17 @@ A proof file `/tmp/lpm-api-proof.txt`, one line `Sherlock Holmes kept his pipe o
 
 `GET /v1/surface` lists the routes this process serves, the database functions those routes call, the engine's twenty-one commands, and the reads that are specified and not yet a route.
 
-Served now: embeddings, search, forward, shape, ingest, surface, health.
+`GET /health` answers without the database.
 
-Engine commands that are not a route here: tier0, flags, highway, deploy, sources, forget, sweep, index, structure, tree, text, pull, turn, hop, translate, degrees, fills, status, bench, model. `hop` is the engine's program over the same container and claim reads search calls. `fills` in the engine is containers, then `lp_follows` for the exact run, then a parent walk through `laplace_fills`. `laplace_fills` by itself is that parent walk, so this service does not expose it as "what follows."
+Served now: embeddings, rerank, code_search, reindex, code_where, sources, file_outline, recipe_plan, search, forward, shape, ingest, hop, text, translate, pull, degrees, surface, health. `hop`, `text`, `translate`, `pull` and `degrees` run the engine command of that name on `input` (`translate` also takes `from` and `to`; `degrees` takes `other`) and return its exit code and log.
 
-Specified past these routes, and not built as their own endpoints: translate, degrees, pull, turn, gaps, file metadata as its own read, DTW, EDR, Fréchet with skipped vertices, and the forward stages RESOLVE, COUPLE, ORIENT, ROUTE, SCAN, PROPOSE, STEER, SELECT, REALIZE, WITNESS. `laplace_couple` is the installed operator that returns strands, containment, and shape in one call. Search calls containers and claims as two reads inside one statement. It does not call `laplace_couple`.
+Engine commands that are not a route here: tier0, flags, highway, deploy, forget, sweep, index, structure, tree, turn, fills, status, bench, model; `sources` is read from the database rather than run. `hop` is the engine's program over the same container and claim reads search calls. `fills` in the engine is containers, then `lp_follows` for the exact run, then a parent walk through `laplace_fills`. `laplace_fills` by itself is that parent walk, so this service does not expose it as "what follows."
+
+Specified past these routes, and not built as their own endpoints: turn, gaps, file metadata as its own read, DTW, EDR, Fréchet with skipped vertices, and the forward stages RESOLVE, COUPLE, ORIENT, ROUTE, SCAN, PROPOSE, STEER, SELECT, REALIZE, WITNESS. `laplace_couple` is the installed operator that returns strands, containment, and shape in one call. Search calls containers and claims as two reads inside one statement. It does not call `laplace_couple`.
 
 ## MCP
 
-`POST /mcp` also speaks MCP JSON-RPC when the body contains `"jsonrpc"`. Tools: `search`, `embeddings`, `shape`, `forward`, `ingest`.
+`POST /mcp` also speaks MCP JSON-RPC when the body contains `"jsonrpc"`. Tools: `embeddings`, `search`, `forward`, `shape`, `ingest`, `code_search`, `rerank`, `reindex`, `code_where`, `sources`, `file_outline`, `recipe_plan`, `hop`, `text`, `translate`, `pull`, `degrees`. `tools/list` gives each one's arguments.
 
 `~/.grok/config.toml` has:
 
@@ -119,7 +121,7 @@ curl -skS --resolve hart-server:8443:127.0.0.1 \
   -d '{"op":"search","input":"Sherlock Holmes"}'
 ```
 
-`op` is `embeddings`, `search`, `forward`, `shape`, `ingest`, or `surface`.
+`op` is any route by its name (`search`, `code_where`, `file_outline`, ...), `embed` for `embeddings`, `frechet` for `shape`, or `surface`.
 
 ## Code index
 
@@ -183,3 +185,7 @@ On HART-DESKTOP the services are the llama.cpp servers on `127.0.0.1:8711` (code
 `code_where` takes `query` (required: a name, or any exact span of code), `path` (a substring the file's path must contain), `defines` (true: only files that define it), `limit` (files, default 20), `occurrences` (per file, default 3, at most 16) and `context` (bytes, default 120). It walks up the container index from the query's entity through every path that holds it to the files: a file is a trunk over its metadata and its content, and the walk stops there. Each hit has `path` (the file's pathname record), `file` (its trunk ID), `defines` (the declaration kinds the code recipe said of the name in that file, such as `function_definition` or `class_declaration`; files that define it come first), `occurrences` (how many places in its syntax tree hold it) and `at`: for each place, `line`, `context` (the innermost enclosing node of at least `context` bytes), `enclosing` (the first line of the outermost enclosing node under 8 KiB below the file, usually the declaration) with its span `line0`..`line1`, and `depth`. Lines are counted in the file's recorded content. The answer also has `files`, `nodes` and `levels` walked, and `cut` when the walk reached 400,000 nodes and stopped (a name as common as `return`).
 
 `sources` returns each witness in the database: `id`, `name` (the first part of its trunk) and `trust`.
+
+`file_outline` takes `path` (the end of a file's pathname, matched at a `/` boundary) or `file` (the file's ID, as `code_where` returns it). For each matching file (up to 16) it returns `path`, `file`, `bytes`, and `declarations`: the claims `[kind, name]` its code recipe said of it, in the order said, each with `line`, the first line at or after the previous declaration where `name` stands as a whole word. A C recipe says parameters as well as functions, so a C function's parameters follow it.
+
+`recipe_plan` takes `input` (optional: a source name or a path) and returns `exit` and `log` from `laplace ingest --plan`: which recipe reads which files, with nothing read into the database. Without `input` it plans every source in order.

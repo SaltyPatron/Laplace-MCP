@@ -123,14 +123,16 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
                 fail(f'file_outline {args}: {o}')
             return [(d['kind'], d['name'], d.get('line')) for d in o['files'][0]['declarations']], o['files'][0]
         got, f = outline(path='proj/retry.c')
-        if got != [('function_definition', 'backoff_delay', 3), ('function_definition', 'retry_count', 8)]:
+        if got != [('function_definition', 'backoff_delay', 3), ('parameter_declaration', 'attempt', 3), ('parameter_declaration', 'first', 3), ('parameter_declaration', 'factor', 3), ('function_definition', 'retry_count', 8), ('parameter_declaration', 'limit', 8)]:
             fail(f'outline retry.c: {got}')
         if outline(file=f['file'])[0] != got:
             fail('outline by file ID differs from by path')
         got, _ = outline(path='jitter.py')
+        got = [d for d in got if d[0] == 'function_definition']
         if got != [('function_definition', 'jitter', 4), ('function_definition', 'spread', 9)]:
             fail(f'outline jitter.py: {got}')
         got, _ = outline(path='alone.py')
+        got = [d for d in got if d[0] == 'function_definition']
         if got != [('function_definition', 'lonely_backoff', 1)]:
             fail(f'outline alone.py: {got}')
         if call('file_outline', {'path': 'proj/nowhere.c'})['files']:
