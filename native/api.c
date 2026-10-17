@@ -163,6 +163,22 @@ static int jstr(const char *body, const char *key, char *out, size_t cap) {
     return 1;
 }
 
+/* A flag: JSON true or false, or the strings "true" and "false". Absent or anything else: dflt. */
+static int jbool(const char *body, const char *key, int dflt) {
+    char pat[80];
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    const char *p = strstr(body, pat);
+    if (!p) return dflt;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != ':') return dflt;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (!strncmp(p, "true", 4) || !strncmp(p, "\"true\"", 6)) return 1;
+    if (!strncmp(p, "false", 5) || !strncmp(p, "\"false\"", 7)) return 0;
+    return dflt;
+}
+
 static int name_entity(const char *text, lp_ref *trunk, lp_ref *parts, size_t cap, size_t *nparts) {
     if (!TX) return 0;
     *trunk = lp_text_parts(TX, (const uint8_t *)text, strlen(text), parts, cap, nparts);
@@ -1541,8 +1557,10 @@ static char *cw_file_name(Reader *rd, const lp_id *file) {
 /* Up from one name through every path that holds it, to the files: a holder whose first vertex is metadata, reached
  * through its content, is a file and the walk stops there. A name held only as metadata (a file called so) is not an
  * occurrence. What holds the name as a claim is what a recipe said of it: a code recipe says [kind, name] of each
- * declaration (Laplace-Engine attest_code_node), so a file reached through one defines the name. The front is bounded,
- * so a name as common as a keyword answers what it reached and says so. */
+ * declaration (Laplace-Engine attest_code_node), so a file reached through one defines the name. A record of one claim is
+ * that claim, said as a record (LP_SAID_RECORD) where it stands, so a holder of the name said so one level up is a claim
+ * too, as the engine's walk up counts it (walk_up): a file that declares one thing defines it. The front is bounded, so a
+ * name as common as a keyword answers what it reached and says so. */
 static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, int *cut) {
     d->m = lp_idmap_new();
     cw_node(d, name, NULL);
@@ -1570,7 +1588,7 @@ static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, i
                 int fresh = 0;
                 size_t pi = cw_node(d, &h[j].entity, &fresh);
                 cw_link(d, pi, (size_t)ci);
-                if (vx.v[v].said == LP_SAID_CLAIM) d->n[ci].claim = 1;          /* said as a claim by what holds it */
+                if (vx.v[v].said == LP_SAID_CLAIM || (level == 1 && vx.v[v].said == LP_SAID_RECORD)) d->n[ci].claim = 1;   /* said as a claim, or as a claim's own record, by what holds it */
                 if (fresh && is_file) { d->n[pi].file = 1; files++; }
                 else if (fresh) lp_idmap_put(next, &h[j].entity, NULL);
             }
@@ -1635,9 +1653,9 @@ static void on_code_where(int c, const char *body) {
     if (context > 4000) context = 4000;
     if (per < 0) per = 0;
     if (per > 16) per = 16;
-    char under[512] = "", defs[8] = "";
+    char under[512] = "";
     jstr(body, "path", under, sizeof under);
-    int defs_only = jstr(body, "defines", defs, sizeof defs) ? !strcmp(defs, "true") : 0;
+    int defs_only = jbool(body, "defines", 0);
     if (!defs_only && strstr(body, "\"defines\":true")) defs_only = 1;
     lp_ref trunk, parts[256];
     size_t np = 0;
