@@ -40,6 +40,7 @@ jobs:
           python3 Laplace-MCP/tests/engine-output.py "$L"
           python3 Laplace-MCP/tests/code-index.py "$L"
           python3 Laplace-MCP/tests/code-semantic.py "$L"
+          python3 Laplace-MCP/tests/code-search-eval.py "$L" --min-mrr "${LPM_EVAL_MIN_MRR:-0.45}"
           python3 Laplace-MCP/tests/rerank-length.py "$L"
           TMPDIR=${RUNNER_TEMP:?} LAPLACE_RECIPES=$GITHUB_WORKSPACE/Laplace-Engine/recipes python3 Laplace-MCP/tests/code-where.py "$L" "$LAPLACE_BUILD/Laplace-MCP/engine/laplace"
   deploy:

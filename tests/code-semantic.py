@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""code_search with LAPLACE_CODE_SEMANTIC: an embeddings endpoint and Qdrant collections add candidates, Laplace
-rerank orders the union, and a configured service that fails is an error, never a lexical-only answer."""
+"""code_search with LAPLACE_CODE_SEMANTIC: an embeddings endpoint and Qdrant collections add candidates, the union is
+ordered by weighted reciprocal rank fusion of each collection's ranking and the Laplace rerank's (fusion "rerank": the rerank
+alone), and a configured service that fails is an error, never a lexical-only answer."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -40,13 +41,17 @@ class Fake(BaseHTTPRequestHandler):
                                                      'text': 'def on_retry():\n    return "caf\u00e9"\n'}},
                 {'id': 2, 'score': 0.42, 'payload': {'repo': 'repo', 'path': 'repo/notes.md', 'start': 1, 'end': 5,
                                                      'text': '# Journal\nThe ingest_run_journal row\n'}}]})
+        if self.path == '/collections/prose/points/search':
+            return self.reply(200, {'status': 'ok', 'result': [
+                {'id': 3, 'score': 0.8, 'payload': {'repo': 'repo', 'path': 'repo/notes.md', 'start': 1, 'end': 3,
+                                                     'text': '# Journal\n\nThe ingest_run_journal row\n'}}]})
         return self.reply(404, {'status': {'error': "Not found: Collection doesn't exist!"}})
 
 
-def mcp(env, query):
+def mcp(env, query, **extra):
     lines = [{'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}},
              {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
-              'params': {'name': 'code_search', 'arguments': {'query': query, 'limit': 5}}}]
+              'params': {'name': 'code_search', 'arguments': dict(dict(query=query, limit=5), **extra)}}]
     run = subprocess.run([str(binary), 'mcp'], input=''.join(json.dumps(m) + '\n' for m in lines), env=env,
                          capture_output=True, text=True, encoding='utf-8', timeout=120)
     replies = [json.loads(l) for l in run.stdout.splitlines() if l.strip()]
@@ -84,8 +89,46 @@ with tempfile.TemporaryDirectory(prefix='lpm-code-semantic-') as directory:
     assert by['handler.py']['source'] == 'semantic' and by['handler.py']['collection'] == 'code', by['handler.py']
     assert Path(by['handler.py']['path']) == root / 'handler.py', by['handler.py']['path']
     assert 'caf\u00e9' in by['handler.py']['snippet'], by['handler.py']
-    assert out['hits'][0]['path'].endswith('notes.md'), out['hits']           # Laplace rerank orders the union
-    assert [h['rerank'] for h in out['hits']] == sorted((h['rerank'] for h in out['hits']), reverse=True)
+    # The fused order: each hit's score is the sum of weight/(60 + rank) over the rankings that hold it, best first;
+    # a code collection weighs 1 and the rerank half by default.
+    assert out['fusion'] == 'rrf' and out['scope'] == 'all' and out['weights'] == {'rerank': 0.5, 'code': 1}, out
+    for h in out['hits']:
+        want = sum(out['weights'][k] / (60 + r) for k, r in h['ranks'].items() if k != 'lexical')
+        assert abs(h['fused'] - want) < 1e-5 and 'rerank' in h['ranks'], h
+    assert by['handler.py']['ranks']['code'] == 1 and by['notes.md']['ranks']['code'] == 2, by
+    assert by['notes.md']['ranks']['lexical'] >= 1 and 'lexical' not in by['handler.py']['ranks'], by
+    assert [h['fused'] for h in out['hits']] == sorted((h['fused'] for h in out['hits']), reverse=True)
+    # The rerank alone, as before: notes.md, which shares the query's words, first.
+    err, old = mcp(env, 'ingest_run_journal written', fusion='rerank')
+    assert not err and old['fusion'] == 'rerank' and old['hits'][0]['path'].endswith('notes.md'), old['hits']
+    assert [h['rerank'] for h in old['hits']] == sorted((h['rerank'] for h in old['hits']), reverse=True)
+    # explain: every candidate of the union, with its rankings.
+    err, ex = mcp(env, 'ingest_run_journal written', explain=True, limit=1)
+    assert not err and len(ex['hits']) == ex['candidates']['union'] >= 2, ex
+
+    # A prose collection: asked under scope all (half weight) and docs, not under code.
+    penv = dict(env, LAPLACE_CODE_TEXT_EMBED_URL=base + '/v1/embeddings', LAPLACE_CODE_TEXT_COLLECTIONS='prose')
+    def asked(**extra):
+        before = len(seen)
+        err, o = mcp(penv, 'ingest_run_journal written', **extra)
+        assert not err, o
+        return o, {s[0].split('/')[2] for s in seen[before:] if s[0].startswith('/collections/')}
+    o, colls = asked()
+    assert colls == {'code', 'prose'} and o['weights'] == {'rerank': 0.5, 'code': 1, 'prose': 0.5}, (colls, o['weights'])
+    note = [h for h in o['hits'] if h['path'].endswith('notes.md')][0]
+    assert note['ranks']['prose'] == 1 and abs(note['fused'] - (0.5 / (60 + note['ranks']['rerank']) + 1 / 62 + 0.5 / 61)) < 1e-5, note
+    o, colls = asked(scope='code')
+    assert colls == {'code'} and 'prose' not in o['weights'], (colls, o)
+    o, colls = asked(scope='docs')
+    assert colls == {'prose'} and 'code' not in o['weights'], (colls, o)
+    err, o = mcp(penv, 'ingest_run_journal written', scope='nowhere')
+    assert err and 'scope' in o['error'], o
+    err, o = mcp(env, 'ingest_run_journal written', scope='docs')
+    assert err and 'LAPLACE_CODE_TEXT_COLLECTIONS' in o['error'], o
+    err, o = mcp(dict(env, LAPLACE_CODE_RERANK_WEIGHT='0'), 'ingest_run_journal written')
+    assert not err and o['weights']['rerank'] == 0 and all(abs(h['fused'] - sum(1 / (60 + r) for k, r in h['ranks'].items() if k == 'code')) < 1e-5 for h in o['hits']), o
+    err, o = mcp(dict(env, LAPLACE_CODE_PROSE_WEIGHT='2'), 'ingest_run_journal written')
+    assert err and 'WEIGHT' in o['error'], o
 
     # Configured and failing: an error naming the cause, not lexical hits.
     for change, cause in ((dict(LAPLACE_CODE_COLLECTIONS='missing'), 'HTTP 404'),

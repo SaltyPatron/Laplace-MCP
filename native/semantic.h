@@ -14,12 +14,15 @@ typedef struct {
     uint32_t line0, line1;
     double cosine;
     char *text;
+    int prose;              /* from a prose collection (LAPLACE_CODE_TEXT_COLLECTIONS) */
 } SemHit;
 
 /* 1 when LAPLACE_CODE_SEMANTIC is set to anything but 0. */
 int sem_enabled(void);
 /* Up to per_collection hits from every configured collection. 0 on success; else -1 with err set. */
-int sem_search(const char *query, size_t per_collection, SemHit **out, size_t *n, char *err, size_t errcap);
+/* scope: SEM_CODE, SEM_PROSE or both, the configured groups asked. */
+enum { SEM_CODE = 1, SEM_PROSE = 2 };
+int sem_search(const char *query, size_t per_collection, int scope, SemHit **out, size_t *n, char *err, size_t errcap);
 void sem_free(SemHit *hits, size_t n);
 
 /* Exposed for tests: decode the JSON string starting at s (just after its opening quote) into out. Returns the
