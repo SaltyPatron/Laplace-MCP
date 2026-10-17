@@ -1584,8 +1584,10 @@ static size_t cw_lines(const char *text, size_t upto) {
 
 static void on_code_where(int c, const char *body) {
     char name[2048];
-    if (!jstr(body, "name", name, sizeof name) || !name[0]) {
-        if (!jstr(body, "query", name, sizeof name) || !name[0]) { http(c, 400, "{\"error\":\"name\"}"); return; }
+    /* query, as code_search takes it (a tools/call's own "name" comes first in its body, so the key is not "name") */
+    if ((!jstr(body, "query", name, sizeof name) || !name[0]) && (!jstr(body, "input", name, sizeof name) || !name[0])) {
+        http(c, 400, "{\"error\":\"query\"}");
+        return;
     }
     int limit = 20, context = 400;
     jint(body, "limit", &limit);
@@ -1617,7 +1619,7 @@ static void on_code_where(int c, const char *body) {
     hex_id(&trunk.id, idh);
     char *out = NULL, *esc = NULL;
     size_t on = 0, ocap = 0;
-    buf_fmt(&out, &on, &ocap, "{\"name\":\"%s\",\"id\":\"%s\",\"database\":\"%s\",\"levels\":%d,\"nodes\":%zu,\"files\":%d,\"cut\":%s,\"ms\":{\"walk\":%.3f},\"hits\":[",
+    buf_fmt(&out, &on, &ocap, "{\"query\":\"%s\",\"id\":\"%s\",\"database\":\"%s\",\"levels\":%d,\"nodes\":%zu,\"files\":%d,\"cut\":%s,\"ms\":{\"walk\":%.3f},\"hits\":[",
             json_esc(name, (esc = malloc(sizeof name * 6 + 8)), sizeof name * 6 + 8), idh, PQdb(pg), levels, d.nn, nfiles, cut ? "true" : "false", walk_ms);
     free(esc);
     int shown = 0;
@@ -1740,7 +1742,7 @@ static void rpc_id(const char *body, char *out, size_t cap) {
 static const char *TOOLS =
     "{\"tools\":["
     "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates and Laplace rerank orders the union; a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
-    "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment: every file whose recorded syntax tree holds it, its pathname as the file's record gives it, the line it is on, the innermost enclosing node of at least context bytes, and the enclosing declaration (the outermost node under 8 KiB below the file) with its line span. path filters by a substring of the file path. Nothing is read from a working tree.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"name\"]}},"
+    "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code (query) stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment: every file whose recorded syntax tree holds it, its pathname as the file's record gives it, the line it is on, the innermost enclosing node of at least context bytes, and the enclosing declaration (the outermost node under 8 KiB below the file) with its line span. path filters by a substring of the file path. Nothing is read from a working tree.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"sources\",\"description\":\"The sources the Laplace database holds: each witness ID, its name and trust.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"rerank\",\"description\":\"Deterministic Laplace reranker (drop-in replacement for neural cross-encoders). Scores candidate documents against a query using IDF-weighted constituent overlap and 4D discrete Frechet trajectory distance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"documents\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"top_n\":{\"type\":\"integer\"}},\"required\":[\"query\",\"documents\"]}},"
