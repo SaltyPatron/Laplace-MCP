@@ -1162,12 +1162,18 @@ static void on_code_search(int c, const char *body) {
         json_esc(hits[i].path, pe, sizeof pe);
         read_lines_snippet(hits[i].path, hits[i].line0, hits[i].line1, snip, sizeof snip);
         json_esc(snip, se, sizeof se);
-        double frechet = lpm_frechet(ix, qrec.id, hits[i].id);
+        /* Trajectories from the text itself: loaded records hold no entity children, so lpm_frechet of the
+         * two IDs would compare a point with a point. */
+        uint32_t rshared = 0;
+        double frechet = -1.0;
+        double rel = snip[0] ? lpm_rerank(ix, query, strlen(query), snip, strlen(snip), &rshared, &frechet)
+                             : 0.0;
+        if (!snip[0]) frechet = lpm_frechet(ix, qrec.id, hits[i].id);
         buf_fmt(&out, &un, &ucap,
                 "%s{\"rank\":%zu,\"path\":\"%s\",\"line0\":%u,\"line1\":%u,"
-                "\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%u,\"frechet\":%.6f,\"snippet\":\"%s\"}",
+                "\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%u,\"frechet\":%.6f,\"rerank\":%.6f,\"snippet\":\"%s\"}",
                 i ? "," : "", i + 1, pe, hits[i].line0, hits[i].line1,
-                id, (unsigned long long)hits[i].hilbert, hits[i].shared, frechet, se);
+                id, (unsigned long long)hits[i].hilbert, hits[i].shared, frechet, rel, se);
     }
     buf_add(&out, &un, &ucap, "]}", 2);
     http(c, 200, out ? out : "{\"hits\":[]}");
