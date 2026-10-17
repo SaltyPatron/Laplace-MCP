@@ -59,6 +59,10 @@ endif()
 # liblpm: the in-process client (check, text, admit, index, search); laplace_mcp.py loads it.
 add_library(lpm_lib SHARED native/lpm.c ${LAPLACE_ENGINE_SRC}/os.c)
 set_target_properties(lpm_lib PROPERTIES OUTPUT_NAME lpm WINDOWS_EXPORT_ALL_SYMBOLS ON)
+# Windows: the DLL's import library and export file must not share lpm.lib/lpm.exp with lpm.exe.
+if(WIN32)
+  set_target_properties(lpm_lib PROPERTIES ARCHIVE_OUTPUT_NAME lpm_import)
+endif()
 target_include_directories(lpm_lib PUBLIC native PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_ENGINE_SRC} ${LAPLACE_NATIVE}/src)
 target_compile_options(lpm_lib PRIVATE ${LP_C_FLAGS})
 if(WIN32)
