@@ -110,7 +110,7 @@ static void http(int c, int code, const char *body) {
         stdio_body = strdup(body ? body : "");
         return;
     }
-    const char *why = code == 200 ? "OK" : code == 202 ? "Accepted" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : "Error";
+    const char *why = code == 200 ? "OK" : code == 202 ? "Accepted" : code == 400 ? "Bad Request" : code == 401 ? "Unauthorized" : code == 404 ? "Not Found" : "Error";
     char hdr[256];
     int n = snprintf(hdr, sizeof hdr,
                      "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
@@ -2056,7 +2056,68 @@ int api_mcp_stdio(void) {
     return 0;
 }
 
+/* ---- who may call the listener. Every request but GET /health carries Authorization: Bearer TOKEN, the one the
+ * installation made for this service (Laplace-Operations: /etc/laplace/secrets/modular-mcp.env, made once, as the
+ * monorepo MCP's mcp.env is). The token is LAPLACE_MCP_TOKEN, else the LAPLACE_MCP_TOKEN line of the file
+ * LAPLACE_MCP_TOKEN_FILE names (or its first line). With no token of at least 32 characters and no whitespace the
+ * listener does not start: it fails closed. stdio (lpm mcp) is the calling user's own process and takes none. */
+static char SERVE_TOKEN[513];
+static size_t SERVE_TOKEN_N;
+static int token_take(const char *v, size_t n) {
+    while (n && (v[n - 1] == '\n' || v[n - 1] == '\r')) n--;
+    if (n >= 2 && (v[0] == '"' || v[0] == '\'') && v[n - 1] == v[0]) { v++; n -= 2; }
+    if (n < 32 || n >= sizeof SERVE_TOKEN) return 0;
+    for (size_t i = 0; i < n; i++) if ((unsigned char)v[i] <= ' ' || v[i] == 0x7f) return 0;
+    memcpy(SERVE_TOKEN, v, n);
+    SERVE_TOKEN[n] = 0;
+    SERVE_TOKEN_N = n;
+    return 1;
+}
+static int serve_token_load(void) {
+    const char *e = getenv("LAPLACE_MCP_TOKEN");
+    if (e && *e) return token_take(e, strlen(e));
+    const char *f = getenv("LAPLACE_MCP_TOKEN_FILE");
+    if (!f || !*f) return 0;
+    FILE *fp = fopen(f, "rb");
+    if (!fp) { perror(f); return 0; }
+    char line[1024], first[1024] = "";
+    int ok = 0, lines = 0;
+    while (fgets(line, sizeof line, fp)) {
+        if (!lines++) snprintf(first, sizeof first, "%s", line);
+        if (!strncmp(line, "LAPLACE_MCP_TOKEN=", 18)) { ok = token_take(line + 18, strlen(line + 18)); break; }
+    }
+    fclose(fp);
+    if (!ok && lines && !strchr(first, '=')) ok = token_take(first, strlen(first));
+    memset(line, 0, sizeof line);
+    memset(first, 0, sizeof first);
+    return ok;
+}
+/* The request's bearer token against the service's, in time that does not depend on where they differ. */
+static int request_authorized(const char *req, const char *head_end) {
+    const char *p = req;
+    while ((p = strstr(p, "\r\n")) && p < head_end) {
+        p += 2;
+        if (strncasecmp(p, "Authorization:", 14)) continue;
+        const char *v = p + 14;
+        while (*v == ' ' || *v == '\t') v++;
+        if (strncasecmp(v, "Bearer ", 7)) return 0;
+        v += 7;
+        while (*v == ' ') v++;
+        size_t n = strcspn(v, "\r\n");
+        while (n && (v[n - 1] == ' ' || v[n - 1] == '\t')) n--;
+        unsigned d = n != SERVE_TOKEN_N;
+        for (size_t i = 0; i < SERVE_TOKEN_N; i++) d |= (unsigned)(unsigned char)SERVE_TOKEN[i] ^ (unsigned)(unsigned char)(i < n ? v[i] : 0);
+        return d == 0 && SERVE_TOKEN_N > 0;
+    }
+    return 0;
+}
+
 int api_serve(const char *host, int port) {
+    if (!serve_token_load()) {
+        fprintf(stderr, "lpm serve: no token: set LAPLACE_MCP_TOKEN, or LAPLACE_MCP_TOKEN_FILE to a file with its "
+                        "LAPLACE_MCP_TOKEN line (at least 32 characters, no whitespace); refusing to listen unauthenticated\n");
+        return 2;
+    }
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
@@ -2112,6 +2173,15 @@ int api_serve(const char *host, int port) {
         char *q = strchr(path, '?');
         if (q) *q = 0;
         char *body = strstr(req, "\r\n\r\n");
+        int open_route = !strcmp(method, "GET") && !strcmp(path, "/health");
+        if (!open_route && (!body || !request_authorized(req, body))) {
+            static const char deny[] = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nWWW-Authenticate: Bearer\r\n"
+                                       "Content-Length: 24\r\nConnection: close\r\n\r\n{\"error\":\"unauthorized\"}";
+            send(c, deny, (int)strlen(deny), MSG_NOSIGNAL);
+            free(req);
+            close_sock(c);
+            continue;
+        }
         body = body ? body + 4 : "";
         dispatch(c, method, path, body);
         free(req);
