@@ -1570,7 +1570,7 @@ static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, i
                 int fresh = 0;
                 size_t pi = cw_node(d, &h[j].entity, &fresh);
                 cw_link(d, pi, (size_t)ci);
-                if (level == 0 && vx.v[v].said == LP_SAID_CLAIM) d->n[pi].claim = 1;
+                if (vx.v[v].said == LP_SAID_CLAIM) d->n[ci].claim = 1;          /* said as a claim by what holds it */
                 if (fresh && is_file) { d->n[pi].file = 1; files++; }
                 else if (fresh) lp_idmap_put(next, &h[j].entity, NULL);
             }
@@ -1669,9 +1669,7 @@ static void on_code_where(int c, const char *body) {
         cw_paths(&d, i, &cur, paths, &npth, 32, &steps);
         int def = 0, occ = 0;
         for (size_t k = 0; k < npth; k++) {
-            int cl = 0;
-            for (size_t z = 0; z < paths[k].len; z++) cl |= d.n[paths[k].n[z]].claim;
-            if (cl) def = 1; else occ++;
+            if (paths[k].len >= 2 && d.n[paths[k].n[paths[k].len - 2]].claim) def = 1; else occ++;
         }
         if (defs_only && !def) { free(path); continue; }
         fs[nf++] = (CwFile){ i, def, occ, path };
@@ -1714,15 +1712,14 @@ static void on_code_where(int c, const char *body) {
         int no = 0;
         long seen[16];
         for (size_t k = 0; k < npth && no < per; k++) {
-            int cl = 0;
-            for (size_t z = 0; z < paths[k].len; z++) cl |= d.n[paths[k].n[z]].claim;
-            if (cl || paths[k].len < 2) continue;
+            if (paths[k].len < 3 || d.n[paths[k].n[paths[k].len - 2]].claim) continue;
             const CwPath *pp = &paths[k];
             /* the innermost node of at least `context` bytes, and the outermost under 8 KiB below the file */
-            char *ctx = NULL, *encl = NULL;
+            char *ctx = NULL, *encl = NULL, *span = NULL, *inner = NULL;
+            size_t ctx_at = 0;
             for (size_t z = pp->len - 1; z-- > 1;) {
                 char *tx = reader_text(rd, &d.n[pp->n[z]].id, (size_t)context * 4);
-                if (strlen(tx) >= (size_t)context || z == 1) { ctx = tx; break; }
+                if (strlen(tx) >= (size_t)context || z == 1) { ctx = tx; ctx_at = z; break; }
                 free(tx);
             }
             for (size_t z = 2; z < pp->len - 1; z++) {
@@ -1730,21 +1727,26 @@ static void on_code_where(int c, const char *body) {
                 if (strlen(tx) <= 8192) { encl = tx; break; }
                 free(tx);
             }
+            /* lines: the enclosing declaration (else the context), whole, where it stands in the file's recorded
+             * content; the name where the context stands in it */
             long line = -1, line0 = -1, line1 = -1;
-            const char *span = encl ? encl : ctx;
-            if (span) {
+            if (ctx_at) inner = reader_text(rd, &d.n[pp->n[ctx_at]].id, (size_t)1 << 20);
+            span = encl ? strdup(encl) : inner ? strdup(inner) : NULL;
+            if (span && span[0]) {
                 if (!whole) whole = reader_text(rd, &d.n[pp->n[1]].id, (size_t)8 << 20);
                 const char *at = strstr(whole, span);
                 if (at) {
                     size_t len = strlen(span);
                     line0 = (long)cw_lines(whole, (size_t)(at - whole));
                     line1 = line0 + (long)cw_lines(at, len) - 1;
-                    const char *in = ctx ? strstr(at, ctx) : NULL;
+                    const char *in = inner && inner[0] ? strstr(at, inner) : NULL;
                     if (!in || (size_t)(in - at) >= len) in = at;
                     const char *nm = strstr(in, name);
                     if (nm && (size_t)(nm - at) < len) line = line0 + (long)cw_lines(at, (size_t)(nm - at)) - 1;
                 }
             }
+            free(span);
+            free(inner);
             int dup = 0;
             for (int q = 0; q < no; q++) if (seen[q] == line && line > 0) dup = 1;
             if (!dup) {
