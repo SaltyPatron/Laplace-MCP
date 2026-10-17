@@ -1486,19 +1486,26 @@ char *reader_text(Reader *, const lp_id *id, size_t limit);
 size_t reader_parts(Reader *, const lp_id *id, lp_id *out, size_t cap);
 Hold *holds_any(const lp_id *keys, int nkeys, int *nout);
 
-typedef struct { lp_id id; size_t down; int file; } CwNode;   /* down: the node it was reached from (a step toward the name) */
+#define CW_DOWN 8
+typedef struct { lp_id id; size_t down[CW_DOWN]; uint8_t nd, file, claim; } CwNode;   /* down: what it was reached from, toward the name */
 typedef struct { CwNode *n; size_t nn, cn; lp_idmap *m; } CwDag;
-static size_t cw_node(CwDag *d, const lp_id *id, size_t down, int *fresh) {
+static size_t cw_node(CwDag *d, const lp_id *id, int *fresh) {
     bool f;
     size_t i = lp_idmap_put(d->m, id, &f);
     if (f) {
         if (d->nn == d->cn) { d->cn = d->cn ? d->cn * 2 : 1024; CwNode *g = realloc(d->n, d->cn * sizeof *d->n); if (!g) abort(); d->n = g; }
-        d->n[d->nn].id = *id; d->n[d->nn].down = down; d->n[d->nn].file = 0; d->nn++;
+        memset(&d->n[d->nn], 0, sizeof d->n[d->nn]);
+        d->n[d->nn].id = *id;
+        d->nn++;
     }
     if (fresh) *fresh = f;
     return i;
 }
-
+static void cw_link(CwDag *d, size_t up, size_t down) {
+    CwNode *x = &d->n[up];
+    for (int k = 0; k < x->nd; k++) if (x->down[k] == down) return;
+    if (x->nd < CW_DOWN) x->down[x->nd++] = down;
+}
 /* A file's path from the OS's record in its metadata tree: [pathname, its folders], or [filename, NAME]. */
 static char *cw_file_name(Reader *rd, const lp_id *file) {
     lp_id at = *file, kid[64];
@@ -1533,10 +1540,12 @@ static char *cw_file_name(Reader *rd, const lp_id *file) {
 
 /* Up from one name through every path that holds it, to the files: a holder whose first vertex is metadata, reached
  * through its content, is a file and the walk stops there. A name held only as metadata (a file called so) is not an
- * occurrence. The front is bounded so a name as common as a keyword answers what it reached and says so. */
+ * occurrence. What holds the name as a claim is what a recipe said of it: a code recipe says [kind, name] of each
+ * declaration (Laplace-Engine attest_code_node), so a file reached through one defines the name. The front is bounded,
+ * so a name as common as a keyword answers what it reached and says so. */
 static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, int *cut) {
     d->m = lp_idmap_new();
-    cw_node(d, name, (size_t)-1, NULL);
+    cw_node(d, name, NULL);
     lp_idmap *front = lp_idmap_new();
     lp_idmap_put(front, name, NULL);
     lp_vec(lp_vertex) vx = { 0 };
@@ -1546,7 +1555,7 @@ static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, i
         int nh = 0;
         Hold *h = holds_any(lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
         lp_idmap *next = lp_idmap_new();
-        for (int j = 0; j < nh; j++) {
+        for (int j = 0; j < nh && !*cut; j++) {
             size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
             if (!nv) continue;
             lp_vec_reserve(&vx, nv);
@@ -1554,14 +1563,16 @@ static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, i
             int is_file = vx.v[0].said == LP_SAID_METADATA;
             for (size_t v = 0; v < nv; v++) {
                 if (vx.v[v].said == LP_SAID_METADATA) continue;
+                if (lp_idmap_find(front, &vx.v[v].id) < 0) continue;
                 ptrdiff_t ci = lp_idmap_find(d->m, &vx.v[v].id);
-                if (ci < 0 || lp_idmap_find(front, &vx.v[v].id) < 0) continue;
+                if (ci < 0) continue;
                 if (d->nn >= max_nodes) { *cut = 1; break; }
                 int fresh = 0;
-                size_t pi = cw_node(d, &h[j].entity, (size_t)ci, &fresh);
+                size_t pi = cw_node(d, &h[j].entity, &fresh);
+                cw_link(d, pi, (size_t)ci);
+                if (level == 0 && vx.v[v].said == LP_SAID_CLAIM) d->n[pi].claim = 1;
                 if (fresh && is_file) { d->n[pi].file = 1; files++; }
                 else if (fresh) lp_idmap_put(next, &h[j].entity, NULL);
-                break;
             }
         }
         holds_free(h, nh);
@@ -1582,6 +1593,31 @@ static size_t cw_lines(const char *text, size_t upto) {
     return l;
 }
 
+/* The paths down from a file to the name (index 0), each its nodes file-first; at most cap of them. */
+typedef struct { size_t n[160]; size_t len; } CwPath;
+static void cw_paths(const CwDag *d, size_t at, CwPath *cur, CwPath *out, size_t *nout, size_t cap, size_t *steps) {
+    if (*nout >= cap || cur->len >= 160 || ++*steps > 20000) return;
+    cur->n[cur->len++] = at;
+    if (at == 0) { out[(*nout)++] = *cur; cur->len--; return; }
+    for (int k = 0; k < d->n[at].nd; k++) cw_paths(d, d->n[at].down[k], cur, out, nout, cap, steps);
+    cur->len--;
+}
+
+static void cw_str(char **out, size_t *on, size_t *ocap, const char *s) {
+    size_t l = strlen(s) * 6 + 8;
+    char *e = malloc(l);
+    buf_add(out, on, ocap, json_esc(s, e, l), strlen(e));
+    free(e);
+}
+
+typedef struct { size_t file; int defines, occ; char *path; } CwFile;
+static int cw_file_cmp(const void *a, const void *b) {
+    const CwFile *x = a, *y = b;
+    if (x->defines != y->defines) return y->defines - x->defines;
+    if (x->occ != y->occ) return y->occ - x->occ;
+    return strcmp(x->path, y->path);
+}
+
 static void on_code_where(int c, const char *body) {
     char name[2048];
     /* query, as code_search takes it (a tools/call's own "name" comes first in its body, so the key is not "name") */
@@ -1589,15 +1625,20 @@ static void on_code_where(int c, const char *body) {
         http(c, 400, "{\"error\":\"query\"}");
         return;
     }
-    int limit = 20, context = 400;
+    int limit = 20, context = 120, per = 3;
     jint(body, "limit", &limit);
     jint(body, "context", &context);
+    jint(body, "occurrences", &per);
     if (limit < 1) limit = 1;
     if (limit > 200) limit = 200;
-    if (context < 40) context = 40;
+    if (context < 20) context = 20;
     if (context > 4000) context = 4000;
-    char under[512] = "";
+    if (per < 0) per = 0;
+    if (per > 16) per = 16;
+    char under[512] = "", defs[8] = "";
     jstr(body, "path", under, sizeof under);
+    int defs_only = jstr(body, "defines", defs, sizeof defs) ? !strcmp(defs, "true") : 0;
+    if (!defs_only && strstr(body, "\"defines\":true")) defs_only = 1;
     lp_ref trunk, parts[256];
     size_t np = 0;
     if (!name_entity(name, &trunk, parts, 256, &np)) { http(c, 500, "{\"error\":\"tier0\"}"); return; }
@@ -1615,77 +1656,131 @@ static void on_code_where(int c, const char *body) {
     int nfiles = cw_walk(&trunk.id, &d, 400000, &levels, &cut);
     double walk_ms = (double)(nsec() - t0) / 1e6;
     Reader *rd = reader_new(pg);
-    char idh[33];
-    hex_id(&trunk.id, idh);
-    char *out = NULL, *esc = NULL;
-    size_t on = 0, ocap = 0;
-    buf_fmt(&out, &on, &ocap, "{\"query\":\"%s\",\"id\":\"%s\",\"database\":\"%s\",\"levels\":%d,\"nodes\":%zu,\"files\":%d,\"cut\":%s,\"ms\":{\"walk\":%.3f},\"hits\":[",
-            json_esc(name, (esc = malloc(sizeof name * 6 + 8)), sizeof name * 6 + 8), idh, PQdb(pg), levels, d.nn, nfiles, cut ? "true" : "false", walk_ms);
-    free(esc);
-    int shown = 0;
-    for (size_t i = 0; i < d.nn && shown < limit; i++) {
+    /* each file: whether a claim path reaches it (it defines the name), and how many text paths */
+    CwFile *fs = calloc((size_t)nfiles + 1, sizeof *fs);
+    size_t nf = 0;
+    CwPath *paths = malloc(sizeof(CwPath) * 32), cur;
+    for (size_t i = 0; i < d.nn; i++) {
         if (!d.n[i].file) continue;
         char *path = cw_file_name(rd, &d.n[i].id);
         if (under[0] && !strstr(path, under)) { free(path); continue; }
-        /* the chain down from the file to the name: its content, then the syntax nodes that enclose the name */
-        size_t chain[160], nc = 0;
-        for (size_t k = d.n[i].down; k != (size_t)-1 && nc < 160; k = d.n[k].down) chain[nc++] = k;
-        /* the innermost node of at least `context` bytes is the context; the outermost below the file under 8 KiB the
-         * enclosing declaration */
-        char *ctx = NULL, *encl = NULL;
-        for (size_t k = nc; k-- > 0;) {
-            char *t = reader_text(rd, &d.n[chain[k]].id, (size_t)context * 4);
-            if (strlen(t) >= (size_t)context || k == 0) { ctx = t; break; }
-            free(t);
+        size_t npth = 0, steps = 0;
+        cur.len = 0;
+        cw_paths(&d, i, &cur, paths, &npth, 32, &steps);
+        int def = 0, occ = 0;
+        for (size_t k = 0; k < npth; k++) {
+            int cl = 0;
+            for (size_t z = 0; z < paths[k].len; z++) cl |= d.n[paths[k].n[z]].claim;
+            if (cl) def = 1; else occ++;
         }
-        for (size_t k = 1; k < nc; k++) {
-            char *t = reader_text(rd, &d.n[chain[k]].id, 8193);
-            if (strlen(t) <= 8192) { encl = t; break; }
-            free(t);
-        }
-        /* lines: where the enclosing text stands in the file's recorded content, and the name in it */
-        long line = -1, line0 = -1, line1 = -1;
-        const char *span = encl ? encl : ctx;
-        if (nc && span) {
-            char *whole = reader_text(rd, &d.n[chain[0]].id, (size_t)8 << 20);
-            const char *at = strstr(whole, span);
-            if (at) {
-                size_t len = strlen(span);
-                line0 = (long)cw_lines(whole, (size_t)(at - whole));
-                line1 = line0 + (long)cw_lines(at, len) - 1;
-                const char *nm = strstr(at, name);
-                if (nm && (size_t)(nm - at) < len) line = line0 + (long)cw_lines(at, (size_t)(nm - at)) - 1;
-            }
-            free(whole);
-        }
-        buf_fmt(&out, &on, &ocap, "%s{\"path\":\"", shown ? "," : "");
-        { size_t pl = strlen(path) * 6 + 8; esc = malloc(pl); buf_add(&out, &on, &ocap, json_esc(path, esc, pl), strlen(esc)); free(esc); }
-        if (line > 0) buf_fmt(&out, &on, &ocap, "\",\"line\":%ld", line); else buf_add(&out, &on, &ocap, "\",\"line\":null", 13);
-        if (line0 > 0) buf_fmt(&out, &on, &ocap, ",\"line0\":%ld,\"line1\":%ld", line0, line1); else buf_add(&out, &on, &ocap, ",\"line0\":null,\"line1\":null", 26);
+        if (defs_only && !def) { free(path); continue; }
+        fs[nf++] = (CwFile){ i, def, occ, path };
+    }
+    qsort(fs, nf, sizeof *fs, cw_file_cmp);
+    char idh[33];
+    hex_id(&trunk.id, idh);
+    char *out = NULL;
+    size_t on = 0, ocap = 0;
+    buf_add(&out, &on, &ocap, "{\"query\":\"", 10);
+    cw_str(&out, &on, &ocap, name);
+    buf_fmt(&out, &on, &ocap, "\",\"id\":\"%s\",\"database\":\"%s\",\"levels\":%d,\"nodes\":%zu,\"files\":%zu,\"cut\":%s,\"walk_ms\":%.3f,\"hits\":[",
+            idh, PQdb(pg), levels, d.nn, nf, cut ? "true" : "false", walk_ms);
+    int shown = 0;
+    for (size_t f = 0; f < nf && shown < limit; f++) {
+        size_t i = fs[f].file;
+        size_t npth = 0, steps = 0;
+        cur.len = 0;
+        cw_paths(&d, i, &cur, paths, &npth, 32, &steps);
         char fh[33];
         hex_id(&d.n[i].id, fh);
-        buf_fmt(&out, &on, &ocap, ",\"file\":\"%s\",\"depth\":%zu,\"context\":\"", fh, nc);
-        if (ctx) { size_t l = strlen(ctx) * 6 + 8; esc = malloc(l); buf_add(&out, &on, &ocap, json_esc(ctx, esc, l), strlen(esc)); free(esc); }
-        buf_add(&out, &on, &ocap, "\",\"enclosing\":\"", strlen("\",\"enclosing\":\""));
-        if (encl) {                                         /* its head: up to its first line's end, at most 240 bytes */
-            size_t hl = strcspn(encl, "\n");
-            if (hl > 240) { hl = 240; while (hl && ((uint8_t)encl[hl] & 0xC0) == 0x80) hl--; }
-            char save = encl[hl]; encl[hl] = 0;
-            size_t l = hl * 6 + 8; esc = malloc(l); buf_add(&out, &on, &ocap, json_esc(encl, esc, l), strlen(esc)); free(esc);
-            encl[hl] = save;
+        buf_fmt(&out, &on, &ocap, "%s{\"path\":\"", shown ? "," : "");
+        cw_str(&out, &on, &ocap, fs[f].path);
+        buf_fmt(&out, &on, &ocap, "\",\"file\":\"%s\",\"defines\":[", fh);
+        int nk = 0;
+        char *whole = NULL;
+        for (size_t k = 0; k < npth; k++) {                 /* the kinds said of it: [kind, name], the node above the name */
+            size_t z = paths[k].len >= 2 ? paths[k].len - 2 : 0;
+            if (!d.n[paths[k].n[z]].claim) continue;
+            lp_id two[4];
+            if (reader_parts(rd, &d.n[paths[k].n[z]].id, two, 4) != 2) continue;
+            char *kind = reader_text(rd, &two[0], 80);
+            buf_add(&out, &on, &ocap, nk ? ",\"" : "\"", nk ? 2 : 1);
+            cw_str(&out, &on, &ocap, kind);
+            buf_add(&out, &on, &ocap, "\"", 1);
+            free(kind);
+            nk++;
         }
-        buf_add(&out, &on, &ocap, "\"}", 2);
-        free(ctx); free(encl); free(path);
+        buf_fmt(&out, &on, &ocap, "],\"occurrences\":%d,\"at\":[", fs[f].occ);
+        int no = 0;
+        long seen[16];
+        for (size_t k = 0; k < npth && no < per; k++) {
+            int cl = 0;
+            for (size_t z = 0; z < paths[k].len; z++) cl |= d.n[paths[k].n[z]].claim;
+            if (cl || paths[k].len < 2) continue;
+            const CwPath *pp = &paths[k];
+            /* the innermost node of at least `context` bytes, and the outermost under 8 KiB below the file */
+            char *ctx = NULL, *encl = NULL;
+            for (size_t z = pp->len - 1; z-- > 1;) {
+                char *tx = reader_text(rd, &d.n[pp->n[z]].id, (size_t)context * 4);
+                if (strlen(tx) >= (size_t)context || z == 1) { ctx = tx; break; }
+                free(tx);
+            }
+            for (size_t z = 2; z < pp->len - 1; z++) {
+                char *tx = reader_text(rd, &d.n[pp->n[z]].id, 8193);
+                if (strlen(tx) <= 8192) { encl = tx; break; }
+                free(tx);
+            }
+            long line = -1, line0 = -1, line1 = -1;
+            const char *span = encl ? encl : ctx;
+            if (span) {
+                if (!whole) whole = reader_text(rd, &d.n[pp->n[1]].id, (size_t)8 << 20);
+                const char *at = strstr(whole, span);
+                if (at) {
+                    size_t len = strlen(span);
+                    line0 = (long)cw_lines(whole, (size_t)(at - whole));
+                    line1 = line0 + (long)cw_lines(at, len) - 1;
+                    const char *in = ctx ? strstr(at, ctx) : NULL;
+                    if (!in || (size_t)(in - at) >= len) in = at;
+                    const char *nm = strstr(in, name);
+                    if (nm && (size_t)(nm - at) < len) line = line0 + (long)cw_lines(at, (size_t)(nm - at)) - 1;
+                }
+            }
+            int dup = 0;
+            for (int q = 0; q < no; q++) if (seen[q] == line && line > 0) dup = 1;
+            if (!dup) {
+                seen[no] = line;
+                buf_add(&out, &on, &ocap, no ? ",{" : "{", no ? 2 : 1);
+                if (line > 0) buf_fmt(&out, &on, &ocap, "\"line\":%ld", line); else buf_add(&out, &on, &ocap, "\"line\":null", 11);
+                if (line0 > 0) buf_fmt(&out, &on, &ocap, ",\"line0\":%ld,\"line1\":%ld", line0, line1);
+                buf_add(&out, &on, &ocap, ",\"context\":\"", 12);
+                if (ctx) cw_str(&out, &on, &ocap, ctx);
+                buf_add(&out, &on, &ocap, "\",\"enclosing\":\"", 15);
+                if (encl) {                                 /* its head: up to its first line's end, at most 240 bytes */
+                    size_t hl = strcspn(encl, "\n");
+                    if (hl > 240) { hl = 240; while (hl && ((uint8_t)encl[hl] & 0xC0) == 0x80) hl--; }
+                    encl[hl] = 0;
+                    cw_str(&out, &on, &ocap, encl);
+                }
+                buf_add(&out, &on, &ocap, "\"}", 2);
+                no++;
+            }
+            free(ctx);
+            free(encl);
+        }
+        free(whole);
+        buf_add(&out, &on, &ocap, "]}", 2);
         shown++;
     }
-    buf_fmt(&out, &on, &ocap, "],\"shown\":%d,\"ms_total\":%.3f}", shown, (double)(nsec() - t0) / 1e6);
+    buf_fmt(&out, &on, &ocap, "],\"shown\":%d,\"ms\":%.3f}", shown, (double)(nsec() - t0) / 1e6);
+    for (size_t f = 0; f < nf; f++) free(fs[f].path);
+    free(fs);
+    free(paths);
     reader_free(rd);
     lp_idmap_free(d.m);
     free(d.n);
     http(c, 200, out ? out : "{\"error\":\"memory\"}");
     free(out);
 }
-
 /* The sources the database holds: each witness, its name (the first part of its trunk, the record its source file
  * names) and its trust. */
 static void on_sources(int c, const char *body) {
@@ -1748,7 +1843,7 @@ static void rpc_id(const char *body, char *out, size_t cap) {
 static const char *TOOLS =
     "{\"tools\":["
     "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates and Laplace rerank orders the union; a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
-    "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code (query) stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment: every file whose recorded syntax tree holds it, its pathname as the file's record gives it, the line it is on, the innermost enclosing node of at least context bytes, and the enclosing declaration (the outermost node under 8 KiB below the file): its first line and its line span (line0..line1). path filters by a substring of the file path. Nothing is read from a working tree.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
+    "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code (query) stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment above it, nothing from a working tree. Each file that holds it, by the pathname its record gives: defines, the declaration kinds its recipe said of the name there (function_definition, class_declaration...), files that define it first; occurrences, how many places in its syntax tree hold it; at, up to occurrences (default 3) of them: the line, the innermost enclosing node of at least context bytes (default 120), and the enclosing declaration's first line with its span line0..line1. defines true: only files that define it. path: a substring the file path must contain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"defines\":{\"type\":\"boolean\"},\"limit\":{\"type\":\"integer\"},\"occurrences\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"sources\",\"description\":\"The sources the Laplace database holds: each witness ID, its name and trust.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"rerank\",\"description\":\"Deterministic Laplace reranker (drop-in replacement for neural cross-encoders). Scores candidate documents against a query using IDF-weighted constituent overlap and 4D discrete Frechet trajectory distance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"documents\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"top_n\":{\"type\":\"integer\"}},\"required\":[\"query\",\"documents\"]}},"
