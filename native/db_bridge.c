@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 uint32_t id_oid;
 static char noted_conn[8192];
@@ -26,6 +27,14 @@ void *xrealloc(void *p, size_t n) {
     p = realloc(p, n ? n : 1);
     if (!p) { perror("realloc"); exit(1); }
     return p;
+}
+
+/* read.c times its pool with the engine's now(). The engine defines that in table.c, which this
+ * service does not link; xrealloc above is the same kind of symbol. */
+double now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
 }
 
 PGconn *db_connect(const char *conninfo) {
