@@ -23,12 +23,6 @@ const char *db_noted(void) { return noted_conn; }
  * the engine's pool to take a snapshot per read; it has no call for that yet. */
 const char *db_snapshot(void) { return NULL; }
 
-double now(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
-
 void *xrealloc(void *p, size_t n) {
     p = realloc(p, n ? n : 1);
     if (!p) { perror("realloc"); exit(1); }
