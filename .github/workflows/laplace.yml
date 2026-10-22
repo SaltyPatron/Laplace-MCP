@@ -37,7 +37,7 @@ jobs:
           [ -s "$LAPLACE_TIER0" ] || { echo "Required tier 0 is missing at $LAPLACE_TIER0; install prepared inputs before verification"; exit 1; }
           "$L" check
           "$L" text 'Sherlock Holmes'
-          python3 Laplace-MCP/tests/engine-output.py "$L"
+          python3 Laplace-MCP/tests/engine-output.py "$L" "$LAPLACE_BUILD/Laplace-MCP/engine/laplace"
           python3 Laplace-MCP/tests/serve-auth.py "$L"
           python3 Laplace-MCP/tests/code-index.py "$L"
           python3 Laplace-MCP/tests/code-semantic.py "$L"
