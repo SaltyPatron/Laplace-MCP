@@ -63,7 +63,7 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         created = True
         if d.returncode:
             fail('deploy: ' + d.stdout[-2000:] + d.stderr[-2000:])
-        i = subprocess.run([engine, 'ingest', '-d', conninfo, '-j', '2'] + [str(root / f) for f in src], env=env,
+        i = subprocess.run([engine, 'ingest', '-d', conninfo, '-j', '2', '-s', 'workspace-code'] + [str(root / f) for f in src], env=env,
                            capture_output=True, text=True, timeout=300)
         if i.returncode:
             fail('ingest: ' + i.stdout[-3000:] + i.stderr[-2000:])

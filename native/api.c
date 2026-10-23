@@ -1802,8 +1802,8 @@ static char *cw_file_name(Reader *rd, const lp_id *file) {
 
 /* Up from one name through every path that holds it, to the files: a holder whose first vertex is metadata, reached
  * through its content, is a file and the walk stops there. A name held only as metadata (a file called so) is not an
- * occurrence. What holds the name as a claim is what a recipe said of it: a code recipe says [kind, name] of each
- * declaration (Laplace-Engine attest_code_node), so a file reached through one defines the name. A record of one claim is
+ * occurrence. A code recipe states [declaration, "declared identifier", name],
+ * with declaration = [kind, complete source bytes]. A record of one claim is
  * that claim, said as a record (LP_SAID_RECORD) where it stands, so a holder of the name said so one level up is a claim
  * too, as the engine's walk up counts it (walk_up): a file that declares one thing defines it. The front is bounded, so a
  * name as common as a keyword answers what it reached and says so. */
@@ -1859,6 +1859,11 @@ static size_t cw_lines(const char *text, size_t upto) {
 
 /* The paths down from a file to the name (index 0), each its nodes file-first; at most cap of them. */
 typedef struct { size_t n[160]; size_t len; } CwPath;
+/* Semantic testimony is not another textual occurrence, regardless of its depth. */
+static int cw_claim_path(const CwDag *d, const CwPath *path) {
+    for (size_t k = 1; k + 1 < path->len; k++) if (d->n[path->n[k]].claim) return 1;
+    return 0;
+}
 static void cw_paths(const CwDag *d, size_t at, CwPath *cur, CwPath *out, size_t *nout, size_t cap, size_t *steps) {
     if (*nout >= cap || cur->len >= 160 || ++*steps > 20000) return;
     cur->n[cur->len++] = at;
@@ -1921,6 +1926,29 @@ static int fo_word(char c) { return isalnum((unsigned char)c) || c == '_' || (un
  * [kind, name] said of it, in the file's order, each at the first line at or after the one before it where its name
  * stands as a word in that text (line 0: it does not). file_outline answers it; code_callers and code_callees read it. */
 typedef struct { char *kind, *name; size_t line; } FoDecl;
+typedef struct { lp_id kind, name, source; } CodeDeclaration;
+/* Read the recipe's typed declaration from the persisted semantic claim. */
+static int code_declaration(Reader *rd, const lp_id *claim, CodeDeclaration *out) {
+    lp_id parts[4], subject[3];
+    if (reader_parts(rd, claim, parts, 4) != 3) return 0;
+    char *relation = reader_text(rd, &parts[1], 80);
+    int declaration = !strcmp(relation, "declared identifier");
+    free(relation);
+    if (!declaration || reader_parts(rd, &parts[0], subject, 3) != 2) return 0;
+    *out = (CodeDeclaration){subject[0], parts[2], subject[1]};
+    return 1;
+}
+static int cw_definition(Reader *rd, const CwDag *d, const CwPath *path, const lp_id *name, lp_id *kind) {
+    for (size_t k = 1; k + 1 < path->len; k++) {
+        const CwNode *node = &d->n[path->n[k]];
+        CodeDeclaration declaration;
+        if (node->claim && code_declaration(rd, &node->id, &declaration) && !memcmp(declaration.name.b, name->b, 16)) {
+            if (kind) *kind = declaration.kind;
+            return 1;
+        }
+    }
+    return 0;
+}
 static void fo_free(FoDecl *d, size_t n) {
     for (size_t k = 0; k < n; k++) { free(d[k].kind); free(d[k].name); }
     free(d);
@@ -1955,9 +1983,9 @@ static size_t fo_outline(PGconn *pg, Reader *rd, const lp_id *file, FoDecl **dec
     FoDecl *dl = NULL;
     size_t nd = 0, at = 0, line = 1;
     for (size_t k = 0; k < claims.n; k++) {
-        lp_id two[4];
-        if (reader_parts(rd, &claims.v[k], two, 4) != 2) continue;
-        char *kind = reader_text(rd, &two[0], 120), *name = reader_text(rd, &two[1], 400);
+        CodeDeclaration declaration;
+        if (!code_declaration(rd, &claims.v[k], &declaration)) continue;
+        char *kind = reader_text(rd, &declaration.kind, 120), *name = reader_text(rd, &declaration.name, 400);
         size_t nl = strlen(name), found = 0, fl = 0;
         for (size_t p = at, ln = line; nl && p + nl <= tn; p++) {
             if (p > at && text[p - 1] == '\n') ln++;
@@ -2122,7 +2150,8 @@ static void on_code_where(int c, const char *body) {    char name[2048];
         cw_paths(&d, i, &cur, paths, &npth, 32, &steps);
         int def = 0, occ = 0;
         for (size_t k = 0; k < npth; k++) {
-            if (paths[k].len >= 2 && d.n[paths[k].n[paths[k].len - 2]].claim) def = 1; else occ++;
+            if (cw_definition(rd, &d, &paths[k], &trunk.id, NULL)) def = 1;
+            if (!cw_claim_path(&d, &paths[k])) occ++;
         }
         if (defs_only && !def) { free(path); continue; }
         fs[nf++] = (CwFile){ i, def, occ, path };
@@ -2149,23 +2178,26 @@ static void on_code_where(int c, const char *body) {    char name[2048];
         buf_fmt(&out, &on, &ocap, "\",\"file\":\"%s\",\"defines\":[", fh);
         int nk = 0;
         char *whole = NULL;
-        for (size_t k = 0; k < npth; k++) {                 /* the kinds said of it: [kind, name], the node above the name */
-            size_t z = paths[k].len >= 2 ? paths[k].len - 2 : 0;
-            if (!d.n[paths[k].n[z]].claim) continue;
-            lp_id two[4];
-            if (reader_parts(rd, &d.n[paths[k].n[z]].id, two, 4) != 2) continue;
-            char *kind = reader_text(rd, &two[0], 80);
+        lp_idmap *kinds = lp_idmap_new();
+        for (size_t k = 0; k < npth; k++) {
+            lp_id kind_id;
+            if (!cw_definition(rd, &d, &paths[k], &trunk.id, &kind_id)) continue;
+            bool fresh;
+            lp_idmap_put(kinds, &kind_id, &fresh);
+            if (!fresh) continue;
+            char *kind = reader_text(rd, &kind_id, 80);
             buf_add(&out, &on, &ocap, nk ? ",\"" : "\"", nk ? 2 : 1);
             cw_str(&out, &on, &ocap, kind);
             buf_add(&out, &on, &ocap, "\"", 1);
             free(kind);
             nk++;
         }
+        lp_idmap_free(kinds);
         buf_fmt(&out, &on, &ocap, "],\"occurrences\":%d,\"at\":[", fs[f].occ);
         int no = 0;
         long seen[16];
         for (size_t k = 0; k < npth && no < per; k++) {
-            if (paths[k].len < 3 || d.n[paths[k].n[paths[k].len - 2]].claim) continue;
+            if (paths[k].len < 3 || cw_claim_path(&d, &paths[k])) continue;
             const CwPath *pp = &paths[k];
             /* the innermost node of at least `context` bytes, and the outermost under 8 KiB below the file */
             char *ctx = NULL, *encl = NULL, *span = NULL, *inner = NULL;
@@ -2349,7 +2381,7 @@ static void on_code_callers(int c, const char *body) {
         size_t tl = 0, nd = 0;
         CcLines *by = NULL, alone = { 0 };
         for (size_t k = 0; k < npth; k++) {
-            if (paths[k].len < 3 || d.n[paths[k].n[paths[k].len - 2]].claim) continue;
+            if (paths[k].len < 3 || cw_claim_path(&d, &paths[k])) continue;
             if (!whole) {
                 whole = reader_text(rd, &d.n[paths[k].n[1]].id, (size_t)8 << 20);
                 nd = fo_outline(pg, rd, &d.n[i].id, &dl, &text, &tl);
@@ -2450,7 +2482,7 @@ static void on_code_callees(int c, const char *body) {
         cur.len = 0;
         cw_paths(&d, i, &cur, paths, &npth, 32, &steps);
         int def = 0;
-        for (size_t k = 0; k < npth; k++) if (paths[k].len >= 2 && d.n[paths[k].n[paths[k].len - 2]].claim) def = 1;
+        for (size_t k = 0; k < npth; k++) if (cw_definition(rd, &d, &paths[k], &trunk.id, NULL)) def = 1;
         if (!def) continue;
         char *path = cw_file_name(rd, &d.n[i].id);
         if (under[0] && !strstr(path, under)) { free(path); continue; }
@@ -2460,7 +2492,7 @@ static void on_code_callees(int c, const char *body) {
         const char *seen[16];
         size_t nseen = 0;
         for (size_t k = 0; k < npth && ndef < 16; k++) {
-            if (paths[k].len < 3 || d.n[paths[k].n[paths[k].len - 2]].claim) continue;
+            if (paths[k].len < 3 || cw_claim_path(&d, &paths[k])) continue;
             if (!whole) whole = reader_text(rd, &d.n[paths[k].n[1]].id, (size_t)8 << 20);
             size_t nn = cc_nodes(&d, rd, &paths[k], whole, nodes, 160);
             if (!nn) continue;
@@ -2524,13 +2556,13 @@ static void on_code_callees(int c, const char *body) {
         lp_vec(size_t) claim_c = { 0 };
         lp_vec(char *) claim_k = { 0 };
         for (int j = 0; j < nh; j++) {
-            lp_id two[4];
-            if (reader_parts(rd, &h[j].entity, two, 4) != 2) continue;
-            int64_t ci = lp_idmap_find(cand, &two[1]);
+            CodeDeclaration declaration;
+            if (!code_declaration(rd, &h[j].entity, &declaration)) continue;
+            int64_t ci = lp_idmap_find(cand, &declaration.name);
             if (ci < 0) continue;
             bool fresh;
             lp_idmap_put(claim, &h[j].entity, &fresh);
-            if (fresh) { lp_push(&claim_c, (size_t)ci); lp_push(&claim_k, reader_text(rd, &two[0], 120)); }
+            if (fresh) { lp_push(&claim_c, (size_t)ci); lp_push(&claim_k, reader_text(rd, &declaration.kind, 120)); }
         }
         holds_free(h, nh);
         size_t nclaim = lp_idmap_count(claim);
