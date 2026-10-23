@@ -1748,8 +1748,7 @@ char *reader_text(Reader *, const lp_id *id, size_t limit);
 size_t reader_parts(Reader *, const lp_id *id, lp_id *out, size_t cap);
 Hold *holds_any(const lp_id *keys, int nkeys, int *nout);
 
-#define CW_DOWN 8
-typedef struct { lp_id id; size_t down[CW_DOWN]; uint8_t nd, file, claim; } CwNode;   /* down: what it was reached from, toward the name */
+typedef struct { lp_id id; uint8_t file; } CwNode;
 typedef struct { CwNode *n; size_t nn, cn; lp_idmap *m; } CwDag;
 static size_t cw_node(CwDag *d, const lp_id *id, int *fresh) {
     bool f;
@@ -1762,11 +1761,6 @@ static size_t cw_node(CwDag *d, const lp_id *id, int *fresh) {
     }
     if (fresh) *fresh = f;
     return i;
-}
-static void cw_link(CwDag *d, size_t up, size_t down) {
-    CwNode *x = &d->n[up];
-    for (int k = 0; k < x->nd; k++) if (x->down[k] == down) return;
-    if (x->nd < CW_DOWN) x->down[x->nd++] = down;
 }
 /* A file's path from the OS's record in its metadata tree: [pathname, its folders], or [filename, NAME]. */
 static char *cw_file_name(Reader *rd, const lp_id *file) {
@@ -1807,11 +1801,10 @@ static char *cw_file_name(Reader *rd, const lp_id *file) {
  * that claim, said as a record (LP_SAID_RECORD) where it stands, so a holder of the name said so one level up is a claim
  * too, as the engine's walk up counts it (walk_up): a file that declares one thing defines it. The front is bounded, so a
  * name as common as a keyword answers what it reached and says so. */
-static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, int *cut) {
+static int cw_walk_many(const lp_id *names, size_t count, CwDag *d, size_t max_nodes, int *levels, int *cut) {
     d->m = lp_idmap_new();
-    cw_node(d, name, NULL);
     lp_idmap *front = lp_idmap_new();
-    lp_idmap_put(front, name, NULL);
+    for (size_t i=0;i<count;i++) { cw_node(d,&names[i],NULL); lp_idmap_put(front,&names[i],NULL); }
     lp_vec(lp_vertex) vx = { 0 };
     int level = 0, files = 0;
     *cut = 0;
@@ -1833,8 +1826,6 @@ static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, i
                 if (d->nn >= max_nodes) { *cut = 1; break; }
                 int fresh = 0;
                 size_t pi = cw_node(d, &h[j].entity, &fresh);
-                cw_link(d, pi, (size_t)ci);
-                if (vx.v[v].said == LP_SAID_CLAIM || (level == 1 && vx.v[v].said == LP_SAID_RECORD)) d->n[ci].claim = 1;   /* said as a claim, or as a claim's own record, by what holds it */
                 if (fresh && is_file) { d->n[pi].file = 1; files++; }
                 else if (fresh) lp_idmap_put(next, &h[j].entity, NULL);
             }
@@ -1849,6 +1840,9 @@ static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, i
     lp_idmap_free(front);
     *levels = level;
     return files;
+}
+static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, int *cut) {
+    return cw_walk_many(name,1,d,max_nodes,levels,cut);
 }
 
 static size_t cw_lines(const char *text, size_t upto) {
@@ -2329,7 +2323,6 @@ static void ce_file(CeCand *x, const char *kind, const lp_id *file) {
     x->total++;
     if (x->nfile < 4) x->file[x->nfile++] = *file;
 }
-typedef struct { size_t rec, claim; } CePair;
 static void on_code_callees(int c, const char *body) {
     char name[2048] = "", under[512] = "";
     jstr(body, "query", name, sizeof name);         /* "query", as code_where's: an MCP call's body names its tool "name" */
@@ -2398,72 +2391,26 @@ static void on_code_callees(int c, const char *body) {
         free(whole);
         free(path);
     }
-    /* which of them a code recipe declared, and in which files: name, its typed declaration claim, what says the claim (a
-     * file's record of claims, or the file itself, said as its one record), and the file that holds that record */
+    /* Resolve all candidate names together through the real containment tree.
+     * A file may sit above any number of content/record block levels. */
     size_t ncand = lp_idmap_count(cand);
     if (ncand) {
-        lp_vec(lp_vertex) vx = { 0 };
-        int nh = 0;
-        Hold *h = holds_any(lp_idmap_keys(cand), (int)ncand, &nh);
-        lp_idmap *claim = lp_idmap_new();
-        lp_vec(size_t) claim_c = { 0 };
-        lp_vec(char *) claim_k = { 0 };
-        for (int j = 0; j < nh; j++) {
-            CodeDeclaration declaration;
-            if (!code_declaration(rd, &h[j].entity, &declaration)) continue;
-            int64_t ci = lp_idmap_find(cand, &declaration.name);
-            if (ci < 0) continue;
-            bool fresh;
-            lp_idmap_put(claim, &h[j].entity, &fresh);
-            if (fresh) { lp_push(&claim_c, (size_t)ci); lp_push(&claim_k, reader_text(rd, &declaration.kind, 120)); }
-        }
-        holds_free(h, nh);
-        size_t nclaim = lp_idmap_count(claim);
-        lp_idmap *rec = lp_idmap_new();
-        lp_vec(CePair) pairs = { 0 };
-        if (nclaim) {
-            h = holds_any(lp_idmap_keys(claim), (int)nclaim, &nh);
-            for (int j = 0; j < nh; j++) {
-                size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
-                if (!nv) continue;
-                lp_vec_reserve(&vx, nv);
-                lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
-                for (size_t v = 0; v < nv; v++) {
-                    if (vx.v[v].said != LP_SAID_CLAIM && vx.v[v].said != LP_SAID_RECORD) continue;
-                    int64_t x = lp_idmap_find(claim, &vx.v[v].id);
-                    if (x < 0) continue;
-                    if (vx.v[0].said == LP_SAID_METADATA) ce_file(&cs.v[claim_c.v[x]], claim_k.v[x], &h[j].entity);
-                    else lp_push(&pairs, (CePair){ lp_idmap_put(rec, &h[j].entity, NULL), (size_t)x });
-                }
+        CwDag holders = {0}; int candidate_levels=0,candidate_cut=0;
+        cw_walk_many(lp_idmap_keys(cand),ncand,&holders,400000,&candidate_levels,&candidate_cut);
+        cut |= candidate_cut;
+        for (size_t i=0;i<holders.nn;i++) {
+            if (!holders.n[i].file) continue;
+            FoDecl *declarations=NULL; char *text=NULL; size_t length=0;
+            size_t count=fo_outline(pg,rd,&holders.n[i].id,&declarations,&text,&length);
+            for (size_t k=0;k<count;k++) {
+                lp_ref identifier, constituents[256]; size_t nconstituents=0;
+                if (!name_entity(declarations[k].name,&identifier,constituents,256,&nconstituents)) continue;
+                int64_t candidate=lp_idmap_find(cand,&identifier.id);
+                if (candidate>=0) ce_file(&cs.v[candidate],declarations[k].kind,&holders.n[i].id);
             }
-            holds_free(h, nh);
+            fo_free(declarations,count); free(text);
         }
-        size_t nrec = lp_idmap_count(rec);
-        if (nrec) {
-            h = holds_any(lp_idmap_keys(rec), (int)nrec, &nh);
-            for (int j = 0; j < nh; j++) {
-                size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
-                if (!nv) continue;
-                lp_vec_reserve(&vx, nv);
-                lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
-                if (vx.v[0].said != LP_SAID_METADATA) continue;
-                for (size_t v = 0; v < nv; v++) {
-                    if (vx.v[v].said != LP_SAID_RECORD) continue;
-                    int64_t r = lp_idmap_find(rec, &vx.v[v].id);
-                    if (r < 0) continue;
-                    for (size_t z = 0; z < pairs.n; z++)
-                        if (pairs.v[z].rec == (size_t)r) ce_file(&cs.v[claim_c.v[pairs.v[z].claim]], claim_k.v[pairs.v[z].claim], &h[j].entity);
-                }
-            }
-            holds_free(h, nh);
-        }
-        for (size_t z = 0; z < claim_k.n; z++) free(claim_k.v[z]);
-        lp_vec_free(&claim_k);
-        lp_vec_free(&claim_c);
-        lp_vec_free(&pairs);
-        lp_vec_free(&vx);
-        lp_idmap_free(claim);
-        lp_idmap_free(rec);
+        lp_idmap_free(holders.m); free(holders.n);
     }
     char *out = NULL;
     size_t on = 0, ocap = 0;
