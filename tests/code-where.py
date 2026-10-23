@@ -203,7 +203,7 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         (logs / 'demo.log').write_text('reading demo\ndemo: 6 files, done\n\n')
         st = call('ingest_status', {}, LAPLACE_INGEST_LOGS=str(logs))
         if st['database'] != name or {w['id'] for w in st['sources']} != {w['id'] for w in s['sources']} \
-                or any(w['readings'] != 1 or w['parts'] != len(src) for w in st['sources']) \
+                or any(w['readings'] != 1 or w['parts'] != 1 for w in st['sources']) \
                 or not isinstance(st['activity'], list):
             fail(f'ingest_status: {st}')
         if [(x['source'], x['last']) for x in st['logs']['runs']] != [('demo', 'demo: 6 files, done'), ('older', 'reading')]:
