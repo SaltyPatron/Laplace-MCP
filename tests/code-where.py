@@ -72,6 +72,15 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         if not {'code_where', 'code_callers', 'code_callees', 'sources', 'ingest_status', 'file_outline', 'recipe_plan'} <= tools:
             fail(f'tools/list: {sorted(tools)}')
 
+        # Product bytes are read from persisted content, without concatenating
+        # overlapping declaration/name/parameter captures into the source.
+        for filename, expected in src.items():
+            o = call('file_outline', {'path': 'proj/' + filename, 'include_text': True})
+            if len(o['files']) != 1 or o['files'][0].get('text') != expected:
+                fail(f'{filename}: persisted source differs: {o}')
+            if o['files'][0]['bytes'] != len(expected.encode('utf-8')):
+                fail(f'{filename}: persisted byte count differs: {o}')
+
         r = call('code_where', {'query': 'backoff_delay', 'occurrences': 4, 'context': 40})
         hits = {Path(h['path']).name: h for h in r['hits']}
         if set(hits) != {'retry.c', 'use.c'}:
