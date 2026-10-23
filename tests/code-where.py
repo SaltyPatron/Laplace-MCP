@@ -53,17 +53,20 @@ src = {
 }
 created = False
 with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
-    root = Path(tmp) / 'proj'
-    root.mkdir()
+    root = Path(tmp) / 'Laplace' / 'proj'
+    root.mkdir(parents=True)
     for f, text in src.items():
         (root / f).write_text(text)
-    env = dict(os.environ, LAPLACE_WORK=str(Path(tmp) / 'work'))
+    env = dict(os.environ, LAPLACE_WORK=str(Path(tmp) / 'work'),
+               LAPLACE_SRC=tmp, LAPLACE_INGEST_ONE='1')
     try:
         d = subprocess.run([engine, 'deploy', '-d', conninfo], env=env, capture_output=True, text=True, timeout=300)
         created = True
         if d.returncode:
             fail('deploy: ' + d.stdout[-2000:] + d.stderr[-2000:])
-        i = subprocess.run([engine, 'ingest', '-d', conninfo, '-j', '2', '-s', 'workspace-code'] + [str(root / f) for f in src], env=env,
+        # Admit the complete bounded workspace source. -s SOURCE FILE is an
+        # intentionally partial ingest and does not publish a source witness.
+        i = subprocess.run([engine, 'ingest', '-d', conninfo, '-j', '2', 'workspace-code'], env=env,
                            capture_output=True, text=True, timeout=300)
         if i.returncode:
             fail('ingest: ' + i.stdout[-3000:] + i.stderr[-2000:])
@@ -189,7 +192,7 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
             fail(f'an absent name: {r}')
 
         s = call('sources', {})
-        if s['database'] != name or not s['sources']:
+        if s['database'] != name or len(s['sources']) != 1 or s['sources'][0]['name'] != 'Laplace Workspace':
             fail(f'sources: {s}')
 
         # ingest_status: each witness with its parts and readings, the busy sessions, the engine's ingest logs
@@ -200,7 +203,7 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         (logs / 'demo.log').write_text('reading demo\ndemo: 6 files, done\n\n')
         st = call('ingest_status', {}, LAPLACE_INGEST_LOGS=str(logs))
         if st['database'] != name or {w['id'] for w in st['sources']} != {w['id'] for w in s['sources']} \
-                or any(w['readings'] != 1 or w['parts'] < 1 for w in st['sources']) \
+                or any(w['readings'] != 1 or w['parts'] != len(src) for w in st['sources']) \
                 or not isinstance(st['activity'], list):
             fail(f'ingest_status: {st}')
         if [(x['source'], x['last']) for x in st['logs']['runs']] != [('demo', 'demo: 6 files, done'), ('older', 'reading')]:
