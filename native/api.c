@@ -1888,7 +1888,7 @@ static int fo_hex(const char *s, lp_id *id) {
     return 1;
 }
 /* One entity's vertices, as laplace_paths gives its path. */
-static size_t fo_vertices(PGconn *pg, const lp_id *id, lp_vertex *out, size_t cap) {
+static size_t fo_vertices(PGconn *pg, const lp_id *id, lp_vertex **out, size_t *cap) {
     char h[33], arr[40];
     hex_id(id, h);
     snprintf(arr, sizeof arr, "{%s}", h);
@@ -1900,14 +1900,41 @@ static size_t fo_vertices(PGconn *pg, const lp_id *id, lp_vertex *out, size_t ca
         size_t hl = strlen(hx) / 2;
         uint8_t *b = malloc(hl + 1);
         for (size_t i = 0; i < hl; i++) { unsigned x; sscanf(hx + i * 2, "%2x", &x); b[i] = (uint8_t)x; }
-        n = lp_path_vertices(b, hl, out, cap);
-        if (n > cap) n = cap;
+        n = lp_path_vertices(b, hl, NULL, 0);
+        lp_reserve((void **)out, cap, n, sizeof **out);
+        lp_path_vertices(b, hl, *out, n);
         free(b);
     }
     PQclear(r);
     return n;
 }
 static int fo_word(char c) { return isalnum((unsigned char)c) || c == '_' || (unsigned char)c >= 0x80; }
+typedef struct { lp_id *v; size_t n, cap; } FoClaims;
+/* Content trunks may contain arbitrarily nested blocks of records. Follow
+ * their explicit roles, preserving source order; never descend text leaves. */
+static void fo_collect_claims(PGconn *pg, const lp_vertex *roots, size_t count, FoClaims *claims) {
+    typedef struct { lp_id id; uint32_t role; } Pending;
+    lp_vec(Pending) pending = {0};
+    lp_vertex *vertices=NULL; size_t capacity=0;
+    for (size_t i=count; i-- > 0;) {
+        Pending next = {roots[i].id, roots[i].said};
+        if (next.role==LP_SAID_CLAIM || next.role==LP_SAID_RECORD || next.role==LP_SAID_HOLDS) lp_push(&pending,next);
+    }
+    while (pending.n) {
+        Pending current = pending.v[--pending.n];
+        if (current.role==LP_SAID_CLAIM) { lp_push(claims,current.id); continue; }
+        size_t n=fo_vertices(pg,&current.id,&vertices,&capacity), marked=0;
+        for (size_t i=n; i-- > 0;) {
+            Pending next = {vertices[i].id,vertices[i].said};
+            if (next.role!=LP_SAID_CLAIM && next.role!=LP_SAID_RECORD && next.role!=LP_SAID_HOLDS) continue;
+            marked++;
+            for (uint32_t run=vertices[i].run ? vertices[i].run : 1; run; run--) lp_push(&pending,next);
+        }
+        if (!marked && current.role==LP_SAID_RECORD) lp_push(claims,current.id);
+    }
+    free(vertices);
+    lp_vec_free(&pending);
+}
 /* One file's outline: its recorded text (every part but the OS's record and what is said of the file) and the claims
  * [kind, name] said of it, in the file's order, each at the first line at or after the one before it where its name
  * stands as a word in that text (line 0: it does not). file_outline answers it; code_callers and code_callees read it. */
@@ -1929,21 +1956,21 @@ static void fo_free(FoDecl *d, size_t n) {
     free(d);
 }
 static size_t fo_outline(PGconn *pg, Reader *rd, const lp_id *file, FoDecl **declp, char **textp, size_t *tnp) {
-    static lp_vertex fv[4096], rv[4096];
-    size_t nv = fo_vertices(pg, file, fv, 4096);
+    lp_vertex *fv=NULL, *rv=NULL; size_t fcap=0, rcap=0;
+    size_t nv = fo_vertices(pg, file, &fv, &fcap);
     /* the recorded text: every part but the OS's record and what is said of the file */
     size_t tn = 0, tcap = 1 << 16;
     char *text = malloc(tcap);
     text[0] = 0;
-    lp_vec(lp_id) claims = { 0 };
+    FoClaims claims = { 0 };
+    fo_collect_claims(pg, fv, nv, &claims);
     for (size_t v = 0; v < nv; v++) {
         uint32_t sd = fv[v].said;
         if (sd == LP_SAID_METADATA) continue;
         if (sd == LP_SAID_RECORD || sd == LP_SAID_CLAIM) {
-            size_t nr = sd == LP_SAID_RECORD ? fo_vertices(pg, &fv[v].id, rv, 4096) : 0;
+            size_t nr = sd == LP_SAID_RECORD ? fo_vertices(pg, &fv[v].id, &rv, &rcap) : 0;
             int has = 0;
-            for (size_t k = 0; k < nr; k++) if (rv[k].said == LP_SAID_CLAIM) { has = 1; lp_push(&claims, rv[k].id); }
-            if (!has) lp_push(&claims, fv[v].id);      /* a claim said alone: its own record */
+            for (size_t k = 0; k < nr; k++) if (rv[k].said == LP_SAID_CLAIM) has = 1;
             if (!has || sd == LP_SAID_CLAIM) continue;
         }
         for (uint32_t k = 0; k < (fv[v].run ? fv[v].run : 1); k++) {
@@ -1975,6 +2002,7 @@ static size_t fo_outline(PGconn *pg, Reader *rd, const lp_id *file, FoDecl **dec
         if (found) { at = found - 1; line = fl; }
     }
     lp_vec_free(&claims);
+    free(fv); free(rv);
     *declp = dl;
     *textp = text;
     *tnp = tn;
