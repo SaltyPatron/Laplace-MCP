@@ -45,7 +45,8 @@ def call(p, path, data=None, token=None, scheme='Bearer'):
         with urllib.request.urlopen(req, timeout=10) as response:
             return response.status, json.load(response), response.headers
     except urllib.error.HTTPError as error:
-        return error.code, json.loads(error.read() or b'null'), error.headers
+        with error:
+            return error.code, json.loads(error.read() or b'null'), error.headers
 
 
 def serving(env):
@@ -55,13 +56,17 @@ def serving(env):
     for _ in range(200):
         if process.poll() is not None:
             log.seek(0)
-            raise RuntimeError('Service exited: ' + log.read())
+            detail = log.read()
+            log.close()
+            raise RuntimeError('Service exited: ' + detail)
         try:
             with socket.create_connection(('127.0.0.1', p), timeout=.1):
-                return process, p
+                return process, p, log
         except OSError:
             time.sleep(.05)
     process.kill()
+    process.wait()
+    log.close()
     raise RuntimeError('Service did not start')
 
 
@@ -86,7 +91,7 @@ with tempfile.TemporaryDirectory(prefix='lpm-serve-auth-') as d:
     ingest = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': 'ingest', 'arguments': {'input': 'x'}}}
     (d / 'token.env').write_text('# made once\nLAPLACE_MCP_TOKEN="' + TOKEN + '"\n')
     for env in (base_env(LAPLACE_MCP_TOKEN=TOKEN), base_env(LAPLACE_MCP_TOKEN_FILE=str(d / 'token.env'))):
-        process, p = serving(env)
+        process, p, log = serving(env)
         try:
             status, body, _ = call(p, '/health')
             assert (status, body) == (200, {'ok': True}), (status, body)
@@ -103,5 +108,9 @@ with tempfile.TemporaryDirectory(prefix='lpm-serve-auth-') as d:
             status, body, _ = call(p, '/mcp', {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}, TOKEN)
             assert status == 200 and any(t['name'] == 'ingest' for t in body['result']['tools']), (status, body)
         finally:
-            stop(process)
+            try:
+                stop(process)
+            finally:
+                log.close()
 print('lpm serve refuses to listen without a token and answers 401 to every unauthenticated route but GET /health')
+subprocess.run([sys.executable, str(Path(__file__).with_name('deployment-runtime.py')), str(binary)], check=True)

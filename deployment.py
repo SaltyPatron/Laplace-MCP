@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Package and exercise the modular MCP and Engine from a declared installation."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -12,6 +13,13 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+
+
+CONTROLLER = 'libexec/laplace-mcp-deployment.py'
+
+
+class PackageUpgradeRequired(ValueError):
+    """An older package lacks the code needed to operate its own protocol."""
 
 
 def run(args, **kwargs):
@@ -117,6 +125,9 @@ def package(config, output):
             run(['cmake', '--build', tree, '--parallel', config['build_jobs']], env=environment)
             run(['cmake', '--install', tree, '--prefix', stage], env=environment)
         import shutil
+        controller = stage / CONTROLLER
+        controller.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source / 'Laplace-MCP/deployment.py', controller)
         for directory in ('recipes', 'firmware'):
             shutil.copytree(source / 'Laplace-Engine' / directory, stage / 'share' / directory)
         dependencies = {}
@@ -158,6 +169,8 @@ def verify_package(release):
     for path, expected in receipt['host_dependencies'].items():
         if digest(path) != expected:
             raise ValueError('Installed dependency differs: ' + path)
+    if CONTROLLER not in receipt['files']:
+        raise PackageUpgradeRequired('Modular package lacks its deployment controller; rebuild a compatible release')
     return receipt
 
 
@@ -177,12 +190,12 @@ def service_token(config):
     return value
 
 
-def request(base, path, data=None, token=None):
+def request(base, path, data=None, token=None, timeout=30):
     headers = {'Content-Type': 'application/json'}
     if token:
         headers['Authorization'] = 'Bearer ' + token
     req = urllib.request.Request(base + path, data=None if data is None else json.dumps(data).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         if response.status != 200:
             raise ValueError('Unexpected service status: ' + str(response.status))
         return json.load(response)
@@ -192,7 +205,10 @@ def refused(base, path, data, token):
     try:
         request(base, path, data, token)
     except urllib.error.HTTPError as error:
-        return error.code == 401
+        try:
+            return error.code == 401
+        finally:
+            error.close()
     return False
 
 
@@ -230,36 +246,64 @@ def verify_http(base, token):
             'scope': 'Installed protocol, Engine operations and selected native/database readback; no ingestion or whole-product capability claim'}
 
 
-def probe(config, release):
-    verify_package(release)
-    environment = runtime_environment(config, release)
-    run([Path(release) / 'bin/lpm', 'check'], env=environment, cwd=config['state'])
-    # The candidate listens on a port of its own, with a token of its own.
+@contextmanager
+def candidate_listener(command, environment, work, timeout=10):
+    """Own one candidate process through authenticated verification and teardown."""
+    environment = dict(environment)
     token = secrets.token_hex(32)
     environment['LAPLACE_MCP_TOKEN'] = token
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
-    with tempfile.TemporaryFile(mode='w+') as log:
-        process = subprocess.Popen([str(Path(release) / 'bin/lpm'), 'serve', '127.0.0.1', str(port)],
-                                   env=environment, cwd=config['state'], stdout=log, stderr=log)
+    base = 'http://127.0.0.1:' + str(port)
+    with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='replace') as log:
+        process = subprocess.Popen([*[str(item) for item in command], 'serve', '127.0.0.1', str(port)],
+                                   env=environment, cwd=work, stdout=log, stderr=log)
+
+        def failure(message):
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 8192))
+            detail = log.read()
+            for value in (token, environment.get('LAPLACE_CONNINFO')):
+                if value:
+                    detail = detail.replace(value, '[redacted]')
+            return ValueError(f'{message} (exit={process.poll()}): ' + detail.strip())
+
         try:
-            for _ in range(100):
+            deadline = time.monotonic() + timeout
+            while True:
                 if process.poll() is not None:
-                    raise ValueError('Candidate service exited before accepting requests')
+                    raise failure('Candidate service exited before accepting requests')
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise failure('Candidate service startup timed out')
                 try:
-                    with socket.create_connection(('127.0.0.1', port), timeout=.2):
-                        break
-                except OSError:
-                    time.sleep(.1)
-            return verify_http('http://127.0.0.1:' + str(port), token)
+                    if request(base, '/health', timeout=min(.2, remaining)) != {'ok': True}:
+                        raise failure('Candidate service returned an invalid health response')
+                    break
+                except urllib.error.HTTPError as error:
+                    error.close()
+                    raise failure('Candidate service refused its health request') from None
+                except (urllib.error.URLError, TimeoutError, ConnectionError):
+                    time.sleep(min(.1, max(0, deadline - time.monotonic())))
+            yield base, token
         finally:
-            process.terminate()
+            if process.poll() is None:
+                process.terminate()
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+
+
+def probe(config, release):
+    verify_package(release)
+    environment = runtime_environment(config, release)
+    command = [Path(release) / 'bin/lpm']
+    run([*command, 'check'], env=environment, cwd=config['state'])
+    with candidate_listener(command, environment, config['state']) as (base, token):
+        return verify_http(base, token)
 
 
 def main():
