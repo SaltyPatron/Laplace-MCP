@@ -1725,6 +1725,7 @@ static const char *SURFACE =
     "{\"method\":\"POST\",\"path\":\"/v1/sources\",\"does\":\"the witnesses the database holds\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/ingest_status\",\"body\":\"{\\\"source\\\":\\\"optional\\\"}\",\"does\":\"each witness with its parts and readings, the database's busy sessions, the ingest logs\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/recipe_plan\",\"body\":\"{\\\"input\\\":\\\"optional source or path\\\"}\",\"does\":\"laplace ingest --plan\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/recipe_catalog\",\"body\":\"{}\",\"does\":\"all available sources, aliases, content locations, decomposers and prerequisites; no database or corpus required\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/hop\",\"body\":\"{\\\"input\\\":\\\"text\\\"}\",\"does\":\"laplace hop\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/text\",\"body\":\"{\\\"input\\\":\\\"32 hex\\\"}\",\"does\":\"laplace text\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/translate\",\"body\":\"{\\\"input\\\":\\\"word\\\",\\\"from\\\":\\\"en\\\",\\\"to\\\":\\\"fr\\\"}\",\"does\":\"laplace translate\"},"
@@ -1732,7 +1733,7 @@ static const char *SURFACE =
     "{\"method\":\"POST\",\"path\":\"/v1/degrees\",\"body\":\"{\\\"input\\\":\\\"text\\\",\\\"other\\\":\\\"text\\\"}\",\"does\":\"laplace degrees\"},"
     "{\"method\":\"GET\",\"path\":\"/v1/surface\"},"
     "{\"method\":\"GET\",\"path\":\"/health\"},"
-    "{\"method\":\"POST\",\"path\":\"/mcp\",\"body\":\"JSON-RPC 2.0 MCP or op: embeddings|rerank|code_search|reindex|code_where|code_callers|code_callees|sources|ingest_status|file_outline|recipe_plan|search|forward|shape|frechet|ingest|hop|text|translate|degrees|pull|surface\"}"
+    "{\"method\":\"POST\",\"path\":\"/mcp\",\"body\":\"JSON-RPC 2.0 MCP or op: embeddings|rerank|code_search|reindex|code_where|code_callers|code_callees|sources|ingest_status|file_outline|recipe_plan|recipe_catalog|search|forward|shape|frechet|ingest|hop|text|translate|degrees|pull|surface\"}"
     "],"
     "\"database_functions\":[\"laplace_containers\",\"laplace_claims\",\"laplace_claims_each\",\"laplace_text\",\"laplace_fills\",\"laplace_forward\",\"laplace_frechet4d\",\"laplace_dtw4d\",\"laplace_edr4d\",\"laplace_distance4d\",\"laplace_couple\",\"laplace_follows\",\"laplace_paths\",\"laplace_attested\",\"laplace_compose\",\"laplace_parts\"],"
     "\"engine_commands\":[\"tier0\",\"flags\",\"highway\",\"deploy\",\"sources\",\"ingest\",\"forget\",\"sweep\",\"index\",\"structure\",\"tree\",\"text\",\"pull\",\"turn\",\"hop\",\"translate\",\"degrees\",\"fills\",\"status\",\"bench\",\"model\"]}";
@@ -2114,6 +2115,12 @@ static void on_recipe_plan(int c, const char *body) {
     jstr(body, "input", what, sizeof what);
     if (what[0] && !plain_arg(what)) { http(c, 400, "{\"error\":\"input is a source name or a path\"}"); return; }
     char *av[] = { (char *)ENGINE, "ingest", "--plan", what[0] ? what : NULL, NULL };
+    on_engine(c, av);
+}
+
+static void on_recipe_catalog(int c, const char *body) {
+    (void)body;
+    char *av[] = { (char *)ENGINE, "ingest", "--catalog", NULL };
     on_engine(c, av);
 }
 
@@ -2689,6 +2696,7 @@ static const char *TOOLS =
     "{\"name\":\"sources\",\"description\":\"The sources the Laplace database holds: each witness ID, its name and trust.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"file_outline\",\"description\":\"What a file in the Laplace database declares: the typed declaration claims its code recipe said of it, in the file's order, each with the line where its name first stands after the one before. The file by the end of its pathname (path) or its ID (file, as code_where returns it).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"file\":{\"type\":\"string\"},\"include_text\":{\"type\":\"boolean\",\"description\":\"Include the source text reconstructed from persisted records.\"}},\"required\":[]}},"
     "{\"name\":\"recipe_plan\",\"description\":\"Which recipe reads what, as laplace ingest --plan answers it, without reading anything into the database: a source name or a path (input), else every source in order.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[]}},"
+    "{\"name\":\"recipe_catalog\",\"description\":\"Complete available ingestion sources, short aliases, content locations, recipes, file formats and prerequisites from the Engine; no database or corpus required.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"rerank\",\"description\":\"Deterministic Laplace reranker (drop-in replacement for neural cross-encoders). Scores candidate documents against a query using IDF-weighted constituent overlap and 4D discrete Frechet trajectory distance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"documents\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"top_n\":{\"type\":\"integer\"}},\"required\":[\"query\",\"documents\"]}},"
     "{\"name\":\"search\",\"description\":\"Name text on the client from tier 0, or take an ID the caller already holds. The trunk is read with holds_above, and so is every constituent whose tier is above a codepoint or a grapheme. A tier-0 constituent stays in the path, in its place, with its codepoint. fan, when sent, caps how many claims and occurrences are returned; omitted, all of them are.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"fan\":{\"type\":\"integer\"}},\"required\":[]}},"
@@ -2759,6 +2767,7 @@ static void mcp_rpc(int c, const char *body) {
         else if (!strcmp(name, "code_callees")) on_code_callees(c, body);
         else if (!strcmp(name, "ingest_status")) on_ingest_status(c, body);
         else if (!strcmp(name, "recipe_plan")) on_recipe_plan(c, body);
+        else if (!strcmp(name, "recipe_catalog")) on_recipe_catalog(c, body);
         else if (!strcmp(name, "rerank")) on_rerank(c, body);
         else if (!strcmp(name, "search")) on_search(c, body);
         else if (!strcmp(name, "embeddings")) on_embeddings(c, body);
@@ -2818,6 +2827,7 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
         else if (!strcmp(op, "code_callees")) path = "/v1/code_callees";
         else if (!strcmp(op, "ingest_status")) path = "/v1/ingest_status";
         else if (!strcmp(op, "recipe_plan")) path = "/v1/recipe_plan";
+        else if (!strcmp(op, "recipe_catalog")) path = "/v1/recipe_catalog";
         else if (!strcmp(op, "search")) path = "/v1/search";
         else if (!strcmp(op, "forward")) path = "/v1/forward";
         else if (!strcmp(op, "shape") || !strcmp(op, "frechet")) path = "/v1/shape";
@@ -2857,6 +2867,7 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
     else if (!strcmp(path, "/v1/code_callees")) on_code_callees(c, body);
     else if (!strcmp(path, "/v1/ingest_status")) on_ingest_status(c, body);
     else if (!strcmp(path, "/v1/recipe_plan")) on_recipe_plan(c, body);
+    else if (!strcmp(path, "/v1/recipe_catalog")) on_recipe_catalog(c, body);
     else if (!strcmp(path, "/v1/search")) on_search(c, body);
     else if (!strcmp(path, "/v1/forward")) on_by_parts(c, body, FORWARD_SQL, "forward");
     else if (!strcmp(path, "/v1/shape")) on_shape(c, body);
