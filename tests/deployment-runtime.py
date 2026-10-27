@@ -55,6 +55,49 @@ class Deployment(unittest.TestCase):
         with self.assertRaises(deployment.PackageUpgradeRequired):
             deployment.verify_package(self.release(controller=False))
 
+    def test_cache_retention_preserves_current_and_unowned_directories(self):
+        root = self.work / 'builds'
+        root.mkdir()
+        origin = self.work / 'source'
+        subprocess.run(['git', 'init', '--quiet', str(origin)], check=True)
+        (origin / 'source.txt').write_text('recorded source')
+        subprocess.run(['git', '-C', str(origin), 'add', 'source.txt'], check=True)
+        subprocess.run(['git', '-C', str(origin), '-c', 'user.name=Cache acceptance',
+                        '-c', 'user.email=cache@example.invalid', 'commit', '--quiet', '-m', 'Source'], check=True)
+        revision = subprocess.check_output(['git', '-C', str(origin), 'rev-parse', 'HEAD'], text=True).strip()
+        builds = []
+        for i in range(5):
+            path = root / format(i, '064x')
+            path.mkdir()
+            marker = path / 'build-cache.json'
+            marker.write_text(json.dumps({'schema': deployment.BUILD_CACHE_SCHEMA,
+                                          'identity': path.name, 'revisions': {'Laplace-MCP': revision}}))
+            subprocess.run(['git', 'clone', '--quiet', '--shared', str(origin),
+                            str(path / 'sources/Laplace-MCP')], check=True)
+            os.utime(marker, ns=(i + 1, i + 1))
+            builds.append(path)
+        unowned = root / ('f' * 64)
+        unowned.mkdir()
+        (unowned / 'source.txt').write_text('unowned work')
+        (builds[2] / 'sources/Laplace-MCP/source.txt').write_text('unfinished edit')
+        removed = deployment.prune_build_cache(root, builds[0])
+        self.assertEqual([builds[1].name], removed)
+        self.assertEqual({builds[0], builds[2], builds[3], builds[4], unowned}, set(root.iterdir()))
+
+    @unittest.skipIf(os.name == 'nt', 'Linux packaging lock and symlink boundaries')
+    def test_cache_lock_excludes_competing_builder_and_links(self):
+        root = self.work / 'builds'
+        with deployment.build_cache_lock(root):
+            self.assertEqual(0o660, (root / '.package.lock').stat().st_mode & 0o777)
+            with self.assertRaisesRegex(ValueError, 'Another modular package build'):
+                with deployment.build_cache_lock(root):
+                    self.fail('Competing build acquired cache')
+        link = self.work / 'linked-builds'
+        link.symlink_to(root, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'unlinked directory'):
+            with deployment.build_cache_lock(link):
+                self.fail('Followed linked cache')
+
     def test_actual_native_listener_authenticates_with_candidate_token(self):
         subprocess.run([str(BINARY), 'check'], env=self.environment, cwd=self.work,
                        check=True, capture_output=True, timeout=15)

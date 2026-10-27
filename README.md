@@ -10,6 +10,11 @@ this service with its matching Engine and recipes, then verifies the candidate b
 replacing the active release. Runtime database connections are supplied at launch;
 they are never embedded in the package. The commands below are for development.
 
+Packaging serializes access to its build cache and retains the current build plus
+the two most recent other builds. It removes only marked cache entries whose Git
+snapshots still match their recorded revisions and contain no edits. Modified
+snapshots and unrecognized directories remain available for reconciliation.
+
 ```
 . ../Laplace-Operations/laplace.env
 cmake -S . -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo

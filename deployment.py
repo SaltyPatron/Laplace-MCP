@@ -6,7 +6,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -16,6 +18,83 @@ import urllib.request
 
 
 CONTROLLER = 'libexec/laplace-mcp-deployment.py'
+BUILD_CACHE_SCHEMA = 'laplace.modular-build/v1'
+
+
+@contextmanager
+def build_cache_lock(root):
+    # Packaging is Linux-only. Keep the protocol helpers importable on Windows.
+    import fcntl
+    root = Path(root)
+    if not root.is_absolute() or root == Path('/') or any(p.is_symlink() for p in (root, *root.parents)):
+        raise ValueError('Build cache must be an absolute, unlinked directory')
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / '.package.lock'
+    if lock_path.is_symlink():
+        raise ValueError('Build cache lock must not be a link')
+    descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+    with os.fdopen(descriptor, 'a') as lock:
+        if os.fstat(lock.fileno()).st_uid == os.geteuid():
+            os.fchmod(lock.fileno(), 0o660)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError('Another modular package build owns ' + str(root)) from error
+        yield
+
+
+def prune_build_cache(root, current, keep=3):
+    """Under build_cache_lock, retain the current build and the newest other builds."""
+    root, current = Path(root), Path(current)
+    if (keep < 1 or not root.is_absolute() or root == Path('/')
+            or any(p.is_symlink() for p in (root, *root.parents))
+            or current.parent != root or not current.is_dir() or current.is_symlink()):
+        raise ValueError('Invalid build cache retention boundary')
+    candidates = []
+    for path in root.iterdir():
+        if path.is_symlink() or not path.is_dir() or not re.fullmatch(r'[0-9a-f]{64}', path.name):
+            continue
+        marker = path / 'build-cache.json'
+        if marker.is_symlink() or not marker.is_file():
+            continue
+        try:
+            receipt = json.loads(marker.read_text())
+        except (ValueError, OSError):
+            continue
+        if receipt.get('schema') == BUILD_CACHE_SCHEMA and receipt.get('identity') == path.name:
+            candidates.append((marker.stat().st_mtime_ns, path))
+    others = sorted((entry for entry in candidates if entry[1] != current), reverse=True)
+    removed = []
+    for _, path in others[max(0, keep - 1):]:
+        if path.resolve().parent != root.resolve():
+            raise ValueError('Build cache entry escaped its directory: ' + str(path))
+        receipt = json.loads((path / 'build-cache.json').read_text())
+        revisions = receipt.get('revisions')
+        if not isinstance(revisions, dict) or not revisions:
+            continue
+        clean = True
+        for repo, revision in revisions.items():
+            if not re.fullmatch(r'Laplace-[A-Za-z0-9_.-]+', repo):
+                clean = False
+                break
+            source = path / 'sources' / repo
+            if source.is_symlink() or not (source / '.git').is_dir():
+                clean = False
+                break
+            command = ['git', '--no-optional-locks', '-c', 'safe.directory=' + str(source), '-C', source]
+            try:
+                if (run([*command, 'rev-parse', 'HEAD'], capture_output=True).stdout.strip() != revision
+                        or run([*command, 'status', '--porcelain'], capture_output=True).stdout.strip()):
+                    clean = False
+                    break
+            except (OSError, subprocess.CalledProcessError):
+                clean = False
+                break
+        if not clean:
+            continue
+        shutil.rmtree(path)
+        removed.append(path.name)
+    return removed
 
 
 class PackageUpgradeRequired(ValueError):
@@ -81,6 +160,11 @@ def package(config, output):
     if os.geteuid() == 0:
         raise ValueError('Build and package as the declared deployment operator, never root')
     os.umask(0o002)
+    with build_cache_lock(config['build']):
+        _package(config, output)
+
+
+def _package(config, output):
     source, build, prefix = (Path(config[k]) for k in ('source', 'build', 'prefix'))
     revisions = {}
     for repo in ('Laplace-MCP', 'Laplace-Engine', 'Laplace-Native', 'Laplace-Operations'):
@@ -90,6 +174,8 @@ def package(config, output):
         revisions[repo] = run(['git', '-C', checkout, 'rev-parse', 'HEAD'], capture_output=True).stdout.strip()
     build_identity = hashlib.sha256(json.dumps({'source': str(source.resolve()), 'builder': os.geteuid(), 'revisions': revisions}, sort_keys=True).encode()).hexdigest()
     build = build / build_identity
+    atomic_json(build / 'build-cache.json', {'schema': BUILD_CACHE_SCHEMA, 'identity': build_identity,
+                                           'revisions': revisions})
     # Build exact Git trees. Untracked developer files and the old in-source
     # serving binaries stay untouched and cannot enter the installed package.
     snapshot = build / 'sources'
@@ -124,7 +210,6 @@ def package(config, output):
                  '-DLAPLACE_CONNINFO='], env=environment)
             run(['cmake', '--build', tree, '--parallel', config['build_jobs']], env=environment)
             run(['cmake', '--install', tree, '--prefix', stage], env=environment)
-        import shutil
         controller = stage / CONTROLLER
         controller.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / 'Laplace-MCP/deployment.py', controller)
@@ -152,6 +237,9 @@ def package(config, output):
             atomic_json(stage / 'package.json', receipt)
             stage.rename(release)
         atomic_json(output, {'release': str(release), 'package_id': identity, 'revisions': revisions})
+    removed = prune_build_cache(build.parent, build)
+    if removed:
+        print('Removed ' + str(len(removed)) + ' expired modular build caches', flush=True)
 
 
 def verify_package(release):
