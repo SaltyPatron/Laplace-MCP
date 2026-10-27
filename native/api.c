@@ -1255,10 +1255,16 @@ static int env_weight(const char *name, double *w) {
 
 /* Query-side vocabulary bridging through the substrate (#19). Each word of the query goes up to its concepts and back
  * down in the same language, as `laplace translate WORD en en` reads it: along the relations the engine's firmware
- * names for translate (a word's sense, the sense's synset, the synset's interlingual concept), its first concepts in
- * the witness's order (`-n`, LAPLACE_CODE_BRIDGE_CONCEPTS, default 2). The words reached are added to the text the
- * lexical retrieval and the Laplace rerank read; the embeddings are asked the query as written. Nothing here names a
- * word: what bridges is what the database's wordnets attest. A word the database has no concept of brings nothing. */
+ * names for translate (a word's sense, the sense's synset, the synset's interlingual concept). translate orders a
+ * word's concepts by observed usages, then the witness's order (Laplace-Wiki Sequence/Web.md 15.6), and says of each
+ * concept a usage count states how often it was observed ("observed N times", WordNet's cntlist: the senses tagged in
+ * the semantic concordance). The sense a query means is the sense its word is used in: the bridge takes the words of
+ * the most observed concepts only (LAPLACE_CODE_BRIDGE_CONCEPTS, default 1), of the first LAPLACE_CODE_BRIDGE_CONSIDER
+ * (default 4) translate gives, and nothing of a concept no usage was observed of. A word's first concepts in the
+ * witness's order are not its common sense (game: lame, before contest), and the bridge that took them diluted the
+ * query (the lexical eval on #19). The words reached are added to the text the lexical retrieval and the Laplace rerank
+ * read; the embeddings are asked the query as written. Nothing here names a word: what bridges is what the database's
+ * wordnets and usage counts attest. A word the database has no observed concept of brings nothing. */
 typedef struct { char *text; size_t n, cap; } Bridge;
 static int bridge_word_ok(const char *w) {
     size_t l = strlen(w);
@@ -1276,10 +1282,12 @@ static int bridge_has(const char *list, const char *w) {     /* list: "\na\nb\n"
  * of each query word to the words it reached. */
 static char *bridge_query(const char *query, char *info, size_t icap, double *ms) {
     uint64_t t0 = nsec();
-    const char *lang = getenv("LAPLACE_CODE_BRIDGE_LANGUAGE"), *nc = getenv("LAPLACE_CODE_BRIDGE_CONCEPTS");
+    const char *lang = getenv("LAPLACE_CODE_BRIDGE_LANGUAGE"), *nc = getenv("LAPLACE_CODE_BRIDGE_CONCEPTS"),
+               *nk = getenv("LAPLACE_CODE_BRIDGE_CONSIDER");
     if (!lang || !*lang) lang = "en";
+    int take = nc && atoi(nc) > 0 && atoi(nc) < 100 ? atoi(nc) : 1;
     char concepts[8];
-    snprintf(concepts, sizeof concepts, "%d", nc && atoi(nc) > 0 && atoi(nc) < 100 ? atoi(nc) : 2);
+    snprintf(concepts, sizeof concepts, "%d", nk && atoi(nk) > 0 && atoi(nk) < 100 ? atoi(nk) : 4);
     size_t ql = strlen(query);
     char *out = malloc(ql + 8192), *seen = malloc(ql + 8192);
     if (!out || !seen) { free(out); free(seen); *ms = 0; snprintf(info, icap, "{}"); return NULL; }
@@ -1304,16 +1312,23 @@ static char *bridge_query(const char *query, char *info, size_t icap, double *ms
         char *log = NULL;
         int code = 0;
         if (!engine_run(av, &log, &code, 20) || code != 0) { free(log); continue; }
-        int listed = 0;
+        int listed = 0, taken = 0, in_taken = 0;
         char wj[2048];
         size_t wn = 0;
         wj[0] = 0;
         for (char *line = log; line && *line;) {
             char *nl = strchr(line, '\n');
             if (nl) *nl = 0;
+            /* a concept: "  RATING \xC2\xB1 DEV  TEXT", and "   observed N times" when a usage count states it */
+            if (strstr(line, " \xC2\xB1 ")) {
+                const char *ob = strstr(line, "   observed ");
+                long long n = ob ? atoll(ob + 12) : 0;
+                in_taken = n > 0 && taken < take;
+                if (in_taken) taken++;
+            }
             /* a concept's words in a language: four spaces, the language, then "a, b, c" */
             size_t ll = strlen(lang);
-            if (!strncmp(line, "    ", 4) && !strncmp(line + 4, lang, ll) && line[4 + ll] == ' ' && !strstr(line, "(nothing attested)")) {
+            if (in_taken && !strncmp(line, "    ", 4) && !strncmp(line + 4, lang, ll) && line[4 + ll] == ' ' && !strstr(line, "(nothing attested)")) {
                 char *q = line + 4 + ll;
                 while (*q) {
                     while (*q == ' ' || *q == ',') q++;
