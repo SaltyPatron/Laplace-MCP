@@ -1255,11 +1255,25 @@ static int env_weight(const char *name, double *w) {
 
 /* Query-side vocabulary bridging through the substrate (#19). Each word of the query goes up to its concepts and back
  * down in the same language, as `laplace translate WORD en en` reads it: along the relations the engine's firmware
- * names for translate (a word's sense, the sense's synset, the synset's interlingual concept), its first concepts in
- * the witness's order (`-n`, LAPLACE_CODE_BRIDGE_CONCEPTS, default 2). The words reached are added to the text the
- * lexical retrieval and the Laplace rerank read; the embeddings are asked the query as written. Nothing here names a
- * word: what bridges is what the database's wordnets attest. A word the database has no concept of brings nothing. */
-typedef struct { char *text; size_t n, cap; } Bridge;
+ * names for translate (a word's sense, the sense's synset, the synset's interlingual concept). translate orders a
+ * word's concepts by observed usages, then the witness's order (Laplace-Wiki Sequence/Web.md 15.6: "ordered by observed
+ * usages, then the witness's sense order, then standing"), and says of each concept a usage count states how often it
+ * was observed ("observed N times", WordNet's cntlist: the senses tagged in the semantic concordance).
+ * The sense a query means is chosen, and only its words bridge (LAPLACE_CODE_BRIDGE_CONCEPTS senses, default 1, of the
+ * first LAPLACE_CODE_BRIDGE_CONSIDER translate gives, default 4). Each sense scores as Laplace-Wiki's word sense
+ * disambiguation does (Research/Semantics-Experiments.md: "each candidate sense as its prior, the attested sense
+ * frequency, plus the pull of the sentence's other words through WordNet's connecting nodes (... definition words,
+ * synset members ...)"): its prior is its share of the observed usages of the senses considered; its pull is LAPLACE_CODE_BRIDGE_PULL
+ * (default 0.5) for each of the query's other words, those the database's wordnets attest a concept of, that its text
+ * (its definition) or its words share. The sense of the highest score is the one the query is about; a sense that was
+ * never observed and shares no word with the query brings nothing.
+ * A word's first concepts in the witness's order are not its common sense (game: lame, before contest), and the bridge
+ * that took them diluted the query (the lexical eval on #19). The words reached are added to the text the lexical
+ * retrieval and the Laplace rerank read; the embeddings are asked the query as written. Nothing here names a word: what
+ * bridges is what the database's wordnets and usage counts attest. A word the database has no concept of brings
+ * nothing. */
+typedef struct { long long observed; int order, context; double score; char text[768]; char words[8][64]; int nw; } BridgeSense;
+typedef struct { char w[48], stem[48]; BridgeSense s[16]; int ns; } BridgeWord;
 static int bridge_word_ok(const char *w) {
     size_t l = strlen(w);
     if (l < 2 || l > 48) return 0;
@@ -1268,84 +1282,184 @@ static int bridge_word_ok(const char *w) {
     return 1;
 }
 static int bridge_has(const char *list, const char *w) {     /* list: "\na\nb\n" */
-    char k[64];
+    char k[80];
     snprintf(k, sizeof k, "\n%s\n", w);
     return strstr(list, k) != NULL;
 }
-/* Returns the bridged text (query, then the words reached), or NULL when nothing was reached; info gets a JSON object
- * of each query word to the words it reached. */
-static char *bridge_query(const char *query, char *info, size_t icap, double *ms) {
-    uint64_t t0 = nsec();
-    const char *lang = getenv("LAPLACE_CODE_BRIDGE_LANGUAGE"), *nc = getenv("LAPLACE_CODE_BRIDGE_CONCEPTS");
-    if (!lang || !*lang) lang = "en";
-    char concepts[8];
-    snprintf(concepts, sizeof concepts, "%d", nc && atoi(nc) > 0 && atoi(nc) < 100 ? atoi(nc) : 2);
-    size_t ql = strlen(query);
-    char *out = malloc(ql + 8192), *seen = malloc(ql + 8192);
-    if (!out || !seen) { free(out); free(seen); *ms = 0; snprintf(info, icap, "{}"); return NULL; }
-    size_t on = (size_t)snprintf(out, ql + 8192, "%s", query), ocap = ql + 8192, in = 0;
-    strcpy(seen, "\n");
-    in += (size_t)snprintf(info + in, icap - in, "{");
-    int words = 0, added = 0, first = 1;
-    for (const char *p = query; *p && words < 16;) {
+/* a word as the overlap compares it: lower case, a plural's s off (games and game meet) */
+static void bridge_stem(const char *s, size_t l, char *o, size_t cap) {
+    if (l > 3 && (s[l - 1] == 's' || s[l - 1] == 'S')) l--;
+    if (l >= cap) l = cap - 1;
+    for (size_t i = 0; i < l; i++) o[i] = (char)tolower((unsigned char)s[i]);
+    o[l] = 0;
+}
+/* the words of a text, each as "\nstem\n" */
+static void bridge_tokens(const char *t, char *out, size_t cap) {
+    size_t n = 0;
+    if (cap < 2) return;
+    out[n++] = '\n'; out[n] = 0;
+    for (const char *p = t; *p;) {
         while (*p && !isalpha((unsigned char)*p)) p++;
         const char *s = p;
         while (*p && isalpha((unsigned char)*p)) p++;
         size_t l = (size_t)(p - s);
         if (l < 3 || l > 40) continue;
-        char w[48];
-        for (size_t i = 0; i < l; i++) w[i] = (char)tolower((unsigned char)s[i]);
-        w[l] = 0;
-        if (bridge_has(seen, w)) continue;
-        size_t sl = strlen(seen);
-        snprintf(seen + sl, ql + 8192 - sl, "%s\n", w);
-        words++;
-        char *av[] = { (char *)ENGINE, "translate", "-n", concepts, w, (char *)lang, (char *)lang, NULL };
-        char *log = NULL;
-        int code = 0;
-        if (!engine_run(av, &log, &code, 20) || code != 0) { free(log); continue; }
-        int listed = 0;
-        char wj[2048];
-        size_t wn = 0;
-        wj[0] = 0;
-        for (char *line = log; line && *line;) {
-            char *nl = strchr(line, '\n');
-            if (nl) *nl = 0;
-            /* a concept's words in a language: four spaces, the language, then "a, b, c" */
-            size_t ll = strlen(lang);
-            if (!strncmp(line, "    ", 4) && !strncmp(line + 4, lang, ll) && line[4 + ll] == ' ' && !strstr(line, "(nothing attested)")) {
-                char *q = line + 4 + ll;
-                while (*q) {
+        char st[48];
+        bridge_stem(s, l, st, sizeof st);
+        size_t sl = strlen(st);
+        if (n + sl + 2 >= cap) break;
+        memcpy(out + n, st, sl); n += sl; out[n++] = '\n'; out[n] = 0;
+    }
+}
+/* translate's answer, as the engine prints it: each concept "  RATING ± DEV  TEXT" ("   observed N times" when a usage
+ * count states it), its definition on the lines indented under it, then four spaces, a language and its words "a, b" */
+static int bridge_parse(char *log, const char *lang, BridgeSense *s, int max) {
+    int n = 0; BridgeSense *cur = NULL; size_t ll = strlen(lang);
+    for (char *line = log; line && *line;) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char *pm = strstr(line, " \xC2\xB1 ");
+        if (pm && !strncmp(line, "  ", 2)) {
+            cur = n < max ? &s[n++] : NULL;
+            if (cur) {
+                memset(cur, 0, sizeof *cur);
+                cur->order = n - 1;
+                const char *ob = strstr(line, "   observed ");
+                cur->observed = ob ? atoll(ob + 12) : 0;
+                char *t = pm + 4;
+                while (*t == ' ') t++;
+                while (*t && *t != ' ') t++;
+                while (*t == ' ') t++;
+                size_t tl = ob && ob > t ? (size_t)(ob - t) : strlen(t);
+                if (tl >= sizeof cur->text) tl = sizeof cur->text - 1;
+                memcpy(cur->text, t, tl); cur->text[tl] = 0;
+            }
+        } else if (cur && !strncmp(line, "    ", 4) && !strncmp(line + 4, lang, ll) && line[4 + ll] == ' ') {
+            if (!strstr(line, "(nothing attested)"))
+                for (char *q = line + 4 + ll; *q;) {
                     while (*q == ' ' || *q == ',') q++;
                     char *e = q;
                     while (*e && *e != ',') e++;
-                    char syn[64];
                     size_t yl = (size_t)(e - q);
                     while (yl && q[yl - 1] == ' ') yl--;
-                    if (yl && yl < sizeof syn) {
-                        for (size_t i = 0; i < yl; i++) syn[i] = (char)tolower((unsigned char)q[i]);
-                        syn[yl] = 0;
-                        if (bridge_word_ok(syn) && !bridge_has(seen, syn) && listed < 8) {
-                            size_t sl2 = strlen(seen);
-                            if (sl2 + yl + 2 < ql + 8192) snprintf(seen + sl2, ql + 8192 - sl2, "%s\n", syn);
-                            if (on + yl + 2 < ocap) on += (size_t)snprintf(out + on, ocap - on, " %s", syn);
-                            char se[160];
-                            json_esc(syn, se, sizeof se);
-                            if (wn + strlen(se) + 4 < sizeof wj) wn += (size_t)snprintf(wj + wn, sizeof wj - wn, "%s\"%s\"", listed ? "," : "", se);
-                            listed++;
-                            added++;
-                        }
+                    if (yl && yl < 64 && cur->nw < 8) {
+                        char *d = cur->words[cur->nw];
+                        for (size_t i = 0; i < yl; i++) d[i] = (char)tolower((unsigned char)q[i]);
+                        d[yl] = 0;
+                        if (bridge_word_ok(d)) cur->nw++;
                     }
                     q = *e ? e + 1 : e;
                 }
-            }
-            line = nl ? nl + 1 : NULL;
+        } else if (cur && !strncmp(line, "            ", 12)) {             /* the concept's definition */
+            size_t tl = strlen(cur->text);
+            const char *t = line + 12;
+            while (*t == ' ') t++;
+            if (*t && tl + 2 < sizeof cur->text) snprintf(cur->text + tl, sizeof cur->text - tl, " %s", t);
         }
-        if (listed && in + wn + 64 < icap) { in += (size_t)snprintf(info + in, icap - in, "%s\"%s\":[%s]", first ? "" : ",", w, wj); first = 0; }
+        line = nl ? nl + 1 : NULL;
+    }
+    return n;
+}
+static int bridge_rank(const void *a, const void *b) {
+    const BridgeSense *x = a, *y = b;
+    if (x->score != y->score) return y->score > x->score ? 1 : -1;
+    return x->order - y->order;
+}
+/* Returns the bridged text (query, then the words reached), or NULL when nothing was reached; info gets a JSON object
+ * of each query word to the words it reached, senses one of each query word to the sense chosen and why. */
+static char *bridge_query(const char *query, char *info, size_t icap, char *senses, size_t scap, double *ms) {
+    uint64_t t0 = nsec();
+    const char *lang = getenv("LAPLACE_CODE_BRIDGE_LANGUAGE"), *nc = getenv("LAPLACE_CODE_BRIDGE_CONCEPTS"),
+               *nk = getenv("LAPLACE_CODE_BRIDGE_CONSIDER");
+    if (!lang || !*lang) lang = "en";
+    int take = nc && atoi(nc) > 0 && atoi(nc) < 100 ? atoi(nc) : 1;
+    double pull = 0.5;
+    if (!env_weight("LAPLACE_CODE_BRIDGE_PULL", &pull)) pull = 0.5;
+    char concepts[8];
+    snprintf(concepts, sizeof concepts, "%d", nk && atoi(nk) > 0 && atoi(nk) <= 16 ? atoi(nk) : 4);
+    snprintf(info, icap, "{}"); snprintf(senses, scap, "{}");
+    size_t ql = strlen(query);
+    BridgeWord *bw = calloc(16, sizeof *bw);
+    char *out = malloc(ql + 8192), *seen = malloc(ql + 8192);
+    if (!out || !seen || !bw) { free(out); free(seen); free(bw); *ms = 0; return NULL; }
+    strcpy(seen, "\n");
+    /* up and down: each word of the query, its concepts as translate gives them */
+    int nwd = 0;
+    for (const char *p = query; *p && nwd < 16;) {
+        while (*p && !isalpha((unsigned char)*p)) p++;
+        const char *s = p;
+        while (*p && isalpha((unsigned char)*p)) p++;
+        size_t l = (size_t)(p - s);
+        if (l < 3 || l > 40) continue;
+        BridgeWord *x = &bw[nwd];
+        for (size_t i = 0; i < l; i++) x->w[i] = (char)tolower((unsigned char)s[i]);
+        x->w[l] = 0;
+        if (bridge_has(seen, x->w)) continue;
+        size_t sl = strlen(seen);
+        snprintf(seen + sl, ql + 8192 - sl, "%s\n", x->w);
+        bridge_stem(x->w, l, x->stem, sizeof x->stem);
+        char *av[] = { (char *)ENGINE, "translate", "-n", concepts, x->w, (char *)lang, (char *)lang, NULL };
+        char *log = NULL;
+        int code = 0;
+        if (engine_run(av, &log, &code, 20) && code == 0 && log) x->ns = bridge_parse(log, lang, x->s, 16);
         free(log);
+        nwd++;
+    }
+    /* the sense each word is used in: the query's other words it shares (those a concept is attested of), then usage */
+    size_t on = (size_t)snprintf(out, ql + 8192, "%s", query), ocap = ql + 8192, in = 0, sn = 0;
+    in += (size_t)snprintf(info + in, icap - in, "{");
+    sn += (size_t)snprintf(senses + sn, scap - sn, "{");
+    int added = 0, first = 1;
+    char *tok = malloc(8192);
+    for (int i = 0; i < nwd && tok; i++) {
+        BridgeWord *x = &bw[i];
+        if (!x->ns) continue;
+        long long total = 0;
+        for (int k = 0; k < x->ns; k++) total += x->s[k].observed > 0 ? x->s[k].observed : 0;
+        for (int k = 0; k < x->ns; k++) {
+            BridgeSense *c = &x->s[k];
+            char all[1400];
+            size_t al = (size_t)snprintf(all, sizeof all, "%s", c->text);
+            for (int m = 0; m < c->nw && al < sizeof all; m++) al += (size_t)snprintf(all + al, sizeof all - al, " %s", c->words[m]);
+            bridge_tokens(all, tok, 8192);
+            for (int j = 0; j < nwd; j++)
+                if (j != i && bw[j].ns && strcmp(bw[j].stem, x->stem) && bridge_has(tok, bw[j].stem)) c->context++;
+            c->score = (total > 0 && c->observed > 0 ? (double)c->observed / (double)total : 0.0) + pull * c->context;
+        }
+        qsort(x->s, (size_t)x->ns, sizeof x->s[0], bridge_rank);
+        char wj[2048], sj[2048];
+        size_t wn = 0, sjn = 0;
+        int listed = 0, chosen = 0;
+        wj[0] = sj[0] = 0;
+        for (int k = 0; k < x->ns && chosen < take; k++) {
+            BridgeSense *c = &x->s[k];
+            if (c->score <= 0) break;
+            chosen++;
+            char te[1600];
+            json_esc(c->text, te, sizeof te);
+            if (sjn + strlen(te) + 96 < sizeof sj)
+                sjn += (size_t)snprintf(sj + sjn, sizeof sj - sjn, "%s{\"sense\":\"%s\",\"observed\":%lld,\"shared\":%d,\"score\":%.3f}",
+                                        chosen > 1 ? "," : "", te, c->observed, c->context, c->score);
+            for (int m = 0; m < c->nw; m++) {
+                const char *syn = c->words[m];
+                size_t yl = strlen(syn);
+                if (bridge_has(seen, syn) || listed >= 8) continue;
+                size_t sl2 = strlen(seen);
+                if (sl2 + yl + 2 < ql + 8192) snprintf(seen + sl2, ql + 8192 - sl2, "%s\n", syn);
+                if (on + yl + 2 < ocap) on += (size_t)snprintf(out + on, ocap - on, " %s", syn);
+                char se[160];
+                json_esc(syn, se, sizeof se);
+                if (wn + strlen(se) + 4 < sizeof wj) wn += (size_t)snprintf(wj + wn, sizeof wj - wn, "%s\"%s\"", listed ? "," : "", se);
+                listed++;
+                added++;
+            }
+        }
+        if (chosen && sn + sjn + 64 < scap) sn += (size_t)snprintf(senses + sn, scap - sn, "%s\"%s\":[%s]", sn > 1 ? "," : "", x->w, sj);
+        if (listed && in + wn + 64 < icap) { in += (size_t)snprintf(info + in, icap - in, "%s\"%s\":[%s]", first ? "" : ",", x->w, wj); first = 0; }
     }
     snprintf(info + in, icap - in, "}");
-    free(seen);
+    snprintf(senses + sn, scap - sn, "}");
+    free(tok); free(seen); free(bw);
     *ms = (double)(nsec() - t0) / 1e6;
     if (!added) { free(out); return NULL; }
     return out;
@@ -1428,9 +1542,9 @@ static void on_code_search(int c, const char *body) {
     /* bridge (LAPLACE_CODE_BRIDGE): the query's words joined by what the database's wordnets attest of them */
     const char *be = getenv("LAPLACE_CODE_BRIDGE");
     int bridge = jbool(body, "bridge", be && *be && strcmp(be, "0"));
-    char binfo[8192] = "{}";
+    char binfo[8192] = "{}", bsenses[16384] = "{}";
     double bridge_ms = 0;
-    char *bridged = bridge ? bridge_query(query, binfo, sizeof binfo, &bridge_ms) : NULL;
+    char *bridged = bridge ? bridge_query(query, binfo, sizeof binfo, bsenses, sizeof bsenses, &bridge_ms) : NULL;
     const char *rq = bridged ? bridged : query;
 
     size_t want = semantic ? (size_t)limit * 3 : (size_t)limit;
@@ -1556,7 +1670,7 @@ static void on_code_search(int c, const char *body) {
         buf_fmt(&out, &un, &ucap, ",\"%s\":%g", cn, coll_prose[ci] ? w_prose : 1.0);
     }
     buf_add(&out, &un, &ucap, "}", 1);
-    if (bridge) buf_fmt(&out, &un, &ucap, ",\"bridge\":{\"words\":%s,\"ms\":%.3f}", binfo, bridge_ms);
+    if (bridge) buf_fmt(&out, &un, &ucap, ",\"bridge\":{\"words\":%s,\"senses\":%s,\"ms\":%.3f}", binfo, bsenses, bridge_ms);
     free(bridged);
     buf_fmt(&out, &un, &ucap, ",\"candidates\":{\"lexical\":%zu,\"semantic\":%zu,\"union\":%zu},\"hits\":[", nh, ns, nc);
     for (size_t i = 0; i < shown; i++) {
