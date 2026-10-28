@@ -36,6 +36,7 @@ jobs:
           L=$LAPLACE_BUILD/Laplace-MCP/icx-release/lpm
           [ -s "$LAPLACE_TIER0" ] || { echo "Required tier 0 is missing at $LAPLACE_TIER0; install prepared inputs before verification"; exit 1; }
           "$L" check
+          python3 Laplace-MCP/tests/deployment-runtime.py "$L"
           "$L" text 'Sherlock Holmes'
           python3 Laplace-MCP/tests/text-floor.py "$L"
           python3 Laplace-MCP/tests/engine-output.py "$L" "$LAPLACE_BUILD/Laplace-MCP/engine/laplace"

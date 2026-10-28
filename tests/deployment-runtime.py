@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -97,6 +98,25 @@ class Deployment(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unlinked directory'):
             with deployment.build_cache_lock(link):
                 self.fail('Followed linked cache')
+
+    @unittest.skipIf(os.name == 'nt', 'Linux package lifetime lock')
+    def test_packaged_client_pins_its_real_release_until_it_exits(self):
+        import fcntl
+        stage = self.work / 'release'
+        (stage / 'bin').mkdir(parents=True)
+        for name in ('lpm', 'laplace'):
+            shutil.copyfile(BINARY, stage / 'bin' / name)
+            (stage / 'bin' / name).chmod(0o755)
+        deployment.runtime_launchers(stage)
+        alias = self.work / 'current'
+        alias.symlink_to(stage, target_is_directory=True)
+        with deployment.candidate_listener([alias / 'bin/lpm'], self.environment, self.work) as (base, token):
+            self.assertEqual({'ok': True}, deployment.request(base, '/health'))
+            with (stage / '.runtime-lease').open() as lease:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with (stage / '.runtime-lease').open() as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_actual_native_listener_authenticates_with_candidate_token(self):
         subprocess.run([str(BINARY), 'check'], env=self.environment, cwd=self.work,

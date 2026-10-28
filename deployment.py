@@ -156,15 +156,34 @@ def runtime_environment(config, release):
     }
 
 
-def package(config, output):
+def runtime_launchers(stage):
+    """Pin this immutable closure for the entire lifetime of each native client."""
+    (stage / '.runtime-lease').touch()
+    (stage / '.runtime-lease').chmod(0o444)
+    (stage / 'libexec').mkdir(exist_ok=True)
+    for name in ('laplace', 'lpm'):
+        program = stage / 'bin' / name
+        program.rename(stage / 'libexec' / name)
+        program.write_text('''#!/bin/sh
+set -eu
+root=$(dirname "$(dirname "$(readlink -f "$0")")")
+exec 9<"$root/.runtime-lease"
+flock --shared 9
+export LAPLACE_ENGINE="$root/bin/laplace" LAPLACE_RECIPES="$root/share/recipes"
+exec "$root/libexec/''' + name + '''" "$@"
+''')
+        program.chmod(0o755)
+
+
+def package(config, output, clean_build=False):
     if os.geteuid() == 0:
         raise ValueError('Build and package as the declared deployment operator, never root')
     os.umask(0o002)
     with build_cache_lock(config['build']):
-        _package(config, output)
+        _package(config, output, clean_build)
 
 
-def _package(config, output):
+def _package(config, output, clean_build=False):
     source, build, prefix = (Path(config[k]) for k in ('source', 'build', 'prefix'))
     revisions = {}
     for repo in ('Laplace-MCP', 'Laplace-Engine', 'Laplace-Native', 'Laplace-Operations'):
@@ -208,7 +227,8 @@ def _package(config, output):
                  '-DCMAKE_C_COMPILER=icx', '-DCMAKE_CXX_COMPILER=icpx',
                  '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DCMAKE_INSTALL_LIBDIR=lib',
                  '-DLAPLACE_CONNINFO='], env=environment)
-            run(['cmake', '--build', tree, '--parallel', config['build_jobs']], env=environment)
+            run(['cmake', '--build', tree, '--parallel', config['build_jobs'],
+                 *(['--clean-first'] if clean_build else [])], env=environment)
             run(['cmake', '--install', tree, '--prefix', stage], env=environment)
         controller = stage / CONTROLLER
         controller.parent.mkdir(parents=True, exist_ok=True)
@@ -226,9 +246,10 @@ def _package(config, output):
                     dependency = Path(fields[2]).resolve()
                     if not dependency.is_relative_to(stage):
                         dependencies[fields[2]] = digest(dependency)
+        runtime_launchers(stage)
         files = {str(p.relative_to(stage)): digest(p) for p in sorted(stage.rglob('*')) if p.is_file()}
         receipt = {'schema': 'laplace.modular-package/v1', 'revisions': revisions,
-                   'files': files, 'host_dependencies': dependencies}
+                   'files': files, 'host_dependencies': dependencies, 'runtime_lease': 'flock-v1'}
         identity = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
         release = release_root / identity
         if release.exists():
@@ -400,10 +421,11 @@ def main():
     parser.add_argument('--config', required=True)
     parser.add_argument('--release')
     parser.add_argument('--output', required=True)
+    parser.add_argument('--clean-build', action='store_true', help='Recompile native targets before packaging')
     args = parser.parse_args()
     config = load(args.config)
     if args.operation == 'package':
-        package(config, args.output)
+        package(config, args.output, args.clean_build)
     else:
         release = Path(args.release) if args.release else (Path(config['prefix']) / 'current').resolve()
         verify_package(release)
