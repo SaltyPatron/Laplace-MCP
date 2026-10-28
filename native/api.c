@@ -38,6 +38,7 @@ typedef intptr_t ssize_t;
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 const lp_tier0_record *T0;
 static lp_text *TX;
@@ -1855,7 +1856,8 @@ static size_t cw_lines(const char *text, size_t upto) {
 static void cw_str(char **out, size_t *on, size_t *ocap, const char *s) {
     size_t l = strlen(s) * 6 + 8;
     char *e = malloc(l);
-    buf_add(out, on, ocap, json_esc(s, e, l), strlen(e));
+    json_esc(s, e, l);
+    buf_add(out, on, ocap, e, strlen(e));
     free(e);
 }
 
@@ -2482,14 +2484,11 @@ static void on_code_callees(int c, const char *body) {
  * source read again without superseding its earlier reading has more than one). Then the database's sessions that
  * are not idle, as pg_stat_activity shows them to this role, and the engine's per-source ingest logs
  * (LAPLACE_INGEST_LOGS, else $LAPLACE_WORK/logs/ingest), newest first, each with its last line. */
-#ifndef _WIN32
-#include <dirent.h>
 typedef struct { char name[256]; time_t mtime; long long bytes; } IsLog;
 static int is_log_cmp(const void *a, const void *b) {
     const IsLog *x = a, *y = b;
     return x->mtime < y->mtime ? 1 : x->mtime > y->mtime ? -1 : strcmp(x->name, y->name);
 }
-#endif
 static void on_ingest_status(int c, const char *body) {
     char want[512] = "";
     jstr(body, "source", want, sizeof want);
@@ -2569,25 +2568,23 @@ static void on_ingest_status(int c, const char *body) {
     if (ld && *ld) snprintf(dir, sizeof dir, "%s", ld);
     else if (work && *work) snprintf(dir, sizeof dir, "%s/logs/ingest", work);
     int listed = 0;
-#ifndef _WIN32
-    DIR *dd = dir[0] ? opendir(dir) : NULL;
-    if (dd) {
+    os_list names = { 0 };
+    if (dir[0] && !os_list_dir(dir, &names)) {
         lp_vec(IsLog) logs = { 0 };
-        struct dirent *de;
-        while ((de = readdir(dd))) {
-            size_t l = strlen(de->d_name);
-            if (l < 5 || l >= 256 || strcmp(de->d_name + l - 4, ".log")) continue;
+        for (size_t entry = 0; entry < names.n; entry++) {
+            const char *name = names.item[entry];
+            size_t l = strlen(name);
+            if (l < 5 || l >= 256 || strcmp(name + l - 4, ".log")) continue;
             char fp[4400];
             struct stat st;
-            snprintf(fp, sizeof fp, "%s/%s", dir, de->d_name);
+            snprintf(fp, sizeof fp, "%s/%s", dir, name);
             if (stat(fp, &st) || !S_ISREG(st.st_mode)) continue;
             IsLog x = { "", st.st_mtime, (long long)st.st_size };
-            memcpy(x.name, de->d_name, l - 4);
+            memcpy(x.name, name, l - 4);
             x.name[l - 4] = 0;
             if (want[0] && strcmp(x.name, want)) continue;
             lp_push(&logs, x);
         }
-        closedir(dd);
         qsort(logs.v, logs.n, sizeof *logs.v, is_log_cmp);
         buf_fmt(&out, &on, &ocap, "{\"dir\":\"");
         cw_str(&out, &on, &ocap, dir);
@@ -2610,7 +2607,11 @@ static void on_ingest_status(int c, const char *body) {
             if (strlen(last) > 240) last[240] = 0;
             for (char *p = last; *p; p++) if ((unsigned char)*p < 0x20 && *p != '\t') *p = ' ';
             struct tm tmv;
+#ifdef _WIN32
+            gmtime_s(&tmv, &logs.v[k].mtime);
+#else
             gmtime_r(&logs.v[k].mtime, &tmv);
+#endif
             strftime(when, sizeof when, "%Y-%m-%dT%H:%M:%SZ", &tmv);
             buf_fmt(&out, &on, &ocap, "%s{\"source\":\"", k ? "," : "");
             cw_str(&out, &on, &ocap, logs.v[k].name);
@@ -2622,7 +2623,7 @@ static void on_ingest_status(int c, const char *body) {
         lp_vec_free(&logs);
         listed = 1;
     }
-#endif
+    os_list_free(&names);
     if (!listed) buf_fmt(&out, &on, &ocap, "null");
     buf_fmt(&out, &on, &ocap, ",\"ms\":%.3f}", (double)(nsec() - t0) / 1e6);
     http(c, 200, out);

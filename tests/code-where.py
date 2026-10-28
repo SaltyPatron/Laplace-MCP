@@ -34,7 +34,11 @@ def call(tool, args, **more):
         return r
     if r.get('isError'):
         fail(f'{tool} {args}: {r["content"][0]["text"]}')
-    return json.loads(r['content'][0]['text'])
+    payload = r['content'][0]['text']
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise AssertionError(f'{tool} returned malformed JSON: {payload!r}') from error
 
 
 src = {
@@ -56,7 +60,7 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
     root = Path(tmp) / 'Laplace' / 'proj'
     root.mkdir(parents=True)
     for f, text in src.items():
-        (root / f).write_text(text)
+        (root / f).write_bytes(text.encode('utf-8'))
     env = dict(os.environ, LAPLACE_WORK=str(Path(tmp) / 'work'),
                LAPLACE_SRC=tmp, LAPLACE_INGEST_ONE='1')
     try:
@@ -70,6 +74,14 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
                            capture_output=True, text=True, timeout=300)
         if i.returncode:
             fail('ingest: ' + i.stdout[-3000:] + i.stderr[-2000:])
+
+        p = call('recipe_plan', {'input': str(root / 'retry.c')})
+        if p['exit'] != 0 or '1 files' not in p['log']:
+            fail(f'recipe_plan: {p}')
+        # Readback below must come from PostgreSQL alone. Preserve the recorded
+        # path identities while removing the original fixture bytes.
+        for filename in src:
+            (root / filename).unlink()
 
         tools = {t['name'] for t in call(None, {})['tools']}
         if not {'code_where', 'code_callers', 'code_callees', 'sources', 'ingest_status', 'file_outline', 'recipe_plan'} <= tools:
@@ -181,11 +193,6 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
             fail(f'callees of jitter: {ce}')
         if call('code_callees', {'query': 'backoff_delay'})['definitions'][0]['callees']:
             fail('backoff_delay calls nothing declared')
-
-        # recipe_plan: which recipe reads a file, nothing read in
-        p = call('recipe_plan', {'input': str(root / 'retry.c')})
-        if p['exit'] != 0 or '1 files' not in p['log']:
-            fail(f'recipe_plan: {p}')
 
         r = call('code_where', {'query': 'exponential_retry_that_is_nowhere'})
         if r['files'] or r['hits']:

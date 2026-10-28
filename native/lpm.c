@@ -1519,28 +1519,22 @@ int lpm_fetch(const Lpm *ix, const uint8_t id[16], LpmRec *out, uint8_t *kids, u
     return 0;
 }
 
-static int cp_of(const Lpm *ix, const uint8_t id[16], const uint32_t *cps, uint32_t nc) {
-    for (uint32_t i = 0; i < nc; i++)
-        if (!memcmp(ix->t0[cps[i]].id.b, id, 16)) return (int)cps[i];
-    return -1;
-}
-
-static void emit_node(const Lpm *ix, const uint8_t id[16], const uint32_t *cps, uint32_t nc, FILE *o) {
+static void emit_node(const Lpm *ix, const uint8_t id[16], FILE *o) {
     Ent *e = ent_find(ix, id);
     if (e && e->nkids > 1) {
         fputc('[', o);
         for (uint32_t i = 0; i < e->nkids; i++) {
             if (i) fputc(',', o);
-            emit_node(ix, e->kids + (size_t)i * 16, cps, nc, o);
+            emit_node(ix, e->kids + (size_t)i * 16, o);
         }
         fputc(']', o);
         return;
     }
-    int cp = cp_of(ix, id, cps, nc);
+    int64_t cp = lp_tier0_codepoint(ix->t0, (const lp_id *)id);
     if (cp == ' ') { fputs("' '", o); return; }
     if (cp >= 32 && cp < 127) { fputc(cp, o); return; }
-    if (cp > 0) { fprintf(o, "U+%04X", cp); return; }
-    if (e && e->nkids == 1) { emit_node(ix, e->kids, cps, nc, o); return; }
+    if (cp >= 0) { fprintf(o, "U+%04X", (unsigned)cp); return; }
+    if (e && e->nkids == 1) { emit_node(ix, e->kids, o); return; }
     fputs("?", o);
 }
 
@@ -1549,15 +1543,6 @@ void lpm_show_text(Lpm *ix, const uint8_t *s, size_t n, void *file) {
     static const char H[] = "0123456789abcdef";
     ix->collecting = 0;
     lp_ref trunk = lp_text_decompose(ix->text, s, n, on_compose, ix);
-    uint32_t cps[256];
-    uint32_t nc = 0;
-    size_t i = 0;
-    uint32_t cp;
-    while (i < n && nc < 256 && lp_utf8_next(s, n, &i, &cp)) {
-        int seen = 0;
-        for (uint32_t k = 0; k < nc; k++) if (cps[k] == cp) seen = 1;
-        if (!seen) cps[nc++] = cp;
-    }
     char id[33];
     for (int b = 0; b < 16; b++) { id[b * 2] = H[trunk.id.b[b] >> 4]; id[b * 2 + 1] = H[trunk.id.b[b] & 15]; }
     id[32] = 0;
@@ -1566,7 +1551,7 @@ void lpm_show_text(Lpm *ix, const uint8_t *s, size_t n, void *file) {
     fprintf(o, "hilbert   %llu\n", (unsigned long long)lp_hilbert4(&trunk.c));
     fprintf(o, "m         %lld %lld %lld %lld\n",
             (long long)trunk.c.m[0], (long long)trunk.c.m[1], (long long)trunk.c.m[2], (long long)trunk.c.m[3]);
-    emit_node(ix, trunk.id.b, cps, nc, o);
+    emit_node(ix, trunk.id.b, o);
     fputc('\n', o);
 }
 
