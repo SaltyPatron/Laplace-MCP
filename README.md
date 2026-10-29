@@ -53,6 +53,12 @@ Observation counts retain their PostgreSQL 64-bit value in JSON responses.
 Text display resolves scalars through Native's indexed floor,
 with no codepoint-offset assumption or 256-scalar selection limit.
 
+`code_search` searches all indexed roots. Its optional `path` refreshes a local
+file or directory using the existing incremental updater: unchanged files keep
+their records, changed files are replaced, and removed files leave the index.
+A missing requested root fails explicitly. `LAPLACE_CODE_ROOTS` declares the
+regular workspace roots; `reindex` refreshes them on demand.
+
 Packaging serializes access to its build cache and retains the current build plus
 the two most recent other builds. It removes only marked cache entries whose Git
 snapshots still match their recorded revisions and contain no edits. Modified

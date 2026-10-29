@@ -149,5 +149,18 @@ with tempfile.TemporaryDirectory(prefix='lpm-code-semantic-') as directory:
     assert not err and out['semantic'] is False and all(h['source'] == 'lexical' for h in out['hits']), out
     assert len(seen) == before
 
+    # A requested path refreshes an indexing root. It must remove vanished
+    # files from a saved index even when periodic root refresh is disabled.
+    retired = root / 'retired.md'
+    retired.write_text('obsoletechecksumterrain\n')
+    records = Path(directory) / 'records.lpm'
+    subprocess.run([str(binary), 'index', str(records), str(root)], check=True, capture_output=True)
+    retired.unlink()
+    local = dict(env, LAPLACE_CODE_SEMANTIC='0', LAPLACE_CODE_RECORDS=str(records), LAPLACE_CODE_REFRESH_SECONDS='0')
+    err, out = mcp(local, 'obsoletechecksumterrain', path=str(root))
+    assert not err and not any(Path(hit['path']).name == 'retired.md' for hit in out['hits']), out
+    err, out = mcp(local, 'obsoletechecksumterrain', path=str(root / 'missing'))
+    assert err and 'path does not exist' in out['error'] and 'hits' not in out, out
+
 server.shutdown()
 print('code semantic ok')
