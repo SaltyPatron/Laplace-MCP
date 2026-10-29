@@ -22,6 +22,10 @@ repository. Engine and MCP share one Native and Tree-sitter build graph. Ninja
 rebuilds changed inputs; a toolchain fingerprint change or `--clean-build`
 explicitly cleans that graph. Uncommitted edits or an attached branch in a build
 snapshot stop packaging instead of being overwritten.
+Engine-owned packaging grammars compile incrementally in this same profile from
+the selected Engine revision. They override prepared external grammar inputs
+when the release is assembled, so another product's parser build cannot select
+an older packaging grammar for this release.
 
 The service compiles the pinned Engine's selected-ID reader and connection-owned
 SQL plan manager. Plans retain SQL contents and follow libpq reset/destruction;

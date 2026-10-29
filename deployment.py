@@ -193,7 +193,7 @@ def package(config, output, clean_build=False):
         _package(config, output, clean_build)
 
 
-def package_resources(config, source, stage):
+def package_resources(config, source, stage, recipe_grammars=None):
     """Use Operations' shared immutable file store, never serving build outputs."""
     spec = importlib.util.spec_from_file_location('artifact_store', source / 'Laplace-Operations/installation/artifact_store.py')
     artifacts = importlib.util.module_from_spec(spec)
@@ -209,10 +209,17 @@ def package_resources(config, source, stage):
         for key, name in (('tier0', 'tier0.bin'), ('flags', 'tier0.flags'), ('highway', 'tier0.highway')):
             artifacts.materialize_file(config[key], stage / 'share/prepared' / name, store)
         artifacts.materialize_file(config['flags'] + '.layout', stage / 'share/prepared/tier0.flags.layout', store)
-        grammars = sorted(Path(config['grammars']).glob('*.so'))
+        grammars = {path.name: path for path in sorted(Path(config['grammars']).glob('*.so'))}
+        if recipe_grammars is not None:
+            selected = list(Path(recipe_grammars).glob('*.so'))
+            if not selected:
+                raise ValueError('The selected Engine produced no recipe grammars')
+            # Prepared external code grammars remain inputs. Engine-owned
+            # packaging grammars always come from this release's source vector.
+            grammars.update((path.name, path) for path in selected)
         if not grammars:
             raise ValueError('No compiled grammars at the declared input root')
-        for grammar in grammars:
+        for grammar in grammars.values():
             artifacts.materialize_file(grammar, stage / 'share/grammars' / grammar.name, store)
 
 
@@ -303,6 +310,10 @@ def _package(config, output, clean_build=False):
                        LAPLACE_ENGINE_SRC=str(source / 'Laplace-Engine/src'),
                        LAPLACE_OPERATIONS=str(source / 'Laplace-Operations'),
                        LAPLACE_CONNINFO='', OMP_NUM_THREADS=str(config['threads']), MKL_NUM_THREADS='1')
+    recipe_grammars = build / 'grammars'
+    environment['LAPLACE_GRAMMARS'] = str(recipe_grammars)
+    run(['bash', source / 'Laplace-Engine/tools/build_grammars.sh',
+         source / 'Laplace-Engine/recipes/formats/grammars', recipe_grammars], env=environment)
     release_root = prefix / 'releases'
     # Setup provisions a shared setgid prefix. Existing release directories may
     # belong to the operator; a group-authorized runner can publish there but
@@ -329,7 +340,7 @@ def _package(config, output, clean_build=False):
         controller = stage / CONTROLLER
         controller.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / 'Laplace-MCP/deployment.py', controller)
-        package_resources(config, source, stage)
+        package_resources(config, source, stage, recipe_grammars)
         dependencies = {}
         for relative in ('bin/lpm', 'bin/laplace', 'lib/liblpm.so'):
             report = run(['ldd', stage / relative], capture_output=True).stdout

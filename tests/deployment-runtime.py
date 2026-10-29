@@ -93,6 +93,13 @@ class Deployment(unittest.TestCase):
         self.assertFalse(os.path.samefile(first / 'share/grammars/parser.so', inputs / 'grammars/parser.so'))
         (inputs / 'grammars/parser.so').write_bytes(b'changed compiler output')
         self.assertEqual((first / 'share/grammars/parser.so').read_bytes(), b'grammars/parser.so')
+        selected = self.work / 'selected-engine-grammars'
+        selected.mkdir()
+        (selected / 'parser.so').write_bytes(b'the pinned Engine grammar')
+        current = self.work / 'current'
+        deployment.package_resources(config, source, current, selected)
+        self.assertEqual((current / 'share/grammars/parser.so').read_bytes(), b'the pinned Engine grammar')
+        self.assertEqual((first / 'share/grammars/parser.so').read_bytes(), b'grammars/parser.so')
 
     def release(self, controller=True):
         content = Path(deployment.__file__).read_bytes()
