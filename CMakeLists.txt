@@ -18,7 +18,7 @@ include(${LAPLACE_NATIVE}/cmake/LaplaceWindowsUtf8.cmake)
 find_package(OpenMP REQUIRED)
 
 laplace_path(LAPLACE_ENGINE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../Laplace-Engine/src" "Laplace-Engine's sources: the reader this service links")
-foreach(f read.c read_text.c pg.c pg_plan.c pg_plan.h walk.c engine.h)
+foreach(f read.c read_ids.c read_text.c pg.c pg_plan.c pg_plan.h walk.c engine.h)
   if(NOT EXISTS "${LAPLACE_ENGINE_SRC}/${f}")
     message(FATAL_ERROR "LAPLACE_ENGINE_SRC: no ${f} at '${LAPLACE_ENGINE_SRC}'")
   endif()
@@ -75,7 +75,7 @@ else()
 endif()
 
 # lpm: the commands and the service (serve).
-add_executable(lpm_program native/main.c native/api.c native/semantic.c native/db_bridge.c ${LAPLACE_ENGINE_SRC}/os.c ${LAPLACE_ENGINE_SRC}/read.c ${LAPLACE_ENGINE_SRC}/read_text.c ${LAPLACE_ENGINE_SRC}/pg.c ${LAPLACE_ENGINE_SRC}/pg_plan.c ${LAPLACE_ENGINE_SRC}/walk.c)
+add_executable(lpm_program native/main.c native/api.c native/semantic.c native/db_bridge.c ${LAPLACE_ENGINE_SRC}/os.c ${LAPLACE_ENGINE_SRC}/read.c ${LAPLACE_ENGINE_SRC}/read_ids.c ${LAPLACE_ENGINE_SRC}/read_text.c ${LAPLACE_ENGINE_SRC}/pg.c ${LAPLACE_ENGINE_SRC}/pg_plan.c ${LAPLACE_ENGINE_SRC}/walk.c)
 laplace_utf8_executable(lpm_program)
 set_target_properties(lpm_program PROPERTIES OUTPUT_NAME lpm)
 target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_ENGINE_SRC} ${LAPLACE_NATIVE}/src

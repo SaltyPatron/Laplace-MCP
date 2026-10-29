@@ -457,11 +457,6 @@ static void downs_free(Down *d, int n) {
     free(d);
 }
 
-/* An entity's physicality is in the leaf of its ID's first byte (physicality_00 .. physicality_ff); a leaf holds every tier. */
-static void phy_leaf_name(char *out, size_t cap, const lp_id *id) {
-    snprintf(out, cap, "physicality_%02x", id->b[0]);
-}
-
 static void emit_ids(char **b, size_t *n, size_t *cap, const uint8_t *path, int plen, int *nids) {
     size_t m = path && plen > 0 ? lp_path_ids(path, (size_t)plen, NULL, 0) : 0;
     *nids = (int)m;
@@ -605,7 +600,7 @@ static void on_search(int c, const char *body) {
             sscanf(idbuf + 2 * i, "%2x", &v);
             trunk.id.b[i] = (uint8_t)v;
         }
-        int recorded = tier_max(&trunk.id, 1);
+        int recorded = tier_max(pg, &trunk.id, 1);
         if (recorded >= 0) { trunk.tier = (uint32_t)recorded; known = 1; }
     }
     t0 = nsec();
@@ -616,10 +611,9 @@ static void on_search(int c, const char *body) {
     size_t al = ids_param(pg,ab, &trunk.id, 1);
     const char *pv[1] = { (const char *)ab };
     int pl[1] = { (int)al }, pf[1] = { 1 };
-    char leaf[64], psql[1024];
-    phy_leaf_name(leaf, sizeof leaf, &trunk.id);
-    snprintf(psql, sizeof psql, "SELECT path, tier, mask FROM @extschema@.%s WHERE entity OPERATOR(@extschema@.=) ANY($1::@extschema@.blake3[])", leaf);
-    PGresult *self = db_exec_params(pg, psql, 1, NULL, pv, pl, pf, 1);
+    PGresult *self = db_exec_params(pg,
+        "SELECT path,tier,mask FROM @extschema@.laplace_physicalities($1::@extschema@.blake3[])",
+        1,NULL,pv,pl,pf,1);
     if (PQresultStatus(self) != PGRES_TUPLES_OK) {
         char e[512], b[700];
         json_esc(PQerrorMessage(pg), e, sizeof e);
@@ -660,15 +654,12 @@ static void on_search(int c, const char *body) {
         down = calloc((size_t)(ndown ? ndown : 1), sizeof *down);
         lp_id *ids = malloc(sizeof(lp_id) * (m ? m : 1));
         if (m) lp_path_ids(pw, (size_t)plen, ids, m);
+        int *tiers=malloc(sizeof(int)*(m?m:1));tiers_of(pg,ids,ndown,tiers);
         for (int i = 0; i < ndown; i++) {
-            down[i].id = ids[i];
-            down[i].cp = (int)lp_tier0_codepoint(T0, &ids[i]);
-            if (down[i].cp >= 0) down[i].tier = 0;
-            else {
-                int t = tier_max(&ids[i], 1);
-                down[i].tier = t < 0 ? -1 : t;
-            }
+            down[i].id=ids[i];down[i].cp=(int)lp_tier0_codepoint(T0,ids+i);
+            down[i].tier=down[i].cp>=0?0:tiers[i];
         }
+        free(tiers);
         free(ids);
     }
     for (int i = 0; i < ndown; i++) {
@@ -682,34 +673,32 @@ static void on_search(int c, const char *body) {
         for (int k = 0; k < down[i].nh; k++) if (down[i].h[k].claim) cids2[n2++] = down[i].h[k].entity;
         down[i].att = attested(pg, cids2, n2, &down[i].natt, NULL);
         free(cids2);
-        uint8_t oneb[40];
-        size_t onel = ids_param(pg,oneb, &down[i].id, 1);
-        const char *ov[1] = { (const char *)oneb };
-        int ol[1] = { (int)onel }, of[1] = { 1 };
-        char leaf[64], psql2[1024];
-        phy_leaf_name(leaf, sizeof leaf, &down[i].id);
-        snprintf(psql2, sizeof psql2, "SELECT path FROM @extschema@.%s WHERE entity OPERATOR(@extschema@.=) ANY($1::@extschema@.blake3[])", leaf);
-        PGresult *pr = db_exec_params(pg, psql2, 1, NULL, ov, ol, of, 1);
-        if (PQresultStatus(pr) == PGRES_TUPLES_OK && PQntuples(pr) > 0) {
-            const uint8_t *kw = (const uint8_t *)PQgetvalue(pr, 0, 0);
-            int klen = PQgetlength(pr, 0, 0);
-            size_t km = lp_path_ids(kw, (size_t)klen, NULL, 0);
-            down[i].nkids = (int)km;
-            down[i].kids = malloc(sizeof(lp_id) * (km ? km : 1));
-            down[i].ktier = malloc(sizeof(int) * (km ? km : 1));
-            down[i].kcp = malloc(sizeof(int) * (km ? km : 1));
-            if (km) lp_path_ids(kw, (size_t)klen, down[i].kids, km);
-            for (int k = 0; k < down[i].nkids; k++) {
-                down[i].kcp[k] = (int)lp_tier0_codepoint(T0, &down[i].kids[k]);
-                if (down[i].kcp[k] >= 0) down[i].ktier[k] = 0;
-                else {
-                    int t = tier_max(&down[i].kids[k], 1);
-                    down[i].ktier[k] = t < 0 ? -1 : t;
-                }
-            }
-        }
-        PQclear(pr);
     }
+    /* One stored-path frontier and one tier frontier for the entire layer.
+     * Duplicate constituent occurrences retain their own Down slots. */
+    lp_vec(lp_id) roots={0};lp_vec(int) slots={0};
+    for(int i=0;i<ndown;i++)if(down[i].tier>=2){lp_push(&roots,down[i].id);lp_push(&slots,i);}
+    int npaths=0;Hold *paths=paths_of(pg,roots.v,(int)roots.n,&npaths);
+    lp_vec(lp_id) children={0};
+    for(int row=0;row<npaths;row++){
+        Down *node=down+slots.v[paths[row].src];
+        size_t count=lp_path_ids(paths[row].path,(size_t)paths[row].path_len,NULL,0);
+        node->nkids=(int)count;node->kids=malloc(sizeof(lp_id)*(count?count:1));
+        node->ktier=malloc(sizeof(int)*(count?count:1));node->kcp=malloc(sizeof(int)*(count?count:1));
+        if(count)lp_path_ids(paths[row].path,(size_t)paths[row].path_len,node->kids,count);
+        for(size_t k=0;k<count;k++)lp_push(&children,node->kids[k]);
+    }
+    int *tiers=malloc(sizeof(int)*(children.n?children.n:1));tiers_of(pg,children.v,(int)children.n,tiers);
+    size_t offset=0;
+    /* paths are ID ordered, so distribute in that same order. */
+    for(int row=0;row<npaths;row++){
+        Down *node=down+slots.v[paths[row].src];
+        for(int k=0;k<node->nkids;k++){
+            node->kcp[k]=(int)lp_tier0_codepoint(T0,node->kids+k);
+            node->ktier[k]=node->kcp[k]>=0?0:tiers[offset];offset++;
+        }
+    }
+    free(tiers);holds_free(paths,npaths);lp_vec_free(&children);lp_vec_free(&slots);lp_vec_free(&roots);
     double db_ms = (double)(nsec() - t0) / 1e6;
     int *order = malloc(sizeof(int) * (size_t)(nh ? nh : 1));
     double *conf = calloc((size_t)(nh ? nh : 1), sizeof(double));

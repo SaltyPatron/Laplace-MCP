@@ -127,6 +127,16 @@ try:
         counts={row['entity']:row['matches'] for row in first['claims'] if row['stood']}
         assert counts and all(value>0 for value in counts.values()),first
         pids=connections()
+        # The ID entry point discovers tiers and both constituent layers from
+        # stored Native rows, without depending on text decomposition or leaf
+        # names. The source trunk exercises nested, mixed-tier content.
+        direct=request('/v1/search',{'id':first['id']})
+        assert direct['physicality']==first['physicality'] and direct['claims']==first['claims'],direct
+        source=request('/v1/search',{'id':next(iter(before))})
+        assert source['physicality'] and source['constituents'],source
+        assert any(part.get('constituents') for part in source['constituents']),source
+        assert all(part['tier']>=0 for part in source['constituents']),source
+        assert connections()==pids
         ingest('second')
         second=request('/v1/search',{'input':'dog'})
         after={row['trunk'] for row in second['attestations'] if row['witness']}

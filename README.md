@@ -15,6 +15,10 @@ SQL plan manager. Plans retain SQL contents and follow libpq reset/destruction;
 the bridge leaves generic/custom and parallel planning to the caller's settings.
 API handlers include the Engine's reader declarations directly. SQL and binary
 arrays use that connection's installed Native/PostGIS namespaces and type OIDs.
+Inspection shares the Engine's `read_ids.c`: stored paths and tiers are fetched
+as complete frontiers through `laplace_entities` / `laplace_physicalities`.
+Constituent layers retain request ordinals and repeated occurrences without
+per-child SQL or client-side partition-name construction.
 The database readback test installs both extensions in separate named schemas
 with conflicting public objects and a restricted search path, then reads the
 ingested source through search, forward, code and provenance tools.
