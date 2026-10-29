@@ -24,7 +24,7 @@ typedef intptr_t ssize_t;
 #include "api.h"
 #include "lpm.h"
 #include "lpm_config.h"
-#include "os.h"
+#include "engine.h"
 #include "semantic.h"
 
 #include "laplace/laplace.h"
@@ -86,9 +86,7 @@ static PGconn *db(void) {
     if (!ci || !*ci) ci = CONN_DEFAULT;
     PG = PQconnectdb(ci);
     if (PQstatus(PG) != CONNECTION_OK) return NULL;
-    PQexec(PG, "SET client_min_messages = warning");
-    /* Parent scans (containers, claims, forward) run as a Gather over the leaves. A named leaf stays one process. */
-    PQexec(PG, "SET enable_parallel_append = on");
+    db_notices(PG);
     return PG;
 }
 
@@ -199,11 +197,11 @@ static void parts_json(const lp_ref *parts, size_t n, char *out, size_t cap) {
 
 static int q1(PGconn *pg, const char *sql, const char *a, char **out, char *err, size_t errcap) {
     const char *v[1] = { a };
-    PGresult *r = PQexecParams(pg, sql, 1, NULL, v, NULL, NULL, 0);
+    PGresult *r = db_exec_params(pg, sql, 1, NULL, v, NULL, NULL, 0);
     if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) < 1) {
         snprintf(err, errcap, "%s", PQerrorMessage(pg));
         PQclear(r);
-        PQclear(PQexec(pg, "ROLLBACK"));
+        PQclear(db_exec(pg, "ROLLBACK"));
         return 0;
     }
     *out = strdup(PQgetvalue(r, 0, 0));
@@ -213,11 +211,11 @@ static int q1(PGconn *pg, const char *sql, const char *a, char **out, char *err,
 
 static int q2(PGconn *pg, const char *sql, const char *a, const char *b, char **out, char *err, size_t errcap) {
     const char *v[2] = { a, b };
-    PGresult *r = PQexecParams(pg, sql, 2, NULL, v, NULL, NULL, 0);
+    PGresult *r = db_exec_params(pg, sql, 2, NULL, v, NULL, NULL, 0);
     if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) < 1) {
         snprintf(err, errcap, "%s", PQerrorMessage(pg));
         PQclear(r);
-        PQclear(PQexec(pg, "ROLLBACK"));
+        PQclear(db_exec(pg, "ROLLBACK"));
         return 0;
     }
     *out = strdup(PQgetvalue(r, 0, 0));
@@ -252,14 +250,14 @@ static const char *FORWARD_SQL =
     "SELECT COALESCE((SELECT json_agg(x) FROM ("
     "  SELECT json_build_object('i', i, 'j', j, 'paths', paths, 'runs', runs,"
     "    'next', next::text, 'times', times) AS x"
-    "  FROM laplace_forward($1::blake3[], 64) LIMIT 128) s), '[]'::json)::text";
+    "  FROM @extschema@.laplace_forward($1::@extschema@.blake3[], 64) LIMIT 128) s), '[]'::json)::text";
 
 static const char *SHAPE_SQL =
-    "SELECT laplace_frechet4d("
-    " (SELECT ST_MakeLine(e.coord ORDER BY u.ord) FROM unnest(string_to_array($1, ',')::blake3[])"
-    "    WITH ORDINALITY AS u(id, ord) JOIN entity e ON e.id = u.id),"
-    " (SELECT ST_MakeLine(e.coord ORDER BY u.ord) FROM unnest(string_to_array($2, ',')::blake3[])"
-    "    WITH ORDINALITY AS u(id, ord) JOIN entity e ON e.id = u.id)"
+    "SELECT @extschema@.laplace_frechet4d("
+    " (SELECT @postgis@.ST_MakeLine(e.coord ORDER BY u.ord) FROM unnest(string_to_array($1, ',')::@extschema@.blake3[])"
+    "    WITH ORDINALITY AS u(id, ord) JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id),"
+    " (SELECT @postgis@.ST_MakeLine(e.coord ORDER BY u.ord) FROM unnest(string_to_array($2, ',')::@extschema@.blake3[])"
+    "    WITH ORDINALITY AS u(id, ord) JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id)"
     ")::text";
 
 static int part_list(const lp_ref *parts, size_t n, char *out, size_t cap) {
@@ -422,20 +420,6 @@ static void on_embeddings(int c, const char *body) {
     http(c, 200, out ? out : "{\"object\":\"list\",\"data\":[]}");
     free(out);
 }
-
-/* holds_above, tier_max, ids_param: Laplace-Engine/src/read.c, linked into this process. */
-typedef struct {
-    lp_id entity; int src; int16_t tier; uint8_t claim, stood;
-    uint8_t *path; int path_len; lp_rating r; int matches;
-} Hold;
-Hold *holds_above(const lp_id *keys, int nkeys, int floor, int each, int standing, int *nout);
-void holds_free(Hold *h, int n);
-int tier_max(const lp_id *ids, int n);
-size_t ids_param(uint8_t *out, const lp_id *ids, uint32_t n);
-/* attested: Laplace-Engine/src/walk.c. Who said a claim is not a row: it is read off the containment above the claim,
- * one row a claim and the trunk that holds it (a trunk in the witness table is a witness, with its trust). */
-typedef struct { lp_id claim, trunk; double games, tokens, score; uint32_t position; double trust; int witness; } Attested;
-Attested *attested(PGconn *pg, const lp_id *claims, int n, int *nout, uint64_t *rows);
 
 /* One constituent of a mixed-tier path. Tier 0 is a codepoint, tier 1 a grapheme.
  * A higher tier is read the same way as the trunk: the paths that hold it, and their attestations.
@@ -628,13 +612,13 @@ static void on_search(int c, const char *body) {
         return;
     }
     uint8_t ab[40];
-    size_t al = ids_param(ab, &trunk.id, 1);
+    size_t al = ids_param(pg,ab, &trunk.id, 1);
     const char *pv[1] = { (const char *)ab };
     int pl[1] = { (int)al }, pf[1] = { 1 };
-    char leaf[64], psql[192];
+    char leaf[64], psql[1024];
     phy_leaf_name(leaf, sizeof leaf, &trunk.id);
-    snprintf(psql, sizeof psql, "SELECT path, tier, mask FROM %s WHERE entity = ANY($1::blake3[])", leaf);
-    PGresult *self = PQexecParams(pg, psql, 1, NULL, pv, pl, pf, 1);
+    snprintf(psql, sizeof psql, "SELECT path, tier, mask FROM @extschema@.%s WHERE entity OPERATOR(@extschema@.=) ANY($1::@extschema@.blake3[])", leaf);
+    PGresult *self = db_exec_params(pg, psql, 1, NULL, pv, pl, pf, 1);
     if (PQresultStatus(self) != PGRES_TUPLES_OK) {
         char e[512], b[700];
         json_esc(PQerrorMessage(pg), e, sizeof e);
@@ -698,13 +682,13 @@ static void on_search(int c, const char *body) {
         down[i].att = attested(pg, cids2, n2, &down[i].natt, NULL);
         free(cids2);
         uint8_t oneb[40];
-        size_t onel = ids_param(oneb, &down[i].id, 1);
+        size_t onel = ids_param(pg,oneb, &down[i].id, 1);
         const char *ov[1] = { (const char *)oneb };
         int ol[1] = { (int)onel }, of[1] = { 1 };
-        char leaf[64], psql2[192];
+        char leaf[64], psql2[1024];
         phy_leaf_name(leaf, sizeof leaf, &down[i].id);
-        snprintf(psql2, sizeof psql2, "SELECT path FROM %s WHERE entity = ANY($1::blake3[])", leaf);
-        PGresult *pr = PQexecParams(pg, psql2, 1, NULL, ov, ol, of, 1);
+        snprintf(psql2, sizeof psql2, "SELECT path FROM @extschema@.%s WHERE entity OPERATOR(@extschema@.=) ANY($1::@extschema@.blake3[])", leaf);
+        PGresult *pr = db_exec_params(pg, psql2, 1, NULL, ov, ol, of, 1);
         if (PQresultStatus(pr) == PGRES_TUPLES_OK && PQntuples(pr) > 0) {
             const uint8_t *kw = (const uint8_t *)PQgetvalue(pr, 0, 0);
             int klen = PQgetlength(pr, 0, 0);
@@ -1743,13 +1727,6 @@ static const char *SURFACE =
  * A file is a trunk [metadata, content]; a recipe with a grammar records its content as the syntax tree, so the nodes
  * above a name are its enclosing expressions, statements and declarations, and above them the file. Nothing is read
  * from a working tree: the path is the file's own pathname record, the text and lines are the recorded content. */
-typedef struct Reader Reader;
-Reader *reader_new(PGconn *pg);
-void reader_free(Reader *);
-char *reader_text(Reader *, const lp_id *id, size_t limit);
-size_t reader_parts(Reader *, const lp_id *id, lp_id *out, size_t cap);
-Hold *holds_any(const lp_id *keys, int nkeys, int *nout);
-
 typedef struct { lp_id id; uint8_t file; } CwNode;
 typedef struct { CwNode *n; size_t nn, cn; lp_idmap *m; } CwDag;
 static size_t cw_node(CwDag *d, const lp_id *id, int *fresh) {
@@ -1889,7 +1866,7 @@ static size_t fo_vertices(PGconn *pg, const lp_id *id, lp_vertex **out, size_t *
     hex_id(id, h);
     snprintf(arr, sizeof arr, "{%s}", h);
     const char *v[1] = { arr };
-    PGresult *r = PQexecParams(pg, "SELECT path::text FROM laplace_paths($1::blake3[])", 1, NULL, v, NULL, NULL, 0);
+    PGresult *r = db_exec_params(pg, "SELECT path::text FROM @extschema@.laplace_paths($1::@extschema@.blake3[])", 1, NULL, v, NULL, NULL, 0);
     size_t n = 0;
     if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0) {
         const char *hx = PQgetvalue(r, 0, 0);
@@ -2495,7 +2472,7 @@ static void on_ingest_status(int c, const char *body) {
     PGconn *pg = cc_db(c);
     if (!pg) return;
     uint64_t t0 = nsec();
-    PGresult *r = PQexecParams(pg, "SELECT id, trust FROM witness", 0, NULL, NULL, NULL, NULL, 1);
+    PGresult *r = db_exec_params(pg, "SELECT id, trust FROM @extschema@.witness", 0, NULL, NULL, NULL, NULL, 1);
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         char e[512], b[640];
         json_esc(PQerrorMessage(pg), e, sizeof e);
@@ -2548,7 +2525,7 @@ static void on_ingest_status(int c, const char *body) {
     free(nfiles);
     reader_free(rd);
     buf_fmt(&out, &on, &ocap, "],\"activity\":[");
-    r = PQexec(pg, "SELECT pid, coalesce(usename::text, ''), coalesce(state, ''), coalesce(extract(epoch FROM now() - query_start)::bigint, 0), "
+    r = db_exec(pg, "SELECT pid, coalesce(usename::text, ''), coalesce(state, ''), coalesce(extract(epoch FROM now() - query_start)::bigint, 0), "
                    "left(regexp_replace(coalesce(query, ''), '\\s+', ' ', 'g'), 200) FROM pg_stat_activity "
                    "WHERE datname = current_database() AND pid <> pg_backend_pid() AND state IS DISTINCT FROM 'idle' ORDER BY query_start NULLS LAST LIMIT 32");
     if (PQresultStatus(r) == PGRES_TUPLES_OK)
@@ -2634,7 +2611,7 @@ static void on_sources(int c, const char *body) {
     (void)body;
     PGconn *pg = db();
     if (!pg) { http(c, 503, "{\"error\":\"database\"}"); return; }
-    PGresult *r = PQexecParams(pg, "SELECT id, trust FROM witness", 0, NULL, NULL, NULL, NULL, 1);
+    PGresult *r = db_exec_params(pg, "SELECT id, trust FROM @extschema@.witness", 0, NULL, NULL, NULL, NULL, 1);
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         char e[512], b[640];
         json_esc(PQerrorMessage(pg), e, sizeof e);

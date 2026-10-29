@@ -8,7 +8,6 @@
 #include <string.h>
 #include <time.h>
 
-uint32_t id_oid;
 static char noted_conn[8192];
 
 const char *laplace_db(void) {
@@ -45,12 +44,6 @@ PGconn *db_connect(const char *conninfo) {
         fprintf(stderr, "Database connection failed: %s", PQerrorMessage(pg));
         exit(1);
     }
-    PQclear(PQexec(pg, "SET client_min_messages = warning"));
-    if (!id_oid) {
-        PGresult *r = PQexec(pg, "SELECT 'blake3'::regtype::oid");
-        if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r))
-            id_oid = (uint32_t)strtoul(PQgetvalue(r, 0, 0), NULL, 10);
-        PQclear(r);
-    }
+    db_notices(pg);
     return pg;
 }

@@ -13,6 +13,11 @@ they are never embedded in the package. The commands below are for development.
 The service compiles the pinned Engine's selected-ID reader and connection-owned
 SQL plan manager. Plans retain SQL contents and follow libpq reset/destruction;
 the bridge leaves generic/custom and parallel planning to the caller's settings.
+API handlers include the Engine's reader declarations directly. SQL and binary
+arrays use that connection's installed Native/PostGIS namespaces and type OIDs.
+The database readback test installs both extensions in separate named schemas
+with conflicting public objects and a restricted search path, then reads the
+ingested source through search, forward, code and provenance tools.
 Text display resolves scalars through Native's indexed floor,
 with no codepoint-offset assumption or 256-scalar selection limit.
 

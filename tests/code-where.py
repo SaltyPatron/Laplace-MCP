@@ -9,9 +9,16 @@ from pathlib import Path
 lpm, engine = sys.argv[1], sys.argv[2]
 host, user = os.environ.get('PGHOST', '/tmp'), os.environ.get('PGUSER', 'laplace')
 name = 'lpm_code_where_' + uuid.uuid4().hex[:12]
-conninfo = f'host={host} port={os.environ.get("PGPORT", "5432")} user={user} dbname={name}'
+conninfo = f"host={host} port={os.environ.get('PGPORT', '5432')} user={user} dbname={name} options='-c search_path=pg_catalog'"
 pg_config = os.environ.get('PG_CONFIG')
-psql = str(Path(pg_config).parent / 'psql') if pg_config else shutil.which('psql') or 'psql'
+psql = os.environ.get('PSQL') or (str(Path(pg_config).parent / 'psql') if pg_config else shutil.which('psql') or 'psql')
+
+
+def sql(database,statement):
+    result=subprocess.run([psql,'-XwAtq','-h',host,'-p',os.environ.get('PGPORT','5432'),'-U',user,
+                           '-d',database,'-v','ON_ERROR_STOP=1','-c',statement],capture_output=True,text=True,timeout=300)
+    if result.returncode:raise RuntimeError(result.stderr)
+    return result.stdout.strip()
 
 
 def fail(msg):
@@ -63,7 +70,15 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         (root / f).write_bytes(text.encode('utf-8'))
     env = dict(os.environ, LAPLACE_WORK=str(Path(tmp) / 'work'),
                LAPLACE_SRC=tmp, LAPLACE_INGEST_ONE='1')
+    Path(env['LAPLACE_WORK']).mkdir()
     try:
+        sql('postgres',f'CREATE DATABASE "{name}"')
+        created=True
+        sql(name,'''CREATE SCHEMA "native reader"; CREATE SCHEMA "spatial reader";
+          CREATE EXTENSION postgis SCHEMA "spatial reader";
+          CREATE EXTENSION laplace SCHEMA "native reader";
+          CREATE DOMAIN public.blake3 AS integer;
+          CREATE TABLE public.entity(id integer); INSERT INTO public.entity VALUES(17);''')
         d = subprocess.run([engine, 'deploy', '-d', conninfo], env=env, capture_output=True, text=True, timeout=300)
         created = True
         if d.returncode:
@@ -74,6 +89,11 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
                            capture_output=True, text=True, timeout=300)
         if i.returncode:
             fail('ingest: ' + i.stdout[-3000:] + i.stderr[-2000:])
+
+        searched=call('search',{'input':'backoff_delay'})
+        if not searched.get('physicality') or not searched.get('constituents'):
+            fail(f'Native search through installed namespaces: {searched}')
+        call('forward',{'input':'backoff_delay'})
 
         p = call('recipe_plan', {'input': str(root / 'retry.c')})
         if p['exit'] != 0 or '1 files' not in p['log']:
@@ -218,10 +238,11 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         just = call('ingest_status', {'source': 'demo'}, LAPLACE_INGEST_LOGS=str(logs))
         if just['sources'] or [x['source'] for x in just['logs']['runs']] != ['demo']:
             fail(f'ingest_status of demo: {just}')
+        assert sql(name,'SELECT id FROM public.entity')=='17'
         print('code-where ok: backoff_delay defined at retry.c:3 (3..7), called at use.c:3 in wait_for; jitter defined in jitter.py and called at :10 in spread; a file of one def defines it; '
               'callers and callees; outlines and a plan; ingest status; '
               f'{len(s["sources"])} witnesses')
     finally:
         if created:
-            subprocess.run([psql, '-XwAt', '-h', host, '-U', user, '-d', 'postgres', '-c', f'DROP DATABASE IF EXISTS "{name}"'],
+            subprocess.run([psql, '-XwAt', '-h', host, '-p',os.environ.get('PGPORT','5432'), '-U', user, '-d', 'postgres', '-c', f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'],
                            capture_output=True, text=True, timeout=60)
