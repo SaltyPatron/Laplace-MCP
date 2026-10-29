@@ -16,7 +16,8 @@ import uuid
 
 
 lpm,engine=(Path(value).resolve() for value in sys.argv[1:3])
-psql=os.environ.get('PSQL','psql')
+pg_config=os.environ.get('PG_CONFIG')
+psql=os.environ.get('PSQL') or (str(Path(pg_config).parent/'psql') if pg_config else shutil.which('psql') or 'psql')
 host,port,user=(os.environ.get(key,default) for key,default in
                 [('PGHOST','/tmp'),('PGPORT','5432'),('PGUSER','laplace')])
 name='laplace_scope_'+uuid.uuid4().hex[:12]
