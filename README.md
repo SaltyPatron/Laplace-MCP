@@ -23,6 +23,7 @@ connection and pooled readers. Response completion releases every transaction;
 the next request imports its new snapshot on the same pooled connections.
 `tests/read-snapshot.py` publishes another real source between persistent
 requests and checks refreshed witness authority, idle transactions and PID reuse.
+Observation counts retain their PostgreSQL 64-bit value in JSON responses.
 Text display resolves scalars through Native's indexed floor,
 with no codepoint-offset assumption or 256-scalar selection limit.
 

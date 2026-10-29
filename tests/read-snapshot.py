@@ -124,12 +124,22 @@ try:
             first=pending.result(timeout=90)
         before={row['trunk'] for row in first['attestations'] if row['witness']}
         assert len(before)==1,first
+        counts={row['entity']:row['matches'] for row in first['claims'] if row['stood']}
+        assert counts and all(value>0 for value in counts.values()),first
         pids=connections()
         ingest('second')
         second=request('/v1/search',{'input':'dog'})
         after={row['trunk'] for row in second['attestations'] if row['witness']}
         assert len(after)==2 and before<after,second
+        assert any(row['matches']>counts[row['entity']] for row in second['claims'] if row['stood'] and row['entity'] in counts),second
         assert connections()==pids,'A new read should reuse the same connections and plans'
-        print('read-snapshot: request snapshot precedes pooled reads; source authority refreshes between requests; all transactions released and connection PIDs reused')
+        # Exercise the PostgreSQL bigint wire contract beyond 32 bits inside
+        # this private fixture, independently of evidence accumulation.
+        claim=next(iter(counts));wide_count=4294967313
+        sql(name,f"UPDATE public.consensus SET matches={wide_count} WHERE claim='{claim}'::public.blake3")
+        third=request('/v1/search',{'input':'dog'})
+        assert next(row['matches'] for row in third['claims'] if row['entity']==claim)==wide_count,third
+        assert connections()==pids
+        print('read-snapshot: snapshot precedes pooled reads; source authority and 64-bit counts refresh between requests; all transactions released and connection PIDs reused')
 finally:
     if created:sql('postgres',f'DROP DATABASE "{name}" WITH (FORCE)')

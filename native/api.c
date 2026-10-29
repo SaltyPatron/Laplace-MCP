@@ -26,6 +26,7 @@ typedef intptr_t ssize_t;
 #include "lpm_config.h"
 #include "engine.h"
 #include "db_bridge.h"
+#include <inttypes.h>
 #include "semantic.h"
 
 #include "laplace/laplace.h"
@@ -545,7 +546,7 @@ static void emit_down(char **b, size_t *n, size_t *cap, const Down *d, int fan) 
             hex_id(&s->entity, id);
             buf_fmt(b, n, cap,
                     "%s{\"entity\":\"%s\",\"tier\":%d,\"stood\":%s,\"confidence\":%.6f,"
-                    "\"rating\":%.3f,\"deviation\":%.3f,\"volatility\":%.6f,\"matches\":%d,\"constituents\":",
+                    "\"rating\":%.3f,\"deviation\":%.3f,\"volatility\":%.6f,\"matches\":%" PRId64 ",\"constituents\":",
                     i ? "," : "", id, (int)s->tier, s->stood ? "true" : "false", conf[order[i]],
                     s->r.rating, s->r.deviation, s->r.volatility, s->matches);
             emit_ids(b, n, cap, s->path, s->path_len, &nids);
@@ -761,7 +762,7 @@ static void on_search(int c, const char *body) {
         int nids = 0;
         buf_fmt(&out, &un, &ucap,
                 "%s{\"entity\":\"%s\",\"tier\":%d,\"stood\":%s,\"confidence\":%.6f,"
-                "\"rating\":%.3f,\"deviation\":%.3f,\"volatility\":%.6f,\"matches\":%d,\"constituents\":",
+                "\"rating\":%.3f,\"deviation\":%.3f,\"volatility\":%.6f,\"matches\":%" PRId64 ",\"constituents\":",
                 shown ? "," : "", eid, (int)s->tier, s->stood ? "true" : "false", conf[order[i]],
                 s->r.rating, s->r.deviation, s->r.volatility, s->matches);
         emit_ids(&out, &un, &ucap, s->path, s->path_len, &nids);
