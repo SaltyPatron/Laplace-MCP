@@ -209,16 +209,7 @@ def package_resources(config, source, stage, recipe_grammars=None):
         for key, name in (('tier0', 'tier0.bin'), ('flags', 'tier0.flags'), ('highway', 'tier0.highway')):
             artifacts.materialize_file(config[key], stage / 'share/prepared' / name, store)
         artifacts.materialize_file(config['flags'] + '.layout', stage / 'share/prepared/tier0.flags.layout', store)
-        grammars = {path.name: path for path in sorted(Path(config['grammars']).glob('*.so'))}
-        if recipe_grammars is not None:
-            selected = list(Path(recipe_grammars).glob('*.so'))
-            if not selected:
-                raise ValueError('The selected Engine produced no recipe grammars')
-            # Prepared external code grammars remain inputs. Engine-owned
-            # packaging grammars always come from this release's source vector.
-            grammars.update((path.name, path) for path in selected)
-        if not grammars:
-            raise ValueError('No compiled grammars at the declared input root')
+        grammars = artifacts.grammar_inputs(config['grammars'], recipe_grammars)
         for grammar in grammars.values():
             artifacts.materialize_file(grammar, stage / 'share/grammars' / grammar.name, store)
 

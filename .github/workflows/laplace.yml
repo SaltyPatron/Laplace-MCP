@@ -32,9 +32,12 @@ jobs:
           export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native LAPLACE_OPERATIONS=$GITHUB_WORKSPACE/Laplace-Operations
           export LAPLACE_ENGINE_SRC=$GITHUB_WORKSPACE/Laplace-Engine/src OMP_NUM_THREADS=$(nproc) MKL_NUM_THREADS=$(nproc)
           . Laplace-Operations/laplace.env
-          export LAPLACE_GRAMMARS="$LAPLACE_BUILD/Laplace-MCP/grammars"
+          prepared_grammars=$LAPLACE_GRAMMARS
+          compiled_grammars="$LAPLACE_BUILD/Laplace-MCP/grammars"
+          bash Laplace-Engine/tools/build_grammars.sh Laplace-Engine/recipes/formats/grammars "$compiled_grammars"
+          export LAPLACE_GRAMMARS="$RUNNER_TEMP/mcp/grammars"
+          python3 Laplace-Operations/installation/artifact_store.py --prepared "$prepared_grammars" --compiled "$compiled_grammars" --output "$LAPLACE_GRAMMARS"
           echo "LAPLACE_GRAMMARS=$LAPLACE_GRAMMARS" >> "$GITHUB_ENV"
-          bash Laplace-Engine/tools/build_grammars.sh Laplace-Engine/recipes/formats/grammars "$LAPLACE_GRAMMARS"
           cmake -S Laplace-MCP -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAPLACE_BUNDLE_ENGINE=ON -DLAPLACE_INSTALL_RECIPE_RESOURCES=OFF
           cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib
           # A second build must leave every target current, including the shared Native dependency.
