@@ -2855,9 +2855,6 @@ int api_mcp_stdio(void) {
 #endif
     engine_resolve();
     T0 = lp_tier0_map(NULL);
-#ifdef _WIN32
-    if (!T0) T0 = lp_tier0_map("E:/Data/Laplace/work/modular-client/prepared/tier0.bin");
-#endif
     if (!T0) {
         fprintf(stderr, "tier 0 did not map\n");
         return 1;
@@ -2956,9 +2953,6 @@ int api_serve(const char *host, int port) {
 #endif
     engine_resolve();
     T0 = lp_tier0_map(NULL);
-#ifdef _WIN32
-    if (!T0) T0 = lp_tier0_map("E:/Data/Laplace/work/modular-client/prepared/tier0.bin");
-#endif
     if (!T0) {
         fprintf(stderr, "tier 0 did not map\n");
         return 1;

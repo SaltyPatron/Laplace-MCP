@@ -194,11 +194,14 @@ class Deployment(unittest.TestCase):
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_missing_selected_cache_is_not_replaced_by_another_installation(self):
-        environment = dict(self.environment, LAPLACE_TIER0=str(self.work / 'absent-tier0.bin'))
-        process = subprocess.run([str(BINARY), 'text', 'Argentina'], env=environment,
-                                 cwd=self.work, capture_output=True, text=True, timeout=15)
-        self.assertNotEqual(process.returncode, 0)
-        self.assertIn('tier 0 did not map', process.stderr)
+        environment = dict(self.environment, LAPLACE_TIER0=str(self.work / 'absent-tier0.bin'),
+                           LAPLACE_MCP_TOKEN='cache-selection-acceptance-token-0123456789')
+        for arguments in (['text', 'Argentina'], ['mcp'], ['serve', '127.0.0.1', '0']):
+            with self.subTest(arguments=arguments):
+                process = subprocess.run([str(BINARY), *arguments], env=environment, input='',
+                                         cwd=self.work, capture_output=True, text=True, timeout=15)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertIn('tier 0 did not map', process.stderr)
 
     def test_actual_native_listener_authenticates_with_candidate_token(self):
         subprocess.run([str(BINARY), 'check'], env=self.environment, cwd=self.work,
