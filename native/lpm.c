@@ -247,9 +247,6 @@ Lpm *lpm_new(const char *tier0) {
     Lpm *ix = calloc(1, sizeof *ix);
     if (!ix) return NULL;
     ix->t0 = lp_tier0_map(tier0 && *tier0 ? tier0 : NULL);
-#ifdef _WIN32
-    if (!ix->t0) ix->t0 = lp_tier0_map("E:/Data/Laplace/work/modular-client/prepared/tier0.bin");
-#endif
     if (!ix->t0) { free(ix); return NULL; }
     ix->text = lp_text_new(ix->t0);
     if (!ix->text) { free(ix); return NULL; }

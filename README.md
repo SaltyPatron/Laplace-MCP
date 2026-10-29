@@ -17,6 +17,11 @@ inputs. Native verifies that the bundled manifests reproduce Highway without
 corpora or a database. Grammar generator sources stay in the build estate.
 Resources share Operations' immutable file store under the modular prefix;
 release retirement removes orphaned blobs after their last retained link.
+The locked `incremental` build profile retains one detached source tree per
+repository. Engine and MCP share one Native and Tree-sitter build graph. Ninja
+rebuilds changed inputs; a toolchain fingerprint change or `--clean-build`
+explicitly cleans that graph. Uncommitted edits or an attached branch in a build
+snapshot stop packaging instead of being overwritten.
 
 The service compiles the pinned Engine's selected-ID reader and connection-owned
 SQL plan manager. Plans retain SQL contents and follow libpq reset/destruction;

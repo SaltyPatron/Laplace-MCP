@@ -103,7 +103,9 @@ class PackageUpgradeRequired(ValueError):
 
 
 def run(args, **kwargs):
-    return subprocess.run([str(v) for v in args], check=True, text=True, **kwargs)
+    kwargs.setdefault('check', True)
+    kwargs.setdefault('text', True)
+    return subprocess.run([str(v) for v in args], **kwargs)
 
 
 def digest(path):
@@ -229,6 +231,57 @@ def verify_frozen_manifest(config, stage, environment):
             raise ValueError('Prepared Highway differs from the packaged frozen manifests: ' + ' versus '.join(fingerprints))
 
 
+def synchronize_sources(source, snapshot, revisions):
+    """Keep one clean, detached source tree per repository under the build lock."""
+    source, snapshot = Path(source), Path(snapshot)
+    if not snapshot.is_absolute() or any(path.is_symlink() for path in (snapshot, *snapshot.parents)):
+        raise ValueError('Build source snapshots need an absolute, unlinked root')
+    if any(not re.fullmatch(r'Laplace-[A-Za-z0-9_.-]+', repo) or not re.fullmatch('[0-9a-f]{40}', revision)
+           for repo, revision in revisions.items()):
+        raise ValueError('Invalid source snapshot revision selection')
+    snapshot.mkdir(parents=True, exist_ok=True)
+    for repo, revision in revisions.items():
+        destination = snapshot / repo
+        existed = destination.exists()
+        if destination.is_symlink():
+            raise ValueError('Build source snapshot must not be a link: ' + repo)
+        if not existed:
+            run(['git', 'clone', '--quiet', '--shared', '--no-checkout', source / repo, destination])
+        git = ['git', '-c', 'safe.directory=' + str(destination), '-C', destination]
+        if run([*git, 'status', '--porcelain'], capture_output=True).stdout.strip():
+            # --no-checkout has no working tree yet; inspect existing trees only.
+            if existed:
+                raise ValueError('Build source snapshot was modified: ' + repo)
+        if existed and run([*git, 'symbolic-ref', '-q', 'HEAD'], capture_output=True, check=False).returncode == 0:
+            raise ValueError('Build source snapshot has an attached branch: ' + repo)
+        current = run([*git, 'rev-parse', 'HEAD'], capture_output=True).stdout.strip()
+        if not existed or current != revision:
+            if run([*git, 'cat-file', '-e', revision + '^{commit}'], capture_output=True, check=False).returncode:
+                run([*git, 'fetch', '--quiet', '--no-tags', source / repo, revision])
+            run([*git, 'checkout', '--quiet', '--detach', revision])
+        if run([*git, 'status', '--porcelain'], capture_output=True).stdout.strip():
+            raise ValueError('Build source snapshot was modified: ' + repo)
+    return snapshot
+
+
+def toolchain_context(source, environment):
+    operations = source / 'Laplace-Operations'
+    files = {path.relative_to(operations).as_posix(): digest(path)
+             for path in (operations / 'toolchain').rglob('*') if path.is_file() and path.suffix in ('.cmake', '.tsv')}
+    files['dependencies.tsv'] = digest(operations / 'dependencies.tsv')
+    compilers = {}
+    for name in ('icx', 'icpx'):
+        executable = shutil.which(name, path=environment.get('PATH'))
+        if not executable:
+            raise ValueError('The declared compiler is absent: ' + name)
+        compilers[name] = dict(path=executable, sha256=digest(executable),
+                               version=run([executable, '--version'], capture_output=True, env=environment).stdout)
+    variables = {name: environment.get(name, '') for name in
+                 ('CC', 'CXX', 'CFLAGS', 'CXXFLAGS', 'LDFLAGS', 'MKLROOT', 'TBBROOT', 'ICU_ROOT',
+                  'LAPLACE_DEPS', 'LAPLACE_PG_DIR', 'LAPLACE_ICU_DIR', 'LAPLACE_ONEAPI')}
+    return hashlib.sha256(json.dumps(dict(schema=1, files=files, compilers=compilers, environment=variables), sort_keys=True).encode()).hexdigest()
+
+
 def _package(config, output, clean_build=False):
     source, build, prefix = (Path(config[k]) for k in ('source', 'build', 'prefix'))
     revisions = {}
@@ -238,20 +291,12 @@ def _package(config, output, clean_build=False):
             raise ValueError('Commit the selected source before packaging: ' + repo)
         revisions[repo] = run(['git', '-C', checkout, 'rev-parse', 'HEAD'], capture_output=True).stdout.strip()
     build_identity = hashlib.sha256(json.dumps({'source': str(source.resolve()), 'builder': os.geteuid(), 'revisions': revisions}, sort_keys=True).encode()).hexdigest()
-    build = build / build_identity
+    # Source revisions select what to compile, not a new copy of every build
+    # tree. Ninja sees only changed files in this stable, locked profile.
+    build = build / 'incremental'
+    snapshot = synchronize_sources(source, build / 'sources', revisions)
     atomic_json(build / 'build-cache.json', {'schema': BUILD_CACHE_SCHEMA, 'identity': build_identity,
                                            'revisions': revisions})
-    # Build exact Git trees. Untracked developer files and the old in-source
-    # serving binaries stay untouched and cannot enter the installed package.
-    snapshot = build / 'sources'
-    snapshot.mkdir(parents=True, exist_ok=True)
-    for repo, revision in revisions.items():
-        destination = snapshot / repo
-        if not destination.exists():
-            run(['git', 'clone', '--quiet', '--shared', '--no-checkout', source / repo, destination])
-            run(['git', '-C', destination, 'checkout', '--quiet', '--detach', revision])
-        if run(['git', '-C', destination, 'rev-parse', 'HEAD'], capture_output=True).stdout.strip() != revision or run(['git', '-C', destination, 'status', '--porcelain'], capture_output=True).stdout.strip():
-            raise ValueError('Build source snapshot was modified: ' + repo)
     source = snapshot
     environment = dict(os.environ, LAPLACE_SRC=str(source), LAPLACE_BUILD=str(build),
                        LAPLACE_NATIVE=str(source / 'Laplace-Native'),
@@ -267,15 +312,20 @@ def _package(config, output, clean_build=False):
     # supplies the toolchain session; service processes never inherit that session.
     with tempfile.TemporaryDirectory(prefix='.package-', dir=release_root) as temporary:
         stage = Path(temporary) / 'root'
-        for repo in ('Laplace-Engine', 'Laplace-MCP'):
-            tree = build / repo
-            run(['cmake', '-S', source / repo, '-B', tree, '-G', 'Ninja',
-                 '-DCMAKE_C_COMPILER=icx', '-DCMAKE_CXX_COMPILER=icpx',
-                 '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DCMAKE_INSTALL_LIBDIR=lib',
-                 '-DLAPLACE_CONNINFO='], env=environment)
-            run(['cmake', '--build', tree, '--parallel', config['build_jobs'],
-                 *(['--clean-first'] if clean_build else [])], env=environment)
-            run(['cmake', '--install', tree, '--prefix', stage], env=environment)
+        tree = build / 'runtime'
+        context = toolchain_context(source, environment)
+        context_file = build / 'toolchain-context.json'
+        previous = json.loads(context_file.read_text()) if context_file.exists() else {}
+        run(['cmake', '-S', source / 'Laplace-MCP', '-B', tree, '-G', 'Ninja',
+             '-DCMAKE_C_COMPILER=icx', '-DCMAKE_CXX_COMPILER=icpx',
+             '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DCMAKE_INSTALL_LIBDIR=lib',
+             '-DLAPLACE_BUNDLE_ENGINE=ON', '-DLAPLACE_INSTALL_RECIPE_RESOURCES=OFF', '-DLAPLACE_CONNINFO='], env=environment)
+        if clean_build or previous.get('fingerprint') != context:
+            run(['cmake', '--build', tree, '--target', 'clean'], env=environment)
+        atomic_json(context_file, {'fingerprint': context})
+        run(['cmake', '--build', tree, '--parallel', config['build_jobs'], '--target',
+             'laplace_engine', 'lpm_program', 'lpm_lib'], env=environment)
+        run(['cmake', '--install', tree, '--prefix', stage], env=environment)
         controller = stage / CONTROLLER
         controller.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / 'Laplace-MCP/deployment.py', controller)

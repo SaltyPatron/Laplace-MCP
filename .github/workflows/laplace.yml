@@ -17,9 +17,9 @@ jobs:
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: 044bd4a361ce32d8a840a480a83bbfd3321ec34e, path: Laplace-Native }
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: eed0a3fd2713a185047286a180cf6c05f1438fba, path: Laplace-Engine }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: cbf7165b168c7e39774c43a6f1a40708c6e63e87, path: Laplace-Engine }
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: 93590436ed11fffb5a7e93732a7433c5e4e6ddb3, path: Laplace-postgres }
+        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: 9486ad3fe58d55a637afafdb80d0afef38010734, path: Laplace-postgres }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
       - name: build
@@ -27,11 +27,11 @@ jobs:
           . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
           export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native LAPLACE_OPERATIONS=$GITHUB_WORKSPACE/Laplace-Operations
           export LAPLACE_ENGINE_SRC=$GITHUB_WORKSPACE/Laplace-Engine/src OMP_NUM_THREADS=$(nproc) MKL_NUM_THREADS=$(nproc)
-          cmake -S Laplace-MCP -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release"
-          # the engine at the same checkout, for the checks that stand a disposable database up and ingest into it
-          cmake -S Laplace-Engine -B "$LAPLACE_BUILD/Laplace-MCP/engine" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          cmake --build "$LAPLACE_BUILD/Laplace-MCP/engine"
+          cmake -S Laplace-MCP -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAPLACE_BUNDLE_ENGINE=ON -DLAPLACE_INSTALL_RECIPE_RESOURCES=OFF
+          cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib
+          # A second build must leave every target current, including the shared Native dependency.
+          ninja -C "$LAPLACE_BUILD/Laplace-MCP/icx-release" -n laplace_engine lpm_program lpm_lib | tee "$RUNNER_TEMP/modular-noop.txt"
+          grep -Fx 'ninja: no work to do.' "$RUNNER_TEMP/modular-noop.txt"
           echo "built against Laplace-Native $(git -C Laplace-Native rev-parse --short HEAD) and Laplace-Engine $(git -C Laplace-Engine rev-parse --short HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Start the pinned Native PostgreSQL candidate
         run: |
@@ -42,19 +42,20 @@ jobs:
       - name: checks
         run: |
           L=$LAPLACE_BUILD/Laplace-MCP/icx-release/lpm
+          E=$LAPLACE_BUILD/Laplace-MCP/icx-release/engine/laplace
           [ -s "$LAPLACE_TIER0" ] || { echo "Required tier 0 is missing at $LAPLACE_TIER0; install prepared inputs before verification"; exit 1; }
           "$L" check
           python3 Laplace-MCP/tests/deployment-runtime.py "$L"
           "$L" text 'Sherlock Holmes'
           python3 Laplace-MCP/tests/text-floor.py "$L"
-          python3 Laplace-MCP/tests/engine-output.py "$L" "$LAPLACE_BUILD/Laplace-MCP/engine/laplace"
+          python3 Laplace-MCP/tests/engine-output.py "$L" "$E"
           python3 Laplace-MCP/tests/serve-auth.py "$L"
           python3 Laplace-MCP/tests/code-index.py "$L"
           python3 Laplace-MCP/tests/code-semantic.py "$L"
           python3 Laplace-MCP/tests/code-search-eval.py "$L" --min-mrr "${LPM_EVAL_MIN_MRR:-0.45}"
           python3 Laplace-MCP/tests/rerank-length.py "$L"
-          TMPDIR=${RUNNER_TEMP:?} LAPLACE_RECIPES=$GITHUB_WORKSPACE/Laplace-Engine/recipes python3 Laplace-MCP/tests/code-where.py "$L" "$LAPLACE_BUILD/Laplace-MCP/engine/laplace"
-          LAPLACE_WORK=${RUNNER_TEMP:?} python3 Laplace-MCP/tests/read-snapshot.py "$L" "$LAPLACE_BUILD/Laplace-MCP/engine/laplace"
+          TMPDIR=${RUNNER_TEMP:?} LAPLACE_RECIPES=$GITHUB_WORKSPACE/Laplace-Engine/recipes python3 Laplace-MCP/tests/code-where.py "$L" "$E"
+          LAPLACE_WORK=${RUNNER_TEMP:?} python3 Laplace-MCP/tests/read-snapshot.py "$L" "$E"
       - name: Stop the private PostgreSQL instance
         if: always()
         run: python3 Laplace-Engine/tools/ci/postgres.py stop "$RUNNER_TEMP/mcp-pg"

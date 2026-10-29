@@ -40,6 +40,31 @@ class Deployment(unittest.TestCase):
             self.assertTrue(Path(environment['LAPLACE_' + name]).is_relative_to(release))
         self.assertEqual(environment['LAPLACE_CONNINFO'], config['connection'])
 
+    def test_source_revision_changes_preserve_unchanged_files_and_reject_user_edits(self):
+        source = self.work / 'selected-sources'
+        repository = source / 'Laplace-MCP'
+        repository.mkdir(parents=True)
+        subprocess.run(['git', 'init', '--quiet', repository], check=True)
+        def commit(message):
+            subprocess.run(['git', '-C', repository, 'add', '.'], check=True)
+            subprocess.run(['git', '-C', repository, '-c', 'user.name=Cache acceptance',
+                            '-c', 'user.email=cache@example.invalid', 'commit', '--quiet', '-m', message], check=True)
+            return subprocess.check_output(['git', '-C', repository, 'rev-parse', 'HEAD'], text=True).strip()
+        (repository / 'reader.c').write_text('int reader(void){return 1;}')
+        first = commit('Initial source')
+        snapshot = self.work / 'incremental/sources'
+        deployment.synchronize_sources(source, snapshot, {'Laplace-MCP': first})
+        compiled_input = snapshot / 'Laplace-MCP/reader.c'
+        timestamp = compiled_input.stat().st_mtime_ns
+        (repository / 'README.md').write_text('Documentation changed')
+        second = commit('Documentation only')
+        deployment.synchronize_sources(source, snapshot, {'Laplace-MCP': second})
+        self.assertEqual(timestamp, compiled_input.stat().st_mtime_ns)
+        compiled_input.write_text('unfinished operator edit')
+        with self.assertRaisesRegex(ValueError, 'snapshot was modified'):
+            deployment.synchronize_sources(source, snapshot, {'Laplace-MCP': first})
+        self.assertEqual(compiled_input.read_text(), 'unfinished operator edit')
+
     def test_resources_are_shared_without_linking_mutable_build_outputs(self):
         source = self.work / 'sources'
         artifact_owner = Path(os.environ.get('LAPLACE_OPERATIONS', ROOT.parent / 'Laplace-Operations')) / 'installation/artifact_store.py'
@@ -154,6 +179,9 @@ class Deployment(unittest.TestCase):
         for name in ('lpm', 'laplace'):
             shutil.copyfile(BINARY, stage / 'bin' / name)
             (stage / 'bin' / name).chmod(0o755)
+        prepared = stage / 'share/prepared'
+        prepared.mkdir(parents=True)
+        shutil.copyfile(os.environ['LAPLACE_TIER0'], prepared / 'tier0.bin')
         deployment.runtime_launchers(stage)
         alias = self.work / 'current'
         alias.symlink_to(stage, target_is_directory=True)
@@ -164,6 +192,13 @@ class Deployment(unittest.TestCase):
                     fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with (stage / '.runtime-lease').open() as lease:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_missing_selected_cache_is_not_replaced_by_another_installation(self):
+        environment = dict(self.environment, LAPLACE_TIER0=str(self.work / 'absent-tier0.bin'))
+        process = subprocess.run([str(BINARY), 'text', 'Argentina'], env=environment,
+                                 cwd=self.work, capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn('tier 0 did not map', process.stderr)
 
     def test_actual_native_listener_authenticates_with_candidate_token(self):
         subprocess.run([str(BINARY), 'check'], env=self.environment, cwd=self.work,
