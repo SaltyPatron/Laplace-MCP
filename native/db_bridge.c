@@ -20,9 +20,7 @@ const char *db_noted(void) { return noted_conn; }
 void lpm_read_scope(PGconn *pg,const char *connection){
     read_master=pg;snprintf(noted_conn,sizeof noted_conn,"%s",connection);
 }
-const char *db_snapshot(void){return read_master?db_read_snapshot(read_master):NULL;}
 void lpm_read_end(void){
-    db_read_pool_end();
     if(read_master && !db_read_end(read_master))PQreset(read_master);
     read_master=NULL;
 }
@@ -33,8 +31,7 @@ void *xrealloc(void *p, size_t n) {
     return p;
 }
 
-/* read.c times its pool with the engine's now(). The engine defines that in table.c, which this
- * service does not link; xrealloc above is the same kind of symbol. */
+/* The Engine's shared reader uses these runtime allocation/time adapters. */
 double now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);

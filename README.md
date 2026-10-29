@@ -22,9 +22,12 @@ per-child SQL or client-side partition-name construction.
 The database readback test installs both extensions in separate named schemas
 with conflicting public objects and a restricted search path, then reads the
 ingested source through search, forward, code and provenance tools.
-Each database-backed response shares one read-only snapshot between its main
-connection and pooled readers. Response completion releases every transaction;
-the next request imports its new snapshot on the same pooled connections.
+Each database-backed response uses one connection-owned read-only snapshot.
+The Engine's `read.c` delegates containment and exact cap classification to
+Native `laplace_holders` / `laplace_containers`; typed standings come from
+`laplace_standings`. There is no per-partition SQL or second read pool.
+Response completion releases the transaction; the next request reuses the
+connection and plans with a fresh snapshot.
 `tests/read-snapshot.py` publishes another real source between persistent
 requests and checks refreshed witness authority, idle transactions and PID reuse.
 Observation counts retain their PostgreSQL 64-bit value in JSON responses.

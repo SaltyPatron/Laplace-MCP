@@ -17,7 +17,9 @@ jobs:
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: 044bd4a361ce32d8a840a480a83bbfd3321ec34e, path: Laplace-Native }
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: d0b1ce3f3b381b11cabc78b3156ef5e8b5482fea, path: Laplace-Engine }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: eed0a3fd2713a185047286a180cf6c05f1438fba, path: Laplace-Engine }
+      - uses: actions/checkout@v4
+        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: 93590436ed11fffb5a7e93732a7433c5e4e6ddb3, path: Laplace-postgres }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
       - name: build
@@ -31,6 +33,12 @@ jobs:
           cmake -S Laplace-Engine -B "$LAPLACE_BUILD/Laplace-MCP/engine" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo
           cmake --build "$LAPLACE_BUILD/Laplace-MCP/engine"
           echo "built against Laplace-Native $(git -C Laplace-Native rev-parse --short HEAD) and Laplace-Engine $(git -C Laplace-Engine rev-parse --short HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Start the pinned Native PostgreSQL candidate
+        run: |
+          . Laplace-Operations/laplace.env
+          . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
+          export LAPLACE_NATIVE="$GITHUB_WORKSPACE/Laplace-Native"
+          python3 Laplace-Engine/tools/ci/postgres.py start "$RUNNER_TEMP/mcp-pg" --source "$GITHUB_WORKSPACE/Laplace-postgres"
       - name: checks
         run: |
           L=$LAPLACE_BUILD/Laplace-MCP/icx-release/lpm
@@ -47,6 +55,9 @@ jobs:
           python3 Laplace-MCP/tests/rerank-length.py "$L"
           TMPDIR=${RUNNER_TEMP:?} LAPLACE_RECIPES=$GITHUB_WORKSPACE/Laplace-Engine/recipes python3 Laplace-MCP/tests/code-where.py "$L" "$LAPLACE_BUILD/Laplace-MCP/engine/laplace"
           LAPLACE_WORK=${RUNNER_TEMP:?} python3 Laplace-MCP/tests/read-snapshot.py "$L" "$LAPLACE_BUILD/Laplace-MCP/engine/laplace"
+      - name: Stop the private PostgreSQL instance
+        if: always()
+        run: python3 Laplace-Engine/tools/ci/postgres.py stop "$RUNNER_TEMP/mcp-pg"
   deploy:
     needs: mcp
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

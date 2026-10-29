@@ -91,12 +91,12 @@ try:
         def connections():
             rows=sql(name,f"SELECT pid,(xact_start IS NULL AND backend_xmin IS NULL)::int FROM pg_stat_activity WHERE application_name='{application}' ORDER BY pid")
             result={int(pid):int(idle) for pid,idle in (line.split('|') for line in rows.splitlines())}
-            assert len(result)>=3 and all(result.values()),result
+            assert len(result)==1 and all(result.values()),result
             return set(result)
 
-        # Stop only this fixture's new namespace lookups. The request's main
-        # connection must already own its exported read snapshot before the
-        # pooled readers can proceed. No source write is blocked or simulated.
+        # Stop this fixture's first namespace lookup. Its sole request connection
+        # must already own a read snapshot before the indexed reads proceed.
+        # The Engine lifecycle test independently proves writer isolation.
         gate=subprocess.Popen([psql,'-XwAtq','-h',host,'-p',port,'-U',user,'-d',name,
                                '-v','ON_ERROR_STOP=1'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE,text=True,encoding='utf-8')
@@ -112,10 +112,10 @@ try:
             try:
                 deadline=time.monotonic()+15
                 while True:
-                    observed=sql(name,f"SELECT (state='idle in transaction' AND query LIKE '%pg_catalog.pg_export_snapshot()%')::int,coalesce((wait_event_type='Lock')::int,0) FROM pg_stat_activity WHERE application_name='{application}'")
+                    observed=sql(name,f"SELECT (backend_xmin IS NOT NULL AND xact_start IS NOT NULL)::int,coalesce((wait_event_type='Lock')::int,0) FROM pg_stat_activity WHERE application_name='{application}'")
                     rows=[line.split('|') for line in observed.splitlines()]
                     if any(row[1]=='1' for row in rows):
-                        assert any(row[0]=='1' for row in rows),observed
+                        assert len(rows)==1 and rows[0][0]=='1',observed
                         break
                     if pending.done() or time.monotonic()>deadline:raise AssertionError('The request did not reach its owned read scope: '+observed)
                     time.sleep(.05)
@@ -150,6 +150,6 @@ try:
         third=request('/v1/search',{'input':'dog'})
         assert next(row['matches'] for row in third['claims'] if row['entity']==claim)==wide_count,third
         assert connections()==pids
-        print('read-snapshot: snapshot precedes pooled reads; source authority and 64-bit counts refresh between requests; all transactions released and connection PIDs reused')
+        print('read-snapshot: one connection owns the snapshot and Native reads; source authority and 64-bit counts refresh between requests; all transactions released and connection PIDs reused')
 finally:
     if created:sql('postgres',f'DROP DATABASE "{name}" WITH (FORCE)')

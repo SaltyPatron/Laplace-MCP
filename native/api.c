@@ -606,7 +606,7 @@ static void on_search(int c, const char *body) {
     t0 = nsec();
     int nh = 0;
     int floor = known ? (int)trunk.tier : -1;
-    Hold *h = holds_above(&trunk.id, 1, floor, 0, 1, &nh);
+    Hold *h = holds_above(pg,&trunk.id, 1, floor, 0, 1, &nh);
     uint8_t ab[40];
     size_t al = ids_param(pg,ab, &trunk.id, 1);
     const char *pv[1] = { (const char *)ab };
@@ -664,7 +664,7 @@ static void on_search(int c, const char *body) {
     }
     for (int i = 0; i < ndown; i++) {
         if (down[i].tier < 2) continue;
-        down[i].h = holds_above(&down[i].id, 1, down[i].tier, 0, 1, &down[i].nh);
+        down[i].h = holds_above(pg,&down[i].id, 1, down[i].tier, 0, 1, &down[i].nh);
         int nc = 0;
         for (int k = 0; k < down[i].nh; k++) nc += down[i].h[k].claim;
         lp_id *cids2 = malloc(sizeof(lp_id) * (size_t)(nc + 1));
@@ -1770,7 +1770,7 @@ static char *cw_file_name(Reader *rd, const lp_id *file) {
  * that claim, said as a record (LP_SAID_RECORD) where it stands, so a holder of the name said so one level up is a claim
  * too, as the engine's walk up counts it (walk_up): a file that declares one thing defines it. The front is bounded, so a
  * name as common as a keyword answers what it reached and says so. */
-static int cw_walk_many(const lp_id *names, size_t count, CwDag *d, size_t max_nodes, int *levels, int *cut) {
+static int cw_walk_many(PGconn *pg,const lp_id *names, size_t count, CwDag *d, size_t max_nodes, int *levels, int *cut) {
     d->m = lp_idmap_new();
     lp_idmap *front = lp_idmap_new();
     for (size_t i=0;i<count;i++) { cw_node(d,&names[i],NULL); lp_idmap_put(front,&names[i],NULL); }
@@ -1779,7 +1779,7 @@ static int cw_walk_many(const lp_id *names, size_t count, CwDag *d, size_t max_n
     *cut = 0;
     while (lp_idmap_count(front) && level < 128) {
         int nh = 0;
-        Hold *h = holds_any(lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
+        Hold *h = holds_any(pg,lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
         lp_idmap *next = lp_idmap_new();
         for (int j = 0; j < nh && !*cut; j++) {
             size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
@@ -1810,8 +1810,8 @@ static int cw_walk_many(const lp_id *names, size_t count, CwDag *d, size_t max_n
     *levels = level;
     return files;
 }
-static int cw_walk(const lp_id *name, CwDag *d, size_t max_nodes, int *levels, int *cut) {
-    return cw_walk_many(name,1,d,max_nodes,levels,cut);
+static int cw_walk(PGconn *pg,const lp_id *name, CwDag *d, size_t max_nodes, int *levels, int *cut) {
+    return cw_walk_many(pg,name,1,d,max_nodes,levels,cut);
 }
 
 static size_t cw_lines(const char *text, size_t upto) {
@@ -2013,7 +2013,7 @@ static void on_file_outline(int c, const char *body) {
         lp_vec(lp_vertex) vx = { 0 };
         for (int level = 0; level < 10 && lp_idmap_count(front) && lp_idmap_count(seen) < 20000; level++) {
             int nh = 0;
-            Hold *h = holds_any(lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
+            Hold *h = holds_any(pg,lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
             lp_idmap *next = lp_idmap_new();
             for (int j = 0; j < nh; j++) {
                 size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
@@ -2109,7 +2109,7 @@ static void on_code_where(int c, const char *body) {
     if (!name_entity(name,&trunk,parts,256,&np)) { http(c,500,"{\"error\":\"tier0\"}"); return; }
     PGconn *pg=cc_db(c); if(!pg) return;
     uint64_t t0=nsec(); CwDag d={0}; int levels=0,cut=0;
-    int nfiles=cw_walk(&trunk.id,&d,400000,&levels,&cut);
+    int nfiles=cw_walk(pg,&trunk.id,&d,400000,&levels,&cut);
     Reader *rd=reader_new(pg);
     typedef struct { CwFile rank; FoDecl *declarations; size_t count,length; char *text; } Found;
     Found *found=calloc((size_t)nfiles+1,sizeof *found); size_t nf=0;
@@ -2221,7 +2221,7 @@ static void on_code_callers(int c, const char *body) {
     uint64_t t0 = nsec();
     CwDag d = { 0 };
     int levels = 0, cut = 0;
-    cw_walk(&trunk.id, &d, 400000, &levels, &cut);
+    cw_walk(pg,&trunk.id, &d, 400000, &levels, &cut);
     Reader *rd = reader_new(pg);
     char *out = NULL, *top = NULL;
     size_t on = 0, ocap = 0, tn = 0, tcap = 0, files = 0;
@@ -2312,7 +2312,7 @@ static void on_code_callees(int c, const char *body) {
     uint64_t t0 = nsec();
     CwDag d = { 0 };
     int levels = 0, cut = 0;
-    cw_walk(&trunk.id, &d, 400000, &levels, &cut);
+    cw_walk(pg,&trunk.id, &d, 400000, &levels, &cut);
     Reader *rd = reader_new(pg);
     /* the definitions: each its file, its outline entry and its code; the names each calls, by candidate index */
     typedef struct { size_t node; char *path, *kind; size_t line; long line1; lp_vec(size_t) calls; } CeDef;
@@ -2372,7 +2372,7 @@ static void on_code_callees(int c, const char *body) {
     size_t ncand = lp_idmap_count(cand);
     if (ncand) {
         CwDag holders = {0}; int candidate_levels=0,candidate_cut=0;
-        cw_walk_many(lp_idmap_keys(cand),ncand,&holders,400000,&candidate_levels,&candidate_cut);
+        cw_walk_many(pg,lp_idmap_keys(cand),ncand,&holders,400000,&candidate_levels,&candidate_cut);
         cut |= candidate_cut;
         for (size_t i=0;i<holders.nn;i++) {
             if (!holders.n[i].file) continue;
