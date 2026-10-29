@@ -22,11 +22,16 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: 9486ad3fe58d55a637afafdb80d0afef38010734, path: Laplace-postgres }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
+      - name: Provide the pinned Tree-sitter generator toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.90.0
       - name: build
         run: |
           . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
           export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native LAPLACE_OPERATIONS=$GITHUB_WORKSPACE/Laplace-Operations
           export LAPLACE_ENGINE_SRC=$GITHUB_WORKSPACE/Laplace-Engine/src OMP_NUM_THREADS=$(nproc) MKL_NUM_THREADS=$(nproc)
+          . Laplace-Operations/laplace.env
           export LAPLACE_GRAMMARS="$LAPLACE_BUILD/Laplace-MCP/grammars"
           echo "LAPLACE_GRAMMARS=$LAPLACE_GRAMMARS" >> "$GITHUB_ENV"
           bash Laplace-Engine/tools/build_grammars.sh Laplace-Engine/recipes/formats/grammars "$LAPLACE_GRAMMARS"
