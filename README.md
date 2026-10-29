@@ -18,6 +18,11 @@ arrays use that connection's installed Native/PostGIS namespaces and type OIDs.
 The database readback test installs both extensions in separate named schemas
 with conflicting public objects and a restricted search path, then reads the
 ingested source through search, forward, code and provenance tools.
+Each database-backed response shares one read-only snapshot between its main
+connection and pooled readers. Response completion releases every transaction;
+the next request imports its new snapshot on the same pooled connections.
+`tests/read-snapshot.py` publishes another real source between persistent
+requests and checks refreshed witness authority, idle transactions and PID reuse.
 Text display resolves scalars through Native's indexed floor,
 with no codepoint-offset assumption or 256-scalar selection limit.
 

@@ -1,6 +1,6 @@
 /* The connection the engine's reader uses. holds_above lives in Laplace-Engine/src/read.c;
  * the service links that file and these symbols, and does not fork the laplace binary. */
-#include "engine.h"
+#include "db_bridge.h"
 #include "lpm_config.h"
 
 #include <stdio.h>
@@ -9,6 +9,7 @@
 #include <time.h>
 
 static char noted_conn[8192];
+static PGconn *read_master;
 
 const char *laplace_db(void) {
     const char *v = getenv("LAPLACE_CONNINFO");
@@ -16,11 +17,15 @@ const char *laplace_db(void) {
 }
 const char *db_noted(void) { return noted_conn; }
 
-/* The engine's commands read under one exported snapshot (its main.c: db_read), which its pool takes when it opens.
- * This process outlives any one read and its pool opens once, so it names none: each statement sees the database as it
- * is when that statement begins, as this service has read since it was written. One world for a whole request needs
- * the engine's pool to take a snapshot per read; it has no call for that yet. */
-const char *db_snapshot(void) { return NULL; }
+void lpm_read_scope(PGconn *pg,const char *connection){
+    read_master=pg;snprintf(noted_conn,sizeof noted_conn,"%s",connection);
+}
+const char *db_snapshot(void){return read_master?db_read_snapshot(read_master):NULL;}
+void lpm_read_end(void){
+    db_read_pool_end();
+    if(read_master && !db_read_end(read_master))PQreset(read_master);
+    read_master=NULL;
+}
 
 void *xrealloc(void *p, size_t n) {
     p = realloc(p, n ? n : 1);

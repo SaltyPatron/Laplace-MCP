@@ -25,6 +25,7 @@ typedef intptr_t ssize_t;
 #include "lpm.h"
 #include "lpm_config.h"
 #include "engine.h"
+#include "db_bridge.h"
 #include "semantic.h"
 
 #include "laplace/laplace.h"
@@ -80,13 +81,15 @@ static int valid_id(const char *s) {
 }
 
 static PGconn *db(void) {
-    if (PG && PQstatus(PG) == CONNECTION_OK) return PG;
-    if (PG) PQfinish(PG);
     const char *ci = getenv("LAPLACE_CONNINFO");
     if (!ci || !*ci) ci = CONN_DEFAULT;
-    PG = PQconnectdb(ci);
+    if(!PG || PQstatus(PG)!=CONNECTION_OK){
+        if(PG){lpm_read_end();PQfinish(PG);}
+        PG=PQconnectdb(ci);db_notices(PG);
+    }
     if (PQstatus(PG) != CONNECTION_OK) return NULL;
-    db_notices(PG);
+    if(!db_read_snapshot(PG) && !db_read_begin(PG,NULL))return NULL;
+    lpm_read_scope(PG,ci);
     return PG;
 }
 
@@ -98,6 +101,7 @@ static int stdio_code;
 static char *stdio_body;
 
 static void http(int c, int code, const char *body) {
+    lpm_read_end();
     if (capture) {
         capture_code = code;
         free(capture_body);
@@ -586,6 +590,11 @@ static void on_search(int c, const char *body) {
         return;
     }
     double id_ms = (double)(nsec() - t0) / 1e6;
+    PGconn *pg=db();
+    if(!pg){
+        char escaped[512],error[640];json_esc(PQerrorMessage(PG),escaped,sizeof escaped);
+        snprintf(error,sizeof error,"{\"error\":\"database\",\"detail\":\"%s\"}",escaped);http(c,503,error);return;
+    }
     int fan = 0;
     jint(body, "fan", &fan);
     int known = np > 0;
@@ -602,15 +611,6 @@ static void on_search(int c, const char *body) {
     int nh = 0;
     int floor = known ? (int)trunk.tier : -1;
     Hold *h = holds_above(&trunk.id, 1, floor, 0, 1, &nh);
-    PGconn *pg = db();
-    if (!pg) {
-        holds_free(h, nh);
-        char e[512], b[640];
-        json_esc(PQerrorMessage(PG), e, sizeof e);
-        snprintf(b, sizeof b, "{\"error\":\"database\",\"detail\":\"%s\"}", e);
-        http(c, 503, b);
-        return;
-    }
     uint8_t ab[40];
     size_t al = ids_param(pg,ab, &trunk.id, 1);
     const char *pv[1] = { (const char *)ab };

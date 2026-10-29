@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: 044bd4a361ce32d8a840a480a83bbfd3321ec34e, path: Laplace-Native }
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: 3a114b77227314bcf4d908aa3d3078e5f68b6cda, path: Laplace-Engine }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: ec85d6bc0d6d2981e9626ac4bb12508d7b0c100e, path: Laplace-Engine }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
       - name: build
@@ -46,6 +46,7 @@ jobs:
           python3 Laplace-MCP/tests/code-search-eval.py "$L" --min-mrr "${LPM_EVAL_MIN_MRR:-0.45}"
           python3 Laplace-MCP/tests/rerank-length.py "$L"
           TMPDIR=${RUNNER_TEMP:?} LAPLACE_RECIPES=$GITHUB_WORKSPACE/Laplace-Engine/recipes python3 Laplace-MCP/tests/code-where.py "$L" "$LAPLACE_BUILD/Laplace-MCP/engine/laplace"
+          LAPLACE_WORK=${RUNNER_TEMP:?} PSQL=$(dirname "$PG_CONFIG")/psql python3 Laplace-MCP/tests/read-snapshot.py "$L" "$LAPLACE_BUILD/Laplace-MCP/engine/laplace"
   deploy:
     needs: mcp
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
