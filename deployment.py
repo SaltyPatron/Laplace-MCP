@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -296,6 +297,13 @@ def _package(config, output, clean_build=False):
     atomic_json(build / 'build-cache.json', {'schema': BUILD_CACHE_SCHEMA, 'identity': build_identity,
                                            'revisions': revisions})
     source = snapshot
+    client_controller = source / 'Laplace-Operations/installation/client.py'
+    spec = importlib.util.spec_from_file_location('laplace_packaged_client', client_controller)
+    client_api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client_api)
+    if not callable(getattr(client_api, 'run_client', None)):
+        raise ValueError('Selected Operations does not provide the packaged client interface')
+    inspect.signature(client_api.run_client).bind(Path('/client.json'), release=Path('/release'))
     environment = dict(os.environ, LAPLACE_SRC=str(source), LAPLACE_BUILD=str(build),
                        LAPLACE_NATIVE=str(source / 'Laplace-Native'),
                        LAPLACE_ENGINE_SRC=str(source / 'Laplace-Engine/src'),
@@ -331,6 +339,7 @@ def _package(config, output, clean_build=False):
         controller = stage / CONTROLLER
         controller.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / 'Laplace-MCP/deployment.py', controller)
+        shutil.copyfile(client_controller, stage / 'libexec/laplace-client.py')
         package_resources(config, source, stage, recipe_grammars)
         dependencies = {}
         for relative in ('bin/lpm', 'bin/laplace', 'lib/liblpm.so'):
@@ -379,7 +388,8 @@ def verify_package(release):
     if CONTROLLER not in receipt['files']:
         raise PackageUpgradeRequired('Modular package lacks its deployment controller; rebuild a compatible release')
     required = {'share/prepared/tier0.bin', 'share/prepared/tier0.flags', 'share/prepared/tier0.flags.layout',
-                'share/prepared/tier0.highway', 'share/manifest/banks.tsv', 'share/firmware/program.firmware'}
+                'share/prepared/tier0.highway', 'share/manifest/banks.tsv', 'share/firmware/program.firmware',
+                'libexec/laplace-client.py'}
     if not required.issubset(receipt['files']) or not any(name.startswith('share/grammars/') and name.endswith('.so') for name in receipt['files']):
         raise PackageUpgradeRequired('Modular package lacks its immutable runtime resources; rebuild a compatible release')
     if any(name.startswith('share/recipes/formats/grammars/') for name in receipt['files']):

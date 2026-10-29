@@ -108,7 +108,7 @@ class Deployment(unittest.TestCase):
                    hashlib.sha256(content).hexdigest()} if controller else {}}
         resources = ('share/prepared/tier0.bin', 'share/prepared/tier0.flags', 'share/prepared/tier0.flags.layout',
                      'share/prepared/tier0.highway', 'share/manifest/banks.tsv', 'share/firmware/program.firmware',
-                     'share/grammars/test.so')
+                     'share/grammars/test.so', 'libexec/laplace-client.py')
         receipt['files'].update({name: hashlib.sha256(b'fixture').hexdigest() for name in resources})
         identity = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
         release = self.work / identity
@@ -120,7 +120,7 @@ class Deployment(unittest.TestCase):
             path.write_bytes(b'fixture')
         if controller:
             path = release / deployment.CONTROLLER
-            path.parent.mkdir()
+            path.parent.mkdir(exist_ok=True)
             path.write_bytes(content)
         return release
 

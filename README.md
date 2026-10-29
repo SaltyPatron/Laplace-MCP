@@ -15,6 +15,8 @@ grammars, recipes and firmware. Runtime launchers select those immutable files;
 the configured `tier0`, `flags`, `highway` and `grammars` locations are packaging
 inputs. Native verifies that the bundled manifests reproduce Highway without
 corpora or a database. Grammar generator sources stay in the build estate.
+The release also contains Operations' matching human-client controller; the
+installed Linux command pins and loads it instead of retaining an old copy.
 Resources share Operations' immutable file store under the modular prefix;
 release retirement removes orphaned blobs after their last retained link.
 The locked `incremental` build profile retains one detached source tree per
