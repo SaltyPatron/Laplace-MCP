@@ -30,7 +30,7 @@ jobs:
           cmake -S Laplace-MCP -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAPLACE_BUNDLE_ENGINE=ON -DLAPLACE_INSTALL_RECIPE_RESOURCES=OFF
           cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib
           # A second build must leave every target current, including the shared Native dependency.
-          ninja -C "$LAPLACE_BUILD/Laplace-MCP/icx-release" -n laplace_engine lpm_program lpm_lib | tee "$RUNNER_TEMP/modular-noop.txt"
+          cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib | tee "$RUNNER_TEMP/modular-noop.txt"
           grep -Fx 'ninja: no work to do.' "$RUNNER_TEMP/modular-noop.txt"
           echo "built against Laplace-Native $(git -C Laplace-Native rev-parse --short HEAD) and Laplace-Engine $(git -C Laplace-Engine rev-parse --short HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Start the pinned Native PostgreSQL candidate
