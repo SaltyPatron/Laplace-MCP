@@ -54,6 +54,10 @@ class Deployment(unittest.TestCase):
         first = commit('Initial source')
         snapshot = self.work / 'incremental/sources'
         deployment.synchronize_sources(source, snapshot, {'Laplace-MCP': first})
+        self.assertFalse((snapshot / 'Laplace-MCP/.git/objects/info/alternates').exists(),
+                         'The reusable build snapshot still borrows objects from disposable CI work')
+        subprocess.run(['git', '-C', snapshot / 'Laplace-MCP', 'fsck', '--full'],
+                       check=True, capture_output=True)
         compiled_input = snapshot / 'Laplace-MCP/reader.c'
         timestamp = compiled_input.stat().st_mtime_ns
         (repository / 'README.md').write_text('Documentation changed')

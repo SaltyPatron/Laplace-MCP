@@ -245,7 +245,7 @@ def synchronize_sources(source, snapshot, revisions):
         if destination.is_symlink():
             raise ValueError('Build source snapshot must not be a link: ' + repo)
         if not existed:
-            run(['git', 'clone', '--quiet', '--shared', '--no-checkout', source / repo, destination])
+            run(['git', 'clone', '--quiet', '--shared', '--dissociate', '--no-checkout', source / repo, destination])
         git = ['git', '-c', 'safe.directory=' + str(destination), '-C', destination]
         if run([*git, 'status', '--porcelain'], capture_output=True).stdout.strip():
             # --no-checkout has no working tree yet; inspect existing trees only.
