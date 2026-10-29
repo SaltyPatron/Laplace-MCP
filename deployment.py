@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -145,11 +146,15 @@ def runtime_environment(config, release):
     return {
         'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8',
         'LAPLACE_CONNINFO': config['connection'],
-        'LAPLACE_TIER0': config['tier0'], 'LAPLACE_FLAGS': config['flags'],
-        'LAPLACE_HIGHWAY': config['highway'], 'LAPLACE_GRAMMARS': config['grammars'],
+        'LAPLACE_TIER0': str(Path(release) / 'share/prepared/tier0.bin'),
+        'LAPLACE_FLAGS': str(Path(release) / 'share/prepared/tier0.flags'),
+        'LAPLACE_HIGHWAY': str(Path(release) / 'share/prepared/tier0.highway'),
+        'LAPLACE_GRAMMARS': str(Path(release) / 'share/grammars'),
         'LAPLACE_UCD': config['ucd'], 'LAPLACE_WORK': config['state'],
         'LAPLACE_ENGINE': str(Path(release) / 'bin/laplace'),
         'LAPLACE_RECIPES': str(Path(release) / 'share/recipes'),
+        'LAPLACE_MANIFEST': str(Path(release) / 'share/manifest'),
+        'LAPLACE_FIRMWARE': str(Path(release) / 'share/firmware/program.firmware'),
         'LAPLACE_MCP_HOST': config['bind'], 'LAPLACE_MCP_PORT': str(config['http_port']),
         'OMP_NUM_THREADS': str(config['threads']), 'MKL_NUM_THREADS': '1',
         'LAPLACE_BATCH_MB': str(config['batch_mb']),
@@ -169,7 +174,10 @@ set -eu
 root=$(dirname "$(dirname "$(readlink -f "$0")")")
 exec 9<"$root/.runtime-lease"
 flock --shared 9
-export LAPLACE_ENGINE="$root/bin/laplace" LAPLACE_RECIPES="$root/share/recipes"
+export LAPLACE_ENGINE="$root/bin/laplace" LAPLACE_RECIPES="$root/share/recipes" LAPLACE_MANIFEST="$root/share/manifest"
+export LAPLACE_TIER0="$root/share/prepared/tier0.bin" LAPLACE_FLAGS="$root/share/prepared/tier0.flags"
+export LAPLACE_HIGHWAY="$root/share/prepared/tier0.highway" LAPLACE_GRAMMARS="$root/share/grammars"
+export LAPLACE_FIRMWARE="$root/share/firmware/program.firmware"
 exec "$root/libexec/''' + name + '''" "$@"
 ''')
         program.chmod(0o755)
@@ -181,6 +189,44 @@ def package(config, output, clean_build=False):
     os.umask(0o002)
     with build_cache_lock(config['build']):
         _package(config, output, clean_build)
+
+
+def package_resources(config, source, stage):
+    """Use Operations' shared immutable file store, never serving build outputs."""
+    spec = importlib.util.spec_from_file_location('artifact_store', source / 'Laplace-Operations/installation/artifact_store.py')
+    artifacts = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(artifacts)
+    store = Path(config['prefix']) / 'assets'
+    with artifacts.store_lock(store):
+        for owner, directory in (('Laplace-Engine', 'recipes'), ('Laplace-Engine', 'firmware'), ('Laplace-Native', 'manifest')):
+            root = source / owner / directory
+            for relative, expected in artifacts.files(root).items():
+                if directory == 'recipes' and relative.startswith('formats/grammars/'):
+                    continue
+                artifacts.materialize_file(root / relative, stage / 'share' / directory / relative, store, expected)
+        for key, name in (('tier0', 'tier0.bin'), ('flags', 'tier0.flags'), ('highway', 'tier0.highway')):
+            artifacts.materialize_file(config[key], stage / 'share/prepared' / name, store)
+        artifacts.materialize_file(config['flags'] + '.layout', stage / 'share/prepared/tier0.flags.layout', store)
+        grammars = sorted(Path(config['grammars']).glob('*.so'))
+        if not grammars:
+            raise ValueError('No compiled grammars at the declared input root')
+        for grammar in grammars:
+            artifacts.materialize_file(grammar, stage / 'share/grammars' / grammar.name, store)
+
+
+def verify_frozen_manifest(config, stage, environment):
+    executable = stage / 'bin/laplace'
+    environment = dict(environment, LAPLACE_TIER0=str(stage / 'share/prepared/tier0.bin'),
+                       LAPLACE_MANIFEST=str(stage / 'share/manifest'),
+                       LAPLACE_CONNINFO='host=127.0.0.1 port=1 connect_timeout=1 dbname=unused')
+    with tempfile.TemporaryDirectory(prefix='.highway-', dir=stage) as temporary:
+        generated = Path(temporary) / 'highway.bin'
+        run([executable, 'highway', '-o', generated], env=environment, capture_output=True, timeout=120)
+        fingerprints = [run([executable, 'highway', '--fingerprint', '-o', path], env=environment,
+                            capture_output=True, timeout=20).stdout.strip()
+                        for path in (stage / 'share/prepared/tier0.highway', generated)]
+        if fingerprints[0] != fingerprints[1]:
+            raise ValueError('Prepared Highway differs from the packaged frozen manifests: ' + ' versus '.join(fingerprints))
 
 
 def _package(config, output, clean_build=False):
@@ -233,8 +279,7 @@ def _package(config, output, clean_build=False):
         controller = stage / CONTROLLER
         controller.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / 'Laplace-MCP/deployment.py', controller)
-        for directory in ('recipes', 'firmware'):
-            shutil.copytree(source / 'Laplace-Engine' / directory, stage / 'share' / directory)
+        package_resources(config, source, stage)
         dependencies = {}
         for relative in ('bin/lpm', 'bin/laplace', 'lib/liblpm.so'):
             report = run(['ldd', stage / relative], capture_output=True).stdout
@@ -246,6 +291,7 @@ def _package(config, output, clean_build=False):
                     dependency = Path(fields[2]).resolve()
                     if not dependency.is_relative_to(stage):
                         dependencies[fields[2]] = digest(dependency)
+        verify_frozen_manifest(config, stage, environment)
         runtime_launchers(stage)
         files = {str(p.relative_to(stage)): digest(p) for p in sorted(stage.rglob('*')) if p.is_file()}
         receipt = {'schema': 'laplace.modular-package/v1', 'revisions': revisions,
@@ -280,6 +326,12 @@ def verify_package(release):
             raise ValueError('Installed dependency differs: ' + path)
     if CONTROLLER not in receipt['files']:
         raise PackageUpgradeRequired('Modular package lacks its deployment controller; rebuild a compatible release')
+    required = {'share/prepared/tier0.bin', 'share/prepared/tier0.flags', 'share/prepared/tier0.flags.layout',
+                'share/prepared/tier0.highway', 'share/manifest/banks.tsv', 'share/firmware/program.firmware'}
+    if not required.issubset(receipt['files']) or not any(name.startswith('share/grammars/') and name.endswith('.so') for name in receipt['files']):
+        raise PackageUpgradeRequired('Modular package lacks its immutable runtime resources; rebuild a compatible release')
+    if any(name.startswith('share/recipes/formats/grammars/') for name in receipt['files']):
+        raise PackageUpgradeRequired('Modular package still carries grammar build sources; rebuild the runtime resource closure')
     return receipt
 
 

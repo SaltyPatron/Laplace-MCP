@@ -30,15 +30,62 @@ class Deployment(unittest.TestCase):
         self.environment = dict(os.environ, LAPLACE_CONNINFO=
             'host=127.0.0.1 port=1 dbname=unit_no_database user=unit connect_timeout=1')
 
+    def test_runtime_resources_are_selected_from_the_release(self):
+        release = self.work / 'immutable-release'
+        config = dict(connection='selected database', tier0='/work/tier0', flags='/work/flags',
+                      highway='/work/highway', grammars='/build/grammars', ucd='/data/UCD', state='/runtime/state',
+                      bind='127.0.0.1', http_port=5188, threads=2, batch_mb=64)
+        environment = deployment.runtime_environment(config, release)
+        for name in ('TIER0', 'FLAGS', 'HIGHWAY', 'GRAMMARS', 'MANIFEST', 'RECIPES', 'FIRMWARE'):
+            self.assertTrue(Path(environment['LAPLACE_' + name]).is_relative_to(release))
+        self.assertEqual(environment['LAPLACE_CONNINFO'], config['connection'])
+
+    def test_resources_are_shared_without_linking_mutable_build_outputs(self):
+        source = self.work / 'sources'
+        artifact_owner = Path(os.environ.get('LAPLACE_OPERATIONS', ROOT.parent / 'Laplace-Operations')) / 'installation/artifact_store.py'
+        target = source / 'Laplace-Operations/installation/artifact_store.py'
+        target.parent.mkdir(parents=True)
+        shutil.copyfile(artifact_owner, target)
+        for relative in ('Laplace-Engine/recipes/order', 'Laplace-Engine/firmware/program.firmware',
+                         'Laplace-Engine/recipes/formats/grammars/input/grammar.js', 'Laplace-Native/manifest/banks.tsv'):
+            target = source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(relative.encode())
+        inputs = self.work / 'build-inputs'
+        inputs.mkdir()
+        for name in ('tier0.bin', 'tier0.flags', 'tier0.flags.layout', 'tier0.highway', 'grammars/parser.so'):
+            target = inputs / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(name.encode())
+        config = dict(prefix=str(self.work / 'installed'), tier0=str(inputs / 'tier0.bin'),
+                      flags=str(inputs / 'tier0.flags'), highway=str(inputs / 'tier0.highway'), grammars=str(inputs / 'grammars'))
+        first, second = self.work / 'first', self.work / 'second'
+        deployment.package_resources(config, source, first)
+        deployment.package_resources(config, source, second)
+        for relative in ('share/prepared/tier0.bin', 'share/grammars/parser.so', 'share/manifest/banks.tsv'):
+            self.assertTrue(os.path.samefile(first / relative, second / relative))
+        self.assertFalse((first / 'share/recipes/formats/grammars').exists())
+        self.assertFalse(os.path.samefile(first / 'share/grammars/parser.so', inputs / 'grammars/parser.so'))
+        (inputs / 'grammars/parser.so').write_bytes(b'changed compiler output')
+        self.assertEqual((first / 'share/grammars/parser.so').read_bytes(), b'grammars/parser.so')
+
     def release(self, controller=True):
         content = Path(deployment.__file__).read_bytes()
         receipt = {'schema': 'laplace.modular-package/v1', 'revisions': {},
                    'host_dependencies': {}, 'files': {deployment.CONTROLLER:
                    hashlib.sha256(content).hexdigest()} if controller else {}}
+        resources = ('share/prepared/tier0.bin', 'share/prepared/tier0.flags', 'share/prepared/tier0.flags.layout',
+                     'share/prepared/tier0.highway', 'share/manifest/banks.tsv', 'share/firmware/program.firmware',
+                     'share/grammars/test.so')
+        receipt['files'].update({name: hashlib.sha256(b'fixture').hexdigest() for name in resources})
         identity = hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest()
         release = self.work / identity
         release.mkdir()
         (release / 'package.json').write_text(json.dumps(receipt))
+        for name in resources:
+            path = release / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'fixture')
         if controller:
             path = release / deployment.CONTROLLER
             path.parent.mkdir()

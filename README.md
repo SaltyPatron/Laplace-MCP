@@ -10,6 +10,14 @@ this service with its matching Engine and recipes, then verifies the candidate b
 replacing the active release. Runtime database connections are supplied at launch;
 they are never embedded in the package. The commands below are for development.
 
+Installed releases contain their perf-caches, frozen Native manifests, compiled
+grammars, recipes and firmware. Runtime launchers select those immutable files;
+the configured `tier0`, `flags`, `highway` and `grammars` locations are packaging
+inputs. Native verifies that the bundled manifests reproduce Highway without
+corpora or a database. Grammar generator sources stay in the build estate.
+Resources share Operations' immutable file store under the modular prefix;
+release retirement removes orphaned blobs after their last retained link.
+
 The service compiles the pinned Engine's selected-ID reader and connection-owned
 SQL plan manager. Plans retain SQL contents and follow libpq reset/destruction;
 the bridge leaves generic/custom and parallel planning to the caller's settings.
