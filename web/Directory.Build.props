@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup Condition="'$(LAPLACE_WEB_BUILD)' != ''">
+    <BaseOutputPath>$(LAPLACE_WEB_BUILD)/bin/</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(LAPLACE_WEB_BUILD)/obj/</BaseIntermediateOutputPath>
+  </PropertyGroup>
+</Project>
