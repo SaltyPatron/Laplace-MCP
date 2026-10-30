@@ -99,6 +99,16 @@ try{
   const download=await readDownload;const exported=JSON.parse(await readFile(await download.path(),'utf8'));
   assert.equal(exported.schema,'laplace-native-readback/v1');assert.equal(exported.query,'dog');assert.equal(exported.response.database,'laplace');assert.ok(exported.ancestry.nodes.some(n=>n.id===source.id));mark('A visible export control downloads the actual query response and traced ancestry');
 
+  await page.getByRole('link',{name:'Library',exact:true}).click();
+  const cachedResponse=page.waitForResponse(base+'api/lookup?q=NOUN');
+  await page.getByRole('textbox',{name:'Search content or an identifier'}).fill('NOUN');
+  await page.getByRole('button',{name:'Search',exact:true}).click();
+  const cached=await (await cachedResponse).json();assert.equal(cached.cache_tier,2);assert.equal(cached.canonical_tier,2);
+  await page.locator('.result').first().click();await waitDetail();
+  await page.locator('.tabs').getByRole('link',{name:'Structure',exact:true}).click();
+  await page.locator('tbody tr').first().waitFor();assert.equal(await page.locator('tbody tr').count(),4);
+  mark('Ordinary library navigation uses the regenerated Highway while retaining stored metadata');
+
   await page.getByRole('link',{name:'Workbench',exact:true}).click();await page.getByLabel('Content',{exact:true}).fill('sabotage');
   assert.equal(await page.locator('textarea').count(),1);
   await page.getByLabel('Operation',{exact:true}).selectOption('shape');assert.equal(await page.locator('textarea').count(),2);

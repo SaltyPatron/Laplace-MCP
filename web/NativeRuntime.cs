@@ -64,7 +64,8 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         var bin = Path.Combine(release, "bin");
         var prepared = Path.Combine(release, "share", "prepared");
         var executable = Path.Combine(AppContext.BaseDirectory, "native", "lpm.exe");
-        if (!File.Exists(executable) || !File.Exists(Path.Combine(prepared, "tier0.bin")))
+        var highway = Path.Combine(AppContext.BaseDirectory, "native", "tier0.highway");
+        if (!File.Exists(executable) || !File.Exists(highway) || !File.Exists(Path.Combine(prepared, "tier0.bin")))
             throw new NativeUnavailableException("The installed native reader or perf-cache is unavailable.");
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
@@ -78,7 +79,7 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         start.Environment["LAPLACE_MCP_TOKEN"] = token;
         start.Environment["LAPLACE_TIER0"] = Path.Combine(prepared, "tier0.bin");
         start.Environment["LAPLACE_FLAGS"] = Path.Combine(prepared, "tier0.flags");
-        start.Environment["LAPLACE_HIGHWAY"] = Path.Combine(prepared, "tier0.highway");
+        start.Environment["LAPLACE_HIGHWAY"] = highway;
         start.Environment["LAPLACE_MANIFEST"] = Path.Combine(release, "share", "manifest");
         start.Environment["LAPLACE_RECIPES"] = Path.Combine(release, "share", "recipes");
         start.Environment["LAPLACE_GRAMMARS"] = Path.Combine(release, "share", "grammars");
