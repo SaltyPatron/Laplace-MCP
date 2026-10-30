@@ -25,6 +25,7 @@ typedef intptr_t ssize_t;
 #include "lpm.h"
 #include "lpm_config.h"
 #include "engine.h"
+#include "walk.h"
 #include "db_bridge.h"
 #include <inttypes.h>
 #include "semantic.h"
@@ -46,6 +47,8 @@ const lp_tier0_record *T0;
 static lp_text *TX;
 static PGconn *PG;
 static Lpm *CODE_IX;
+static void cw_str(char **out, size_t *on, size_t *ocap, const char *s);
+static char *cw_file_name(Reader *rd, const lp_id *file);
 
 /* Where things are when the environment does not say: what this service was built with (lpm_config.h). */
 static const char *CONN_DEFAULT = LPM_CONNINFO_DEFAULT;
@@ -142,43 +145,66 @@ static char *json_esc(const char *s, char *out, size_t cap) {
     return out;
 }
 
-/* Value of a JSON string field. Handles a single level of backslash escapes. */
+/* A field of this object only. Quoted content and nested objects cannot shadow
+ * the transport envelope or another argument. Full JSON validation belongs to
+ * the caller; this bounded reader selects the protocol's scalar fields. */
+static const char *jvalue(const char *body,const char *key){
+    const char *p=body;while(isspace((unsigned char)*p))p++;if(*p++!='{')return NULL;
+    while(*p){
+        while(isspace((unsigned char)*p)||*p==',')p++;if(*p!='"')return NULL;
+        const char *name=++p;while(*p&&*p!='"'){if(*p=='\\'&&p[1])p++;p++;}if(!*p)return NULL;
+        size_t len=(size_t)(p-name);p++;while(isspace((unsigned char)*p))p++;if(*p++!=':')return NULL;
+        while(isspace((unsigned char)*p))p++;
+        if(strlen(key)==len&&!memcmp(name,key,len))return p;
+        int depth=0,quoted=0;
+        for(;*p;p++){
+            if(quoted){if(*p=='\\'&&p[1])p++;else if(*p=='"')quoted=0;continue;}
+            if(*p=='"'){quoted=1;continue;}if(*p=='{'||*p=='[')depth++;
+            else if(*p=='}'||*p==']'){if(!depth)return NULL;depth--;}
+            else if(*p==','&&!depth){p++;break;}
+        }
+    }
+    return NULL;
+}
+static int jhex4(const char *p,uint32_t *value){
+    *value=0;for(int i=0;i<4;i++){unsigned c=(unsigned char)p[i];if(!c)return 0;
+        unsigned n=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:16;
+        if(n>15)return 0;*value=(*value<<4)|n;}return 1;
+}
+/* JSON strings, including UTF-16 escape pairs, decoded as UTF-8 once. */
 static int jstr(const char *body, const char *key, char *out, size_t cap) {
-    char pat[80];
-    snprintf(pat, sizeof pat, "\"%s\"", key);
-    const char *p = strstr(body, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != ':') return 0;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    const char *p=jvalue(body,key);if(!p)return 0;
     if (*p != '"') return 0;
     p++;
     size_t n = 0;
-    while (*p && *p != '"' && n + 1 < cap) {
+    while (*p && *p != '"') {
+        if(n+1>=cap)return 0;
         if (*p == '\\' && p[1]) {
             p++;
             if (*p == 'n') out[n++] = '\n';
-            else out[n++] = *p;
+            else if(*p=='r')out[n++]='\r';else if(*p=='t')out[n++]='\t';else if(*p=='b')out[n++]='\b';else if(*p=='f')out[n++]='\f';
+            else if(*p=='u'){
+                uint32_t cp;if(!jhex4(p+1,&cp))return 0;p+=4;
+                if(cp>=0xd800&&cp<=0xdbff){uint32_t low;if(p[1]!='\\'||p[2]!='u'||!jhex4(p+3,&low)||low<0xdc00||low>0xdfff)return 0;cp=0x10000+((cp-0xd800)<<10)+low-0xdc00;p+=6;}
+                else if(cp>=0xdc00&&cp<=0xdfff)return 0;
+                if(!cp)return 0;
+                if(cp<0x80)out[n++]=(char)cp;
+                else if(cp<0x800){if(n+2>=cap)return 0;out[n++]=(char)(0xc0|(cp>>6));out[n++]=(char)(0x80|(cp&63));}
+                else if(cp<0x10000){if(n+3>=cap)return 0;out[n++]=(char)(0xe0|(cp>>12));out[n++]=(char)(0x80|((cp>>6)&63));out[n++]=(char)(0x80|(cp&63));}
+                else{if(n+4>=cap)return 0;out[n++]=(char)(0xf0|(cp>>18));out[n++]=(char)(0x80|((cp>>12)&63));out[n++]=(char)(0x80|((cp>>6)&63));out[n++]=(char)(0x80|(cp&63));}
+            }
+            else if(*p=='"'||*p=='\\'||*p=='/')out[n++]=*p;else return 0;
             p++;
         } else out[n++] = *p++;
     }
+    if(*p!='"')return 0;
     out[n] = 0;
     return 1;
 }
 
 /* A flag: JSON true or false, or the strings "true" and "false". Absent or anything else: dflt. */
 static int jbool(const char *body, const char *key, int dflt) {
-    char pat[80];
-    snprintf(pat, sizeof pat, "\"%s\"", key);
-    const char *p = strstr(body, pat);
-    if (!p) return dflt;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != ':') return dflt;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    const char *p=jvalue(body,key);if(!p)return dflt;
     if (!strncmp(p, "true", 4) || !strncmp(p, "\"true\"", 6)) return 1;
     if (!strncmp(p, "false", 5) || !strncmp(p, "\"false\"", 7)) return 0;
     return dflt;
@@ -229,15 +255,7 @@ static int q2(PGconn *pg, const char *sql, const char *a, const char *b, char **
 }
 
 static int jint(const char *body, const char *key, int *out) {
-    char pat[80];
-    snprintf(pat, sizeof pat, "\"%s\"", key);
-    const char *p = strstr(body, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != ':') return 0;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    const char *p=jvalue(body,key);if(!p)return 0;
     if (*p == '"') return 0;
     char *end = NULL;
     long v = strtol(p, &end, 10);
@@ -593,6 +611,8 @@ static void on_search(int c, const char *body) {
     }
     int fan = 0;
     jint(body, "fan", &fan);
+    /* A text identity may be computable without having been stored. */
+    int recorded = np ? tier_max(pg, &trunk.id, 1) : -1;
     int known = np > 0;
     if (!np) {
         for (int i = 0; i < 16; i++) {
@@ -600,7 +620,7 @@ static void on_search(int c, const char *body) {
             sscanf(idbuf + 2 * i, "%2x", &v);
             trunk.id.b[i] = (uint8_t)v;
         }
-        int recorded = tier_max(pg, &trunk.id, 1);
+        recorded = tier_max(pg, &trunk.id, 1);
         if (recorded >= 0) { trunk.tier = (uint32_t)recorded; known = 1; }
     }
     t0 = nsec();
@@ -612,7 +632,7 @@ static void on_search(int c, const char *body) {
     const char *pv[1] = { (const char *)ab };
     int pl[1] = { (int)al }, pf[1] = { 1 };
     PGresult *self = db_exec_params(pg,
-        "SELECT path,tier,mask FROM @extschema@.laplace_physicalities($1::@extschema@.blake3[])",
+        "SELECT path,tier,mask,mask::text FROM @extschema@.laplace_physicalities($1::@extschema@.blake3[])",
         1,NULL,pv,pl,pf,1);
     if (PQresultStatus(self) != PGRES_TUPLES_OK) {
         char e[512], b[700];
@@ -739,8 +759,17 @@ static void on_search(int c, const char *body) {
         int claim = mask_claim(PQgetvalue(self, i, 2), PQgetlength(self, i, 2));
         buf_fmt(&out, &un, &ucap, "%s{\"tier\":%d,\"claim\":%s,\"constituents\":", i ? "," : "", tier, claim ? "true" : "false");
         emit_ids(&out, &un, &ucap, (const uint8_t *)PQgetvalue(self, i, 0), PQgetlength(self, i, 0), &nids);
-        snprintf(one, sizeof one, ",\"n\":%d}", nids);
+        snprintf(one, sizeof one, ",\"n\":%d,\"mask\":\"", nids);
         buf_add(&out, &un, &ucap, one, strlen(one));
+        cw_str(&out,&un,&ucap,PQgetvalue(self,i,3));buf_fmt(&out,&un,&ucap,"\",\"vertices\":[");
+        size_t nv=lp_path_vertices((const uint8_t *)PQgetvalue(self,i,0),(size_t)PQgetlength(self,i,0),NULL,0);
+        lp_vertex *vertices=malloc((nv?nv:1)*sizeof *vertices);
+        lp_path_vertices((const uint8_t *)PQgetvalue(self,i,0),(size_t)PQgetlength(self,i,0),vertices,nv);
+        for(size_t k=0;k<nv;k++){
+            char member[33];hex_id(&vertices[k].id,member);
+            buf_fmt(&out,&un,&ucap,"%s{\"id\":\"%s\",\"ordinal\":%zu,\"position\":%u,\"run\":%u,\"said\":%u,\"outcome\":%u,\"spare\":%u}",k?",":"",member,k,vertices[k].position,vertices[k].run,vertices[k].said,vertices[k].outcome,vertices[k].spare);
+        }
+        free(vertices);buf_fmt(&out,&un,&ucap,"]}");
     }
     buf_add(&out, &un, &ucap, "],\"claims\":[", strlen("],\"claims\":["));
     int shown = 0;
@@ -778,7 +807,47 @@ static void on_search(int c, const char *body) {
         if (i) buf_add(&out, &un, &ucap, ",", 1);
         emit_down(&out, &un, &ucap, &down[i], fan);
     }
-    buf_add(&out, &un, &ucap, "]}", 2);
+    buf_fmt(&out,&un,&ucap,"],\"database\":\"%s\",\"recorded\":%s",PQdb(pg),recorded>=0?"true":"false");
+    if(jbool(body,"display",0)){
+        /* Native's selected-prefix reader shares a batched frontier. Labels are
+         * a display projection, never an alternate browser-side decomposer. */
+        lp_idmap *names=lp_idmap_new();lp_idmap_put(names,&trunk.id,NULL);
+        for(int i=0;i<natt;i++)lp_idmap_put(names,&att[i].trunk,NULL);
+        for(int i=0;i<ndown;i++)lp_idmap_put(names,&down[i].id,NULL);
+        for(int i=0;i<nh;i++){
+            int wanted=h[i].claim?0:1;
+            if(h[i].claim)for(int k=0;k<ncret;k++)if(order[k]==i){wanted=1;break;}
+            if(!wanted)continue;
+            lp_idmap_put(names,&h[i].entity,NULL);
+            size_t count=lp_path_ids(h[i].path,(size_t)h[i].path_len,NULL,0);
+            lp_id *ids=malloc((count?count:1)*sizeof *ids);
+            lp_path_ids(h[i].path,(size_t)h[i].path_len,ids,count);
+            for(size_t k=0;k<count;k++)lp_idmap_put(names,ids+k,NULL);
+            free(ids);
+            if(lp_idmap_count(names)>=1024)break;
+        }
+        size_t count=lp_idmap_count(names);if(count>1024)count=1024;
+        const lp_id *ids=lp_idmap_keys(names);Reader *rd=reader_new(pg);
+        reader_prefetch(rd,ids,count,240);
+        if(PQntuples(self)>0){
+            lp_vertex first[2];size_t nv=lp_path_vertices((const uint8_t *)PQgetvalue(self,0,0),(size_t)PQgetlength(self,0,0),first,2);
+            if(nv>=2 && first[0].said==LP_SAID_METADATA){
+                char *file=cw_file_name(rd,&trunk.id);char *title=*file?strdup(file):reader_text(rd,&first[0].id,160);
+                char metadata[33],content[33];hex_id(&first[0].id,metadata);hex_id(&first[1].id,content);
+                buf_fmt(&out,&un,&ucap,",\"display\":{\"trunk_kind\":\"%s\",\"metadata\":\"%s\",\"content\":\"%s\",\"title\":\"",*file?"file":"source",metadata,content);
+                cw_str(&out,&un,&ucap,title);buf_fmt(&out,&un,&ucap,"\"}");free(file);free(title);
+            }
+        }
+        buf_fmt(&out,&un,&ucap,",\"labels\":[");
+        for(size_t i=0;i<count;i++){
+            char hex[33];hex_id(ids+i,hex);char *value=reader_text(rd,ids+i,240);
+            buf_fmt(&out,&un,&ucap,"%s{\"id\":\"%s\",\"text\":\"",i?",":"",hex);
+            cw_str(&out,&un,&ucap,value);buf_fmt(&out,&un,&ucap,"\"}");free(value);
+        }
+        buf_fmt(&out,&un,&ucap,"],\"labels_complete\":%s",lp_idmap_count(names)<=1024?"true":"false");
+        reader_free(rd);lp_idmap_free(names);
+    }
+    buf_add(&out,&un,&ucap,"}",1);
     PQclear(self);
     free(att);
     free(cids);
@@ -1706,6 +1775,9 @@ static const char *SURFACE =
     "{\"method\":\"POST\",\"path\":\"/v1/code_callers\",\"body\":\"{\\\"query\\\":\\\"declared name\\\",\\\"path\\\":\\\"optional\\\"}\",\"does\":\"the declarations whose code uses a name, with the lines\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/code_callees\",\"body\":\"{\\\"query\\\":\\\"declared name\\\",\\\"path\\\":\\\"optional\\\"}\",\"does\":\"what a declaration calls that a code recipe declared, and where\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/sources\",\"does\":\"the witnesses the database holds\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/library\",\"body\":\"{\\\"after\\\":\\\"optional canonical ID cursor\\\"}\",\"does\":\"stored source and file trunks by the native kind bank, independent of registration\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/catalog\",\"does\":\"exact qualified table counts and connected database/read-only status\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/provenance\",\"body\":\"{\\\"id\\\":\\\"32 hex\\\"}\",\"does\":\"bounded containment ancestry with ordered stored vertices, source/file labels, and separate registry metadata\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/ingest_status\",\"body\":\"{\\\"source\\\":\\\"optional\\\"}\",\"does\":\"each witness with its parts and readings, the database's busy sessions, the ingest logs\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/recipe_plan\",\"body\":\"{\\\"input\\\":\\\"optional source or path\\\"}\",\"does\":\"laplace ingest --plan\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/recipe_catalog\",\"body\":\"{}\",\"does\":\"all available sources, aliases, content locations, decomposers and prerequisites; no database or corpus required\"},"
@@ -2643,19 +2715,141 @@ static void on_sources(int c, const char *body) {
     free(out);
 }
 
+static void on_catalog(int c,const char *body){
+    (void)body;PGconn *pg=db();if(!pg){http(c,503,"{\"error\":\"database\"}");return;}
+    PGresult *r=db_exec_params(pg,
+        "SELECT json_build_object('database',current_database(),'read_only',current_setting('transaction_read_only')::boolean,"
+        "'database_bytes',pg_database_size(current_database())::text,'entities',(SELECT count(*)::text FROM @extschema@.entity),"
+        "'physicalities',(SELECT count(*)::text FROM @extschema@.physicality),'standing_rows',(SELECT count(*)::text FROM @extschema@.consensus),"
+        "'registered_witness_rows',(SELECT count(*)::text FROM @extschema@.witness),'as_of',statement_timestamp(),'count_kind','exact')::text",
+        0,NULL,NULL,NULL,NULL,0);
+    if(PQresultStatus(r)!=PGRES_TUPLES_OK||PQntuples(r)!=1){PQclear(r);http(c,503,"{\"error\":\"catalog_unavailable\"}");return;}
+    char *json=strdup(PQgetvalue(r,0,0));PQclear(r);http(c,200,json);free(json);
+}
+
+/* Discover stored provenance trunks through the native kind bank, regardless
+ * of registry membership. This is the library's entry collection, not a
+ * fabricated list of sample queries. Cursor order is canonical identity. */
+static void on_library(int c,const char *body){
+    char after[64]="";jstr(body,"after",after,sizeof after);
+    if(*after&&!valid_id(after)){http(c,400,"{\"error\":\"after\"}");return;}
+    PGconn *pg=db();if(!pg){http(c,503,"{\"error\":\"database\"}");return;}
+    const char *values[1]={after};
+    PGresult *rows=db_exec_params(pg,
+        "SELECT entity,tier,path,mask::text FROM @extschema@.physicality"
+        " WHERE mask OPERATOR(@extschema@.?) @extschema@.laplace_bank_bit('kind','file')"
+        " AND ($1='' OR entity OPERATOR(@extschema@.>) NULLIF($1,'')::@extschema@.blake3) ORDER BY entity LIMIT 65",
+        1,NULL,values,NULL,NULL,1);
+    if(PQresultStatus(rows)!=PGRES_TUPLES_OK){PQclear(rows);http(c,503,"{\"error\":\"library_unavailable\"}");return;}
+    int count=PQntuples(rows),more=count>64;if(more)count=64;
+    Reader *reader=reader_new(pg);lp_vec(lp_id) names={0};
+    for(int i=0;i<count;i++){lp_id id;memcpy(&id,PQgetvalue(rows,i,0),16);lp_push(&names,id);}
+    reader_prefetch(reader,names.v,names.n,160);
+    char *out=NULL;size_t on=0,cap=0;
+    buf_fmt(&out,&on,&cap,"{\"database\":\"%s\",\"collection\":\"stored-trunks\",\"scope\":\"native kind=file on physicality\",\"items\":[",PQdb(pg));
+    for(int i=0;i<count;i++){
+        lp_id id;memcpy(&id,PQgetvalue(rows,i,0),16);char hex[33];hex_id(&id,hex);
+        lp_vertex first[2];size_t n=lp_path_vertices((const uint8_t *)PQgetvalue(rows,i,2),(size_t)PQgetlength(rows,i,2),first,2);
+        int metadata=n>=2&&first[0].said==LP_SAID_METADATA;
+        char *path=metadata?cw_file_name(reader,&id):strdup("");char *title=*path?strdup(path):reader_text(reader,metadata?&first[0].id:&id,160);
+        buf_fmt(&out,&on,&cap,"%s{\"id\":\"%s\",\"tier\":%llu,\"kind\":\"%s\",\"title\":\"",i?",":"",hex,(unsigned long long)lp_be(PQgetvalue(rows,i,1),2),metadata?(*path?"file":"source"):"trunk");
+        cw_str(&out,&on,&cap,title);buf_fmt(&out,&on,&cap,"\",\"mask\":\"");cw_str(&out,&on,&cap,PQgetvalue(rows,i,3));buf_fmt(&out,&on,&cap,"\"");
+        if(metadata){
+            char meta[33],content[33];hex_id(&first[0].id,meta);hex_id(&first[1].id,content);
+            buf_fmt(&out,&on,&cap,",\"metadata\":\"%s\",\"content\":\"%s\"",meta,content);
+            if(!*path){
+                lp_id parts[4096];size_t np=reader_parts(reader,&first[1].id,parts,4096);size_t shown=np>4096?4096:np;
+                buf_fmt(&out,&on,&cap,",\"children_complete\":%s,\"children\":[",np<=4096?"true":"false");
+                for(size_t k=0;k<shown;k++){char child[33];hex_id(parts+k,child);buf_fmt(&out,&on,&cap,"%s\"%s\"",k?",":"",child);}buf_fmt(&out,&on,&cap,"]");
+            }
+        }
+        buf_fmt(&out,&on,&cap,"}");free(path);free(title);
+    }
+    buf_fmt(&out,&on,&cap,"],\"has_more\":%s,\"next\":",more?"true":"false");
+    if(more){char next[33];memcpy(names.v[0].b,PQgetvalue(rows,count-1,0),16);hex_id(names.v,next);buf_fmt(&out,&on,&cap,"\"%s\"",next);}else buf_fmt(&out,&on,&cap,"null");
+    buf_fmt(&out,&on,&cap,"}");http(c,200,out);free(out);PQclear(rows);reader_free(reader);lp_vec_free(&names);
+}
+
+/* A bounded structural ancestry read. The graph is containment, not a claim
+ * that every structural edge is an assertion. attested() above remains the
+ * authority for claim/voice/outcome provenance. Source/file trunks exist as
+ * entities paired with physicalities; registry membership only enriches them. */
+typedef struct { int tier,expanded,parents,metadata,hub; } AncestryNode;
+typedef struct { lp_id parent,child; lp_vertex vertex; size_t ordinal; } AncestryEdge;
+static void on_provenance(int c,const char *body){
+    char value[64];lp_id start;
+    if(!jstr(body,"id",value,sizeof value)||!valid_id(value)){http(c,400,"{\"error\":\"id\"}");return;}
+    for(int i=0;i<16;i++){unsigned v=0;sscanf(value+2*i,"%2x",&v);start.b[i]=(uint8_t)v;}
+    PGconn *pg=db();if(!pg){http(c,503,"{\"error\":\"database\"}");return;}
+    lp_idmap *nodes=lp_idmap_sized(sizeof(AncestryNode));
+    lp_idmap_put(nodes,&start,NULL);((AncestryNode *)lp_idmap_at(nodes,0))->tier=tier_max(pg,&start,1);
+    int np=0;Hold *self=paths_of(pg,&start,1,&np);
+    if(np){lp_vertex first;size_t nv=lp_path_vertices(self[0].path,(size_t)self[0].path_len,&first,1);((AncestryNode *)lp_idmap_at(nodes,0))->metadata=nv && first.said==LP_SAID_METADATA;}
+    holds_free(self,np);
+    lp_vec(lp_id) front={0};lp_push(&front,start);lp_vec(AncestryEdge) edges={0};
+    int complete=1,levels=0;
+    while(front.n && levels<16 && lp_idmap_count(nodes)<512){
+        int nh=0;int *hubs=calloc(front.n*2,sizeof(int));
+        Hold *holders=holds_capped(pg,front.v,(int)front.n,64,0,3,hubs,&nh);
+        for(size_t i=0;i<front.n;i++){
+            AncestryNode *node=lp_idmap_at(nodes,(size_t)lp_idmap_find(nodes,front.v+i));
+            node->expanded=1;node->hub=hubs[2*i]||hubs[2*i+1];if(node->hub)complete=0;
+        }
+        lp_vec(lp_id) next={0};lp_idmap *current=lp_idmap_new();
+        for(size_t i=0;i<front.n;i++)lp_idmap_put(current,front.v+i,NULL);
+        for(int row=0;row<nh;row++){
+            Hold *holder=holders+row;size_t nv=lp_path_vertices(holder->path,(size_t)holder->path_len,NULL,0);
+            lp_vertex *vertices=malloc((nv?nv:1)*sizeof *vertices);lp_path_vertices(holder->path,(size_t)holder->path_len,vertices,nv);
+            bool fresh;size_t at=lp_idmap_put(nodes,&holder->entity,&fresh);
+            AncestryNode *parent=lp_idmap_at(nodes,at);parent->tier=holder->tier;parent->metadata|=nv && vertices[0].said==LP_SAID_METADATA;
+            if(fresh)lp_push(&next,holder->entity);
+            for(size_t i=0;i<nv;i++)if(lp_idmap_find(current,&vertices[i].id)>=0){
+                AncestryNode *child=lp_idmap_at(nodes,(size_t)lp_idmap_find(nodes,&vertices[i].id));child->parents=1;
+                int duplicate=0;for(size_t k=0;k<edges.n;k++)if(!memcmp(&edges.v[k].parent,&holder->entity,16)&&edges.v[k].ordinal==i){duplicate=1;break;}
+                if(!duplicate){AncestryEdge edge={.parent=holder->entity,.child=vertices[i].id,.vertex=vertices[i],.ordinal=i};lp_push(&edges,edge);}
+            }
+            free(vertices);
+            if(lp_idmap_count(nodes)>=512){
+                complete=0;
+                for(size_t k=0;k<front.n;k++)((AncestryNode *)lp_idmap_at(nodes,(size_t)lp_idmap_find(nodes,front.v+k)))->expanded=0;
+                break;
+            }
+        }
+        free(hubs);holds_free(holders,nh);lp_idmap_free(current);lp_vec_free(&front);front.v=next.v;front.n=next.n;front.cap=next.cap;levels++;
+    }
+    if(front.n)complete=0;
+    size_t count=lp_idmap_count(nodes);const lp_id *ids=lp_idmap_keys(nodes);
+    Root *roots=calloc(count?count:1,sizeof *roots);for(size_t i=0;i<count;i++)roots[i].id=ids[i];witnesses_known(pg,roots,count);
+    Reader *reader=reader_new(pg);reader_prefetch(reader,ids,count,160);
+    char *out=NULL;size_t on=0,cap=0;
+    buf_fmt(&out,&on,&cap,"{\"id\":\"%s\",\"database\":\"%s\",\"complete\":%s,\"levels\":%d,\"limits\":{\"levels\":16,\"nodes\":512,\"holders_per_kind\":64},\"nodes\":[",value,PQdb(pg),complete?"true":"false",levels);
+    for(size_t i=0;i<count;i++){
+        AncestryNode *node=lp_idmap_at(nodes,i);char hex[33];hex_id(ids+i,hex);
+        lp_id first[2];size_t n=node->metadata?reader_parts(reader,ids+i,first,2):0;
+        char *file=node->metadata?cw_file_name(reader,ids+i):strdup("");
+        char *label=*file?strdup(file):reader_text(reader,n?first:ids+i,160);
+        buf_fmt(&out,&on,&cap,"%s{\"id\":\"%s\",\"tier\":%d,\"metadata_trunk\":%s,\"trunk_kind\":\"%s\",\"root\":%s,\"expanded\":%s,\"truncated\":%s,\"registered\":%s,\"trust\":%.6g,\"label\":\"",i?",":"",hex,node->tier,node->metadata?"true":"false",node->metadata?(*file?"file":"source"):"",node->expanded&&!node->parents&&!node->hub?"true":"false",node->expanded?"true":"false",node->hub?"true":"false",roots[i].witness?"true":"false",roots[i].trust);
+        cw_str(&out,&on,&cap,label);buf_fmt(&out,&on,&cap,"\"}");free(label);
+        free(file);
+    }
+    buf_fmt(&out,&on,&cap,"],\"edges\":[");
+    for(size_t i=0;i<edges.n;i++){
+        AncestryEdge *edge=edges.v+i;char parent[33],child[33];hex_id(&edge->parent,parent);hex_id(&edge->child,child);
+        buf_fmt(&out,&on,&cap,"%s{\"parent\":\"%s\",\"child\":\"%s\",\"ordinal\":%zu,\"position\":%u,\"said\":%u,\"run\":%u,\"outcome\":%u}",i?",":"",parent,child,edge->ordinal,edge->vertex.position,edge->vertex.said,edge->vertex.run,edge->vertex.outcome);
+    }
+    buf_fmt(&out,&on,&cap,"]}");http(c,200,out);free(out);reader_free(reader);free(roots);lp_idmap_free(nodes);lp_vec_free(&front);lp_vec_free(&edges);
+}
+
 static void rpc_id(const char *body, char *out, size_t cap) {
-    const char *p = strstr(body, "\"id\"");
+    const char *p = jvalue(body,"id");
     out[0] = 'n'; out[1] = 'u'; out[2] = 'l'; out[3] = 'l'; out[4] = 0;
     if (!p) return;
-    p += 4;
-    while (*p == ' ' || *p == '\t' || *p == ':') p++;
     size_t n = 0;
     if (*p == '"') {
-        out[n++] = '"';
-        p++;
-        while (*p && *p != '"' && n + 2 < cap) out[n++] = *p++;
-        if (n + 1 < cap) out[n++] = '"';
-        out[n] = 0;
+        const char *start=p++;
+        while(*p&&*p!='"'){if(*p=='\\'&&p[1])p++;p++;}
+        if(!*p)return;n=(size_t)(p-start)+1;if(n>=cap)return;
+        memcpy(out,start,n);out[n]=0;
         return;
     }
     while (*p && *p != ',' && *p != '}' && *p != ' ' && n + 1 < cap) out[n++] = *p++;
@@ -2664,6 +2858,9 @@ static void rpc_id(const char *body, char *out, size_t cap) {
 
 static const char *TOOLS =
     "{\"tools\":["
+    "{\"name\":\"library\",\"description\":\"Browse stored source and file trunks using their physicality kind role, independently of witness registration. Canonical-ID cursor pagination.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"after\":{\"type\":\"string\"}},\"required\":[]}},"
+    "{\"name\":\"catalog\",\"description\":\"Exact table counts and connected database/read-only scope. Registry row counts do not count all witness trunks.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
+    "{\"name\":\"provenance\",\"description\":\"Bounded structural ancestry of an exact canonical ID. Stored edge positions, run and said are retained. Source/file trunks are read from the DAG, and registry metadata is separate. complete=false means additional ancestry may exist.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"]}},"
     "{\"name\":\"code_search\",\"description\":\"Search code and documentation across indexed repositories using Laplace Tree-sitter AST declaration chunking, UAX #29 segmentation, IDF constituent postings, and 4D Frechet trajectory distance. With LAPLACE_CODE_SEMANTIC set, nearest chunks from the configured embedding endpoint and Qdrant collections join the candidates, and the union is ordered by reciprocal rank fusion of each collection's ranking and the Laplace rerank's (fusion rerank: the rerank alone); a configured service that fails is an error. Returns matching files, exact line ranges (line0..line1), source (lexical, semantic or both), Laplace entity ID, Hilbert index, shared constituent count, Frechet distance, rerank score, cosine for semantic hits, the fused score and each ranking's rank of the hit, and code snippet.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\",\"description\":\"Refresh this local file or directory before searching all indexed roots.\"},\"limit\":{\"type\":\"integer\"},\"fusion\":{\"type\":\"string\",\"enum\":[\"rrf\",\"rerank\"]},\"bridge\":{\"type\":\"boolean\",\"description\":\"add to the query the words the database's wordnets reach from its words (laplace translate), for the lexical retrieval and the rerank\"},\"scope\":{\"type\":\"string\",\"enum\":[\"all\",\"code\",\"docs\"],\"description\":\"which embedding collections are asked: code (the default), prose (docs), or both (all)\"},\"explain\":{\"type\":\"boolean\",\"description\":\"every candidate of the union, not only the first limit\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"code_where\",\"description\":\"Where a name or any exact span of code (query) stands in the code the Laplace database holds (an ingested source such as workspace-code), read off the containment above it, nothing from a working tree. Each file that holds it, by the pathname its record gives: defines, the declaration kinds its recipe said of the name there (function_definition, class_declaration...), files that define it first; occurrences, how many places in its syntax tree hold it; at, up to occurrences (default 3) of them: the line, the innermost enclosing node of at least context bytes (default 120), and the enclosing declaration's first line with its span line0..line1. defines true: only files that define it. path: a substring the file path must contain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"defines\":{\"type\":\"boolean\"},\"limit\":{\"type\":\"integer\"},\"occurrences\":{\"type\":\"integer\"},\"context\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
     "{\"name\":\"code_callers\",\"description\":\"Who uses a name (query) in the code the Laplace database holds: each declaration (name, kind, path, its line) whose code holds a place the name stands, with the lines it does at (at). A place outside every declaration is its file's top level (top_level); a declaration's own name is not a use of it. Read off the containment code_where walks and the file's outline; same-named declarations in different files are not told apart. path: a substring the file path must contain.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"a declared name\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}},"
@@ -2700,7 +2897,7 @@ static void mcp_rpc(int c, const char *body) {
     }
     if (!strcmp(method, "initialize")) {
         char ver[40] = "2025-03-26";
-        jstr(body, "protocolVersion", ver, sizeof ver);
+        const char *params=jvalue(body,"params");if(params)jstr(params,"protocolVersion",ver,sizeof ver);
         char out[512];
         snprintf(out, sizeof out,
                  "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"protocolVersion\":\"%s\","
@@ -2724,7 +2921,8 @@ static void mcp_rpc(int c, const char *body) {
     }
     if (!strcmp(method, "tools/call")) {
         char name[32];
-        if (!jstr(body, "name", name, sizeof name)) {
+        const char *params=jvalue(body,"params");
+        if (!params || !jstr(params, "name", name, sizeof name)) {
             char out[160];
             snprintf(out, sizeof out, "{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":-32602,\"message\":\"name\"}}", id);
             http(c, 200, out);
@@ -2734,10 +2932,14 @@ static void mcp_rpc(int c, const char *body) {
         capture_code = 500;
         free(capture_body);
         capture_body = NULL;
+        body=jvalue(params,"arguments");if(!body||*body!='{')body="{}";
         if (!strcmp(name, "code_search")) on_code_search(c, body);
         else if (!strcmp(name, "reindex")) on_reindex(c, body);
         else if (!strcmp(name, "code_where")) on_code_where(c, body);
         else if (!strcmp(name, "sources")) on_sources(c, body);
+        else if (!strcmp(name, "catalog")) on_catalog(c, body);
+        else if (!strcmp(name, "library")) on_library(c, body);
+        else if (!strcmp(name, "provenance")) on_provenance(c, body);
         else if (!strcmp(name, "file_outline")) on_file_outline(c, body);
         else if (!strcmp(name, "code_callers")) on_code_callers(c, body);
         else if (!strcmp(name, "code_callees")) on_code_callees(c, body);
@@ -2798,6 +3000,9 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
         else if (!strcmp(op, "reindex")) path = "/v1/reindex";
         else if (!strcmp(op, "code_where")) path = "/v1/code_where";
         else if (!strcmp(op, "sources")) path = "/v1/sources";
+        else if (!strcmp(op, "catalog")) path = "/v1/catalog";
+        else if (!strcmp(op, "library")) path = "/v1/library";
+        else if (!strcmp(op, "provenance")) path = "/v1/provenance";
         else if (!strcmp(op, "file_outline")) path = "/v1/file_outline";
         else if (!strcmp(op, "code_callers")) path = "/v1/code_callers";
         else if (!strcmp(op, "code_callees")) path = "/v1/code_callees";
@@ -2838,6 +3043,9 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
     else if (!strcmp(path, "/v1/reindex")) on_reindex(c, body);
     else if (!strcmp(path, "/v1/code_where")) on_code_where(c, body);
     else if (!strcmp(path, "/v1/sources")) on_sources(c, body);
+    else if (!strcmp(path, "/v1/catalog")) on_catalog(c, body);
+    else if (!strcmp(path, "/v1/library")) on_library(c, body);
+    else if (!strcmp(path, "/v1/provenance")) on_provenance(c, body);
     else if (!strcmp(path, "/v1/file_outline")) on_file_outline(c, body);
     else if (!strcmp(path, "/v1/code_callers")) on_code_callers(c, body);
     else if (!strcmp(path, "/v1/code_callees")) on_code_callees(c, body);

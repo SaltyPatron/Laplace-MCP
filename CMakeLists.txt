@@ -109,6 +109,19 @@ else()
 endif()
 
 enable_testing()
+if(WIN32)
+  # Select the declared ICU imports explicitly; LIB may contain another ICU.
+  # CORE-MATH's int128 conversion uses the compiler's matching builtins runtime.
+  execute_process(COMMAND "${CMAKE_C_COMPILER}" -print-resource-dir
+    OUTPUT_VARIABLE _compiler_resource OUTPUT_STRIP_TRAILING_WHITESPACE)
+  find_library(_compiler_builtins NAMES clang_rt.builtins-x86_64
+    PATHS "${_compiler_resource}/lib/windows" NO_DEFAULT_PATH REQUIRED)
+  foreach(_target lpm_program lpm_lib)
+    target_link_libraries(${_target} PRIVATE
+      "${LAPLACE_ICU_DIR}/lib64/icuin.lib" "${LAPLACE_ICU_DIR}/lib64/icuuc.lib"
+      "${LAPLACE_ICU_DIR}/lib64/icudt.lib" "${_compiler_builtins}")
+  endforeach()
+endif()
 add_test(NAME check COMMAND lpm_program check)
 
 include(GNUInstallDirs)

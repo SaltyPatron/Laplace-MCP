@@ -43,6 +43,30 @@ The ID, tier, coordinate, Hilbert value, and parts are computed here from the ma
 
 ## Search
 
+The browser-oriented read extensions are additive:
+
+- `POST /v1/library` discovers stored source/file trunks through the native
+  `kind=file` physicality role, regardless of witness registration. `after` is
+  an optional canonical-ID cursor; a page returns up to 64 trunks, `has_more`
+  and `next`. Source children retain their stored content order.
+- `POST /v1/provenance` takes `id` and returns bounded structural ancestry:
+  nodes, ordered edges (ordinal, position, run, said, outcome), source/file
+  display metadata, and registry metadata separately. Bounds are 16 levels,
+  512 nodes and 64 holders per kind and frontier member. `complete=false`
+  means more ancestry may exist. Structural containment is not itself an
+  assertion; `search.attestations` remains the attestation projection.
+- `POST /v1/catalog` returns the connected database, read-only state, exact
+  table counts and observation time. `registered_witness_rows` counts registry
+  rows only, not all source trunks in the DAG.
+- `search` accepts `display:true` for bounded Native-rendered labels and trunk
+  metadata. `recorded` distinguishes a computed identity from stored content.
+  Physicality rows include their mask string and original vertex annotations
+  alongside expanded constituent IDs. Labels are display projections.
+
+These reads are also MCP tools (`library`, `provenance`, `catalog`). JSON-RPC
+envelope IDs and `params.arguments.id` are separate. JSON Unicode escapes and
+direct UTF-8 resolve to the same canonical identity.
+
 `POST /v1/search` with `{"input":"Sherlock Holmes"}` or `{"id":"d91895c654f33a108a63bb64f10ca69f"}`.
 
 The string is named here. The database is then called with that one ID:

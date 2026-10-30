@@ -1,16 +1,18 @@
 # Acceptance boundaries for the modular website
 
-This file distinguishes design-preview verification from future product acceptance. Passing preview checks does not establish live identity, semantic reasoning, ingestion, exports or deployment.
+This file distinguishes delivered browser read workflows from full product acceptance. Read workflows and deployment do not establish witnessed conversation, ingestion, synthesis or payments.
 
-## Interactive design preview
+## Live IIS read workflows
 
-- Home, Library, Research, Sources, Workbench, Exports and design coverage render at desktop and mobile widths.
+- A fresh Home discovers actual stored source/file trunks without a prepared query or identifier. Source hierarchy and ordered files are navigable from visible controls.
+- Home, Library, Research, Sources, Workbench and Exports render at desktop and mobile widths.
 - Query, kind/tier filters, selected resource and selected view survive reload and browser Back/Forward.
 - A child, claim, physicality, assertion or source reference opens through shared resource detail. Following a link retains lookup context.
 - Ordered constituent positions preserve repeated equal identities. Unknown labels and unavailable standing stay explicit.
-- Source registration and assertion presence are represented separately. Snapshot counts are qualified and do not become global totals.
-- Research references and notes persist locally; exported notes and captured native data are valid JSON with acquisition context.
-- Sign-in controls state that providers are not connected. No fake account or payment completion is produced.
+- Source/file trunks are discovered through stored physicality roles. Containment provenance and registry metadata are separate; registry counts are not a census of witness trunks.
+- Research references and notes persist locally; exported notes and live native data are valid JSON with read context.
+- Sign-in controls discover the installed identity service and produce real provider challenges. No account consent or payment completion is simulated.
+- Explicit native read operations execute through browser forms. Failed reads stay distinct from empty results and can recover.
 - Keyboard access, dialog focus, contextual titles, accessible names, contrast and responsive layout are checked with Playwright and axe. No uncaught exceptions, missing local files or page-wide horizontal overflow.
 
 ## Identity and authority: required live acceptance

@@ -136,6 +136,15 @@ try:
         assert source['physicality'] and source['constituents'],source
         assert any(part.get('constituents') for part in source['constituents']),source
         assert all(part['tier']>=0 for part in source['constituents']),source
+        library=request('/v1/library',{})
+        discovered={item['id']:item for item in library['items']}
+        assert next(iter(before)) in discovered,library
+        assert discovered[next(iter(before))]['kind']=='source',library
+        assert discovered[next(iter(before))]['children'],library
+        graph=request('/v1/provenance',{'id':first['id']})
+        assert graph['complete'] and graph['edges'],graph
+        assert before<={node['id'] for node in graph['nodes'] if node['metadata_trunk'] and node['root']},graph
+        assert all('position' in edge and 'ordinal' in edge for edge in graph['edges']),graph
         assert connections()==pids
         ingest('second')
         second=request('/v1/search',{'input':'dog'})

@@ -78,5 +78,7 @@ nginx proxies `POST /mcp` on port 8443 to that process. Direct routes are under 
 The independent [modular browser application](web/README.md) is deployed on
 HART-DESKTOP at `https://dev.hartonomous.com/modular/`. It shares the existing
 same-origin identity service and runs in its own IIS pool. Its current resource
-screens use an explicitly labelled captured readback; live native collection and
-operation integration remains separate work.
+screens read the live modular database through an IIS-owned native reader.
+Stored source/file discovery, exact ID lookup, physicalities, claim evidence and
+containment ancestry share the same resource navigation. No captured-data fallback
+is shipped. See the browser application's README for the deployed boundaries.
