@@ -15,9 +15,9 @@ jobs:
       - uses: actions/checkout@v4
         with: { path: Laplace-MCP }
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: 044bd4a361ce32d8a840a480a83bbfd3321ec34e, path: Laplace-Native }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: 817f9b7ba32dc847225936f1db0fc8a69a7f2770, path: Laplace-Native }
       - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: cbf7165b168c7e39774c43a6f1a40708c6e63e87, path: Laplace-Engine }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: 5ca5fca9f15059215b8c6a1401f544928f1615bd, path: Laplace-Engine }
       - uses: actions/checkout@v4
         with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: 9486ad3fe58d55a637afafdb80d0afef38010734, path: Laplace-postgres }
       - uses: actions/checkout@v4
