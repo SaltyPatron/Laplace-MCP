@@ -31,6 +31,7 @@ typedef intptr_t ssize_t;
 #include "semantic.h"
 
 #include "laplace/laplace.h"
+#include "laplace/highway.h"
 
 #include <ctype.h>
 #include <libpq-fe.h>
@@ -48,7 +49,10 @@ static lp_text *TX;
 static PGconn *PG;
 static Lpm *CODE_IX;
 static void cw_str(char **out, size_t *on, size_t *ocap, const char *s);
+static void buf_fmt(char **b, size_t *n, size_t *cap, const char *fmt, ...);
 static char *cw_file_name(Reader *rd, const lp_id *file);
+static const lp_highway *VIEW_HIGHWAY;
+static const lp_highway *view_highway(void){if(!VIEW_HIGHWAY)VIEW_HIGHWAY=lp_highway_map(NULL);return VIEW_HIGHWAY;}
 
 /* Where things are when the environment does not say: what this service was built with (lpm_config.h). */
 static const char *CONN_DEFAULT = LPM_CONNINFO_DEFAULT;
@@ -268,6 +272,28 @@ static int mask_claim(const char *m, int len) {
     if (len < 5) return 0;
     return ((const unsigned char *)m)[4] & 0x80;
 }
+/* PostgreSQL bit(64)'s binary carrier has a network-order length and MSB-first
+ * bit positions. Decode transport bytes here; Native's manifest APIs own every
+ * field's enum/flags semantics and canonical value identities. */
+static void emit_mask_values(char **out,size_t *n,size_t *cap,const char *wire,int len){
+    const lp_highway *highway=view_highway();buf_fmt(out,n,cap,"[");
+    if(highway&&len==12&&lp_be(wire,4)==64){
+        lp_mask mask=0;const uint8_t *bytes=(const uint8_t *)wire+4;
+        for(unsigned bit=0;bit<64;bit++)if(bytes[bit>>3]&(0x80u>>(bit&7)))mask|=UINT64_C(1)<<bit;
+        int shown=0;
+        for(size_t i=0;i<highway->nbanks;i++){
+            const lp_bank *bank=highway->bank+i;if(!(mask&lp_mask_field(bank)))continue;
+            buf_fmt(out,n,cap,"%s{\"bank\":\"%s\",\"carrier\":\"%s\",\"encoding\":\"%s\",\"values\":[",shown++?",":"",bank->name,bank->carrier,bank->flags?"flags":"enum");
+            unsigned values=0;for(uint32_t slot=0;slot<bank->list->count;slot++)if(lp_mask_has(mask,bank,slot)){
+                const lp_tier0_record *record=lp_highway_at(highway,bank->list,slot);if(!record)continue;
+                char id[33];hex_id(&record->id,id);const char *label=lp_highway_identifier(highway,bank->list,slot);
+                buf_fmt(out,n,cap,"%s{\"slot\":%u,\"id\":\"%s\",\"label\":\"",values++?",":"",slot,id);cw_str(out,n,cap,label?label:"");buf_fmt(out,n,cap,"\"}");
+            }
+            buf_fmt(out,n,cap,"]}");
+        }
+    }
+    buf_fmt(out,n,cap,"]");
+}
 
 static const char *FORWARD_SQL =
     "SELECT COALESCE((SELECT json_agg(x) FROM ("
@@ -427,6 +453,8 @@ static void on_embeddings(int c, const char *body) {
             http(c, 500, "{\"error\":\"tier0\"}");
             return;
         }
+        size_t total_parts=np;
+        if(np>64)np=64;
         char id[33], pj[64 * 40], cj[160], uj[160];
         hex_id(&trunk.id, id);
         parts_json(parts, np, pj, sizeof pj);
@@ -434,8 +462,8 @@ static void on_embeddings(int c, const char *body) {
         unit_coord_json(&trunk, uj, sizeof uj);
         buf_fmt(&out, &un, &ucap,
                 "%s{\"object\":\"embedding\",\"index\":%zu,\"embedding\":%s,"
-                "\"id\":\"%s\",\"tier\":%u,\"coord\":%s,\"hilbert\":\"%016llx\",\"parts\":[%s]}",
-                i ? "," : "", i, uj, id, trunk.tier, cj, (unsigned long long)lp_hilbert4(&trunk.c), pj);
+                "\"id\":\"%s\",\"tier\":%u,\"coord\":%s,\"hilbert\":\"%016llx\",\"parts\":[%s],\"parts_total\":%zu,\"parts_complete\":%s}",
+                i ? "," : "", i, uj, id, trunk.tier, cj, (unsigned long long)lp_hilbert4(&trunk.c), pj,total_parts,total_parts==np?"true":"false");
         free(inputs[i]);
     }
     double ms = (double)(nsec() - t0) / 1e6;
@@ -444,8 +472,8 @@ static void on_embeddings(int c, const char *body) {
     free(out);
 }
 
-/* One constituent of a mixed-tier path. Tier 0 is a codepoint, tier 1 a grapheme.
- * A higher tier is read the same way as the trunk: the paths that hold it, and their attestations.
+/* One constituent reference in a mixed-tier path. Non-atomic content is read
+ * the same way as the trunk: the paths that hold it, and their attestations.
  * Its own constituents stay on it, so a word's codepoints are not dropped and are not searched as the trunk. */
 typedef struct {
     lp_id id;
@@ -530,7 +558,7 @@ static void emit_down(char **b, size_t *n, size_t *cap, const Down *d, int fan) 
         }
         buf_add(b, n, cap, "]", 1);
     }
-    if (d->tier >= 2) {
+    if (d->cp < 0) {
         int nh = d->nh;
         Hold *h = d->h;
         int *order = malloc(sizeof(int) * (size_t)(nh ? nh : 1));
@@ -603,6 +631,8 @@ static void on_search(int c, const char *body) {
         http(c, 400, "{\"error\":\"input or id\"}");
         return;
     }
+    size_t total_parts=np;
+    if(np>64)np=64;
     double id_ms = (double)(nsec() - t0) / 1e6;
     PGconn *pg=db();
     if(!pg){
@@ -611,37 +641,33 @@ static void on_search(int c, const char *body) {
     }
     int fan = 0;
     jint(body, "fan", &fan);
-    /* A text identity may be computable without having been stored. */
-    int recorded = np ? tier_max(pg, &trunk.id, 1) : -1;
-    int known = np > 0;
-    if (!np) {
-        for (int i = 0; i < 16; i++) {
-            unsigned v = 0;
-            sscanf(idbuf + 2 * i, "%2x", &v);
-            trunk.id.b[i] = (uint8_t)v;
+    int text_input=np>0;
+    if(!text_input)lp_id_unhex(idbuf,&trunk.id);
+    const lp_tier0_record *cached=lp_highway_find(view_highway(),&trunk.id);
+    int64_t codepoint=lp_tier0_codepoint(T0,&trunk.id);
+    if(!text_input && codepoint>=0){trunk=lp_ref_atom(T0,(uint32_t)codepoint);parts[0]=trunk;np=total_parts=1;}
+    else if(!text_input && cached){
+        if(!lp_highway_decompose(view_highway(),TX,&trunk.id,NULL,NULL,&trunk,parts,64,&total_parts)){
+            http(c,503,"{\"error\":\"Highway components disagree with canonical content\"}");return;
         }
-        recorded = tier_max(pg, &trunk.id, 1);
-        if (recorded >= 0) { trunk.tier = (uint32_t)recorded; known = 1; }
+        np=total_parts>64?64:total_parts;
     }
-    t0 = nsec();
-    int nh = 0;
-    int floor = known ? (int)trunk.tier : -1;
-    Hold *h = holds_above(pg,&trunk.id, 1, floor, 0, 1, &nh);
-    uint8_t ab[40];
-    size_t al = ids_param(pg,ab, &trunk.id, 1);
-    const char *pv[1] = { (const char *)ab };
-    int pl[1] = { (int)al }, pf[1] = { 1 };
-    PGresult *self = db_exec_params(pg,
-        "SELECT path,tier,mask,mask::text FROM @extschema@.laplace_physicalities($1::@extschema@.blake3[])",
-        1,NULL,pv,pl,pf,1);
-    if (PQresultStatus(self) != PGRES_TUPLES_OK) {
-        char e[512], b[700];
-        json_esc(PQerrorMessage(pg), e, sizeof e);
-        snprintf(b, sizeof b, "{\"error\":\"physicality\",\"detail\":\"%s\"}", e);
-        PQclear(self);
-        holds_free(h, nh);
-        http(c, 500, b);
-        return;
+    uint8_t ab[40];size_t al=ids_param(pg,ab,&trunk.id,1);
+    const char *pv[1]={(const char *)ab};int pl[1]={(int)al},pf[1]={1};
+    PGresult *entity_row=db_exec_params(pg,"SELECT tier,mask FROM @extschema@.laplace_entities($1::@extschema@.blake3[])",1,NULL,pv,pl,pf,1);
+    if(PQresultStatus(entity_row)!=PGRES_TUPLES_OK){PQclear(entity_row);http(c,503,"{\"error\":\"entity\"}");return;}
+    int recorded=PQntuples(entity_row)?(int)lp_be(PQgetvalue(entity_row,0,0),2):-1;
+    if(!np && recorded>=0)trunk.tier=(uint8_t)recorded;
+    t0=nsec();int nh=0;
+    /* Cache membership supplies canonical content, never observations. Read
+     * reverse references from PostgreSQL using its stored tier, if present. */
+    Hold *h=holds_above(pg,&trunk.id,1,recorded,0,1,&nh);
+    PGresult *self=db_exec_params(pg,
+        "SELECT path,tier,mask,mask::text FROM @extschema@.laplace_physicalities($1::@extschema@.blake3[])",1,NULL,pv,pl,pf,1);
+    if(PQresultStatus(self)!=PGRES_TUPLES_OK){
+        char escaped[512],error[700];json_esc(PQerrorMessage(pg),escaped,sizeof escaped);
+        snprintf(error,sizeof error,"{\"error\":\"physicality\",\"detail\":\"%s\"}",escaped);
+        PQclear(self);PQclear(entity_row);holds_free(h,nh);http(c,503,error);return;
     }
     /* Who said this ID and every claim that holds it: a walk up the containment from them (the engine's attested). */
     int nclaim = 0;
@@ -652,16 +678,19 @@ static void on_search(int c, const char *body) {
     for (int i = 0; i < nh; i++) if (h[i].claim) cids[ncids++] = h[i].entity;
     int natt = 0;
     Attested *att = attested(pg, cids, ncids, &natt, NULL);
-    /* The trunk's path mixes tiers. Each constituent keeps its own tier. Tier 0 and tier 1
-     * stay in the path. A constituent above them is read for what holds it. */
+    /* Read non-atomic references by ID. Neither packaging depth nor a stored
+     * tier is a semantic content-type test. */
     Down *down = NULL;
     int ndown = 0;
     if (np) {
         ndown = (int)np;
         down = calloc((size_t)ndown, sizeof *down);
+        lp_id ids[64];int stored[64];
+        for(int i=0;i<ndown;i++)ids[i]=parts[i].id;
+        tiers_of(pg,ids,ndown,stored);
         for (int i = 0; i < ndown; i++) {
             down[i].id = parts[i].id;
-            down[i].tier = parts[i].tier;
+            down[i].tier = stored[i]>=0?stored[i]:parts[i].tier;
             down[i].cp = (int)lp_tier0_codepoint(T0, &parts[i].id);
             down[i].have_c = 1;
             down[i].c = parts[i].c;
@@ -683,7 +712,7 @@ static void on_search(int c, const char *body) {
         free(ids);
     }
     for (int i = 0; i < ndown; i++) {
-        if (down[i].tier < 2) continue;
+        if (down[i].cp >= 0) continue;
         down[i].h = holds_above(pg,&down[i].id, 1, down[i].tier, 0, 1, &down[i].nh);
         int nc = 0;
         for (int k = 0; k < down[i].nh; k++) nc += down[i].h[k].claim;
@@ -697,7 +726,7 @@ static void on_search(int c, const char *body) {
     /* One stored-path frontier and one tier frontier for the entire layer.
      * Duplicate constituent occurrences retain their own Down slots. */
     lp_vec(lp_id) roots={0};lp_vec(int) slots={0};
-    for(int i=0;i<ndown;i++)if(down[i].tier>=2){lp_push(&roots,down[i].id);lp_push(&slots,i);}
+    for(int i=0;i<ndown;i++)if(down[i].cp<0){lp_push(&roots,down[i].id);lp_push(&slots,i);}
     int npaths=0;Hold *paths=paths_of(pg,roots.v,(int)roots.n,&npaths);
     lp_vec(lp_id) children={0};
     for(int row=0;row<npaths;row++){
@@ -748,10 +777,10 @@ static void on_search(int c, const char *body) {
     size_t un = 0, ucap = 0;
     buf_fmt(&out, &un, &ucap,
             "{\"id\":\"%s\",\"tier\":%u,\"fan\":%d,\"coord\":%s,\"hilbert\":\"%016llx\","
-            "\"parts\":[%s],\"ms\":{\"identity\":%.3f,\"database\":%.3f},"
+            "\"parts\":[%s],\"parts_total\":%zu,\"parts_complete\":%s,\"ms\":{\"identity\":%.3f,\"database\":%.3f},"
             "\"holds_read\":%d,\"claims_read\":%d,\"occurrences_read\":%d,\"physicality\":[",
-            idbuf, trunk.tier, fan, np ? cj : "null",
-            np ? (unsigned long long)lp_hilbert4(&trunk.c) : 0ull, pj, id_ms, db_ms, nh, nco, noo);
+            idbuf, recorded>=0?(unsigned)recorded:trunk.tier, fan, np ? cj : "null",
+            np ? (unsigned long long)lp_hilbert4(&trunk.c) : 0ull, pj,total_parts,total_parts==np?"true":"false",id_ms, db_ms, nh, nco, noo);
     for (int i = 0; i < PQntuples(self); i++) {
         char one[32];
         int nids = 0;
@@ -769,7 +798,8 @@ static void on_search(int c, const char *body) {
             char member[33];hex_id(&vertices[k].id,member);
             buf_fmt(&out,&un,&ucap,"%s{\"id\":\"%s\",\"ordinal\":%zu,\"position\":%u,\"run\":%u,\"said\":%u,\"outcome\":%u,\"spare\":%u}",k?",":"",member,k,vertices[k].position,vertices[k].run,vertices[k].said,vertices[k].outcome,vertices[k].spare);
         }
-        free(vertices);buf_fmt(&out,&un,&ucap,"]}");
+        free(vertices);buf_fmt(&out,&un,&ucap,"],\"facets\":");
+        emit_mask_values(&out,&un,&ucap,PQgetvalue(self,i,2),PQgetlength(self,i,2));buf_fmt(&out,&un,&ucap,"}");
     }
     buf_add(&out, &un, &ucap, "],\"claims\":[", strlen("],\"claims\":["));
     int shown = 0;
@@ -808,6 +838,14 @@ static void on_search(int c, const char *body) {
         emit_down(&out, &un, &ucap, &down[i], fan);
     }
     buf_fmt(&out,&un,&ucap,"],\"database\":\"%s\",\"recorded\":%s",PQdb(pg),recorded>=0?"true":"false");
+    buf_fmt(&out,&un,&ucap,",\"stored_tier\":");
+    if(recorded>=0)buf_fmt(&out,&un,&ucap,"%d",recorded);else buf_fmt(&out,&un,&ucap,"null");
+    buf_fmt(&out,&un,&ucap,",\"computed_tier\":");
+    if(text_input)buf_fmt(&out,&un,&ucap,"%u",trunk.tier);else buf_fmt(&out,&un,&ucap,"null");
+    buf_fmt(&out,&un,&ucap,",\"canonical_tier\":");if(np)buf_fmt(&out,&un,&ucap,"%u",trunk.tier);else buf_fmt(&out,&un,&ucap,"null");
+    buf_fmt(&out,&un,&ucap,",\"cache_tier\":");if(codepoint>=0)buf_fmt(&out,&un,&ucap,"0");else if(cached)buf_fmt(&out,&un,&ucap,"%u",cached->pad);else buf_fmt(&out,&un,&ucap,"null");
+    buf_fmt(&out,&un,&ucap,",\"storage\":\"%s\",\"entity_facets\":",PQntuples(entity_row)?"database":codepoint>=0?"tier0-cache":cached?"highway-cache":text_input?"computed":"unresolved");
+    if(PQntuples(entity_row))emit_mask_values(&out,&un,&ucap,PQgetvalue(entity_row,0,1),PQgetlength(entity_row,0,1));else buf_fmt(&out,&un,&ucap,"[]");
     if(jbool(body,"display",0)){
         /* Native's selected-prefix reader shares a batched frontier. Labels are
          * a display projection, never an alternate browser-side decomposer. */
@@ -849,6 +887,7 @@ static void on_search(int c, const char *body) {
     }
     buf_add(&out,&un,&ucap,"}",1);
     PQclear(self);
+    PQclear(entity_row);
     free(att);
     free(cids);
     free(order);
@@ -1787,6 +1826,7 @@ static const char *SURFACE =
     "{\"method\":\"POST\",\"path\":\"/v1/pull\",\"body\":\"{\\\"input\\\":\\\"text\\\"}\",\"does\":\"laplace pull\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/degrees\",\"body\":\"{\\\"input\\\":\\\"text\\\",\\\"other\\\":\\\"text\\\"}\",\"does\":\"laplace degrees\"},"
     "{\"method\":\"GET\",\"path\":\"/v1/surface\"},"
+    "{\"method\":\"GET\",\"path\":\"/v1/schema\",\"does\":\"native view descriptors, mask banks, occurrence roles and operation input schemas\"},"
     "{\"method\":\"GET\",\"path\":\"/health\"},"
     "{\"method\":\"POST\",\"path\":\"/mcp\",\"body\":\"JSON-RPC 2.0 MCP or op: embeddings|rerank|code_search|reindex|code_where|code_callers|code_callees|sources|ingest_status|file_outline|recipe_plan|recipe_catalog|search|forward|shape|frechet|ingest|hop|text|translate|degrees|pull|surface\"}"
     "],"
@@ -2872,7 +2912,7 @@ static const char *TOOLS =
     "{\"name\":\"recipe_catalog\",\"description\":\"Complete available ingestion sources, short aliases, content locations, recipes, file formats and prerequisites from the Engine; no database or corpus required.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"rerank\",\"description\":\"Deterministic Laplace reranker (drop-in replacement for neural cross-encoders). Scores candidate documents against a query using IDF-weighted constituent overlap and 4D discrete Frechet trajectory distance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"documents\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"top_n\":{\"type\":\"integer\"}},\"required\":[\"query\",\"documents\"]}},"
-    "{\"name\":\"search\",\"description\":\"Name text on the client from tier 0, or take an ID the caller already holds. The trunk is read with holds_above, and so is every constituent whose tier is above a codepoint or a grapheme. A tier-0 constituent stays in the path, in its place, with its codepoint. fan, when sent, caps how many claims and occurrences are returned; omitted, all of them are.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"fan\":{\"type\":\"integer\"}},\"required\":[]}},"
+    "{\"name\":\"search\",\"description\":\"Name text on the client from tier 0, or take an ID the caller already holds. The trunk and non-atomic constituent references are read with holds_above. A scalar stays in the path, in its place, with its codepoint. Stored tiers are returned separately from the computed text modality tier. fan, when sent, caps how many claims and occurrences are returned; omitted, all of them are.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"fan\":{\"type\":\"integer\"}},\"required\":[]}},"
     "{\"name\":\"embeddings\",\"description\":\"Same call shape as an embedding endpoint. Returns the Laplace entity ID, tier, 4D coordinate (also exposed as OpenAI-compatible embedding array), Hilbert value, and constituent IDs. Does not touch the database.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"inputs\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[]}},"
     "{\"name\":\"shape\",\"description\":\"Discrete Frechet distance between two texts, laplace_frechet4d on the stored coordinates of their constituents.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"other\":{\"type\":\"string\"}},\"required\":[\"input\",\"other\"]}},"
     "{\"name\":\"forward\",\"description\":\"laplace_forward on the constituent IDs of a prompt: which spans are observed and what follows them.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[\"input\"]}},"
@@ -2883,6 +2923,40 @@ static const char *TOOLS =
     "{\"name\":\"degrees\",\"description\":\"laplace degrees: how far one entity is from another over rated claims.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"other\":{\"type\":\"string\"}},\"required\":[\"input\",\"other\"]}},"
     "{\"name\":\"pull\",\"description\":\"laplace pull: the forward pass. The prompt is decomposed, trajectories give precedes, contains and co-occurrence, claims tug back by their Glicko standing, and the firmware's take steps choose the segment. No fan cap is passed; the firmware's own fan and hops apply.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[\"input\"]}}"
     "]}";
+
+/* View projections are not entity subclasses. Every canonical ID still names
+ * the same content when used as a claim, file, source or constituent. */
+static void on_schema(int c){
+    const lp_highway *highway=view_highway();
+    if(!highway){http(c,503,"{\"error\":\"highway schema unavailable\"}");return;}
+    char *out=NULL;size_t n=0,cap=0;uint8_t fingerprint[32];lp_highway_fingerprint(highway,fingerprint);
+    buf_fmt(&out,&n,&cap,"{\"schema\":\"laplace-view-schema/v1\",\"highway\":\"");
+    for(size_t i=0;i<32;i++)buf_fmt(&out,&n,&cap,"%02x",fingerprint[i]);
+    buf_fmt(&out,&n,&cap,"\",\"identity\":{\"algorithm\":\"BLAKE3-128\",\"input\":\"ordered constituent IDs, repeats included\",\"singleton\":\"child\"},\"views\":{");
+    static const char *view[][4]={
+        {"entity","Entity","Entities","Canonical content shared across every structure that references its ID."},
+        {"physicality","Physicality","Physicalities","The physical form of the paired entity: ordered constituent references and occurrence annotations."},
+        {"claim","Claim","Claims","A composition used as a claim. Its identity is distinct from its assertions and standing."},
+        {"container","Containing path","Containing paths","A parent composition whose physicality references this content."},
+        {"attestation","Attestation","Attestations","A claim attributed through containment to a source trunk."},
+        {"source","Source trunk","Source trunks","The source trunk in the same Merkle DAG as its files, records and content."},
+        {"file","File trunk","File trunks","A composition referencing file metadata and its recorded content tree."}
+    };
+    for(size_t i=0;i<sizeof view/sizeof *view;i++)buf_fmt(&out,&n,&cap,"%s\"%s\":{\"name\":\"%s\",\"plural\":\"%s\",\"description\":\"%s\"}",i?",":"",view[i][0],view[i][1],view[i][2],view[i][3]);
+    buf_fmt(&out,&n,&cap,"},\"banks\":[");
+    for(size_t i=0;i<highway->nbanks;i++){
+        const lp_bank *bank=highway->bank+i;
+        buf_fmt(&out,&n,&cap,"%s{\"name\":\"%s\",\"group\":\"%s\",\"carrier\":\"%s\",\"list\":\"%s\",\"width\":%u,\"offset\":%u,\"encoding\":\"%s\",\"slots\":%u}",i?",":"",bank->name,bank->group,bank->carrier,bank->list->name,bank->width,bank->offset,bank->flags?"flags":"enum",bank->list->count);
+    }
+    buf_fmt(&out,&n,&cap,"],\"vertex_roles\":[");
+    static const struct {unsigned value;const char *name;} roles[]={
+        {0,"Constituent"},{LP_SAID_CLAIM,"Claim"},{LP_SAID_RECORD,"Record"},
+        {LP_SAID_TUPLE,"Tuple"},{LP_SAID_METADATA,"Metadata"},{LP_SAID_HOLDS,"Content tree"},{LP_SAID_VOICE,"Voice"}
+    };
+    for(size_t i=0;i<sizeof roles/sizeof *roles;i++)buf_fmt(&out,&n,&cap,"%s{\"value\":%u,\"name\":\"%s\"}",i?",":"",roles[i].value,roles[i].name);
+    buf_fmt(&out,&n,&cap,"],\"operations\":%s}",TOOLS);
+    http(c,200,out);free(out);
+}
 
 static void mcp_rpc(int c, const char *body) {
     char method[64], id[64];
@@ -3031,6 +3105,10 @@ static void dispatch(int c, const char *method, const char *path, const char *bo
     }
     if (!strcmp(method, "GET") && !strcmp(path, "/v1/surface")) {
         http(c, 200, SURFACE);
+        return;
+    }
+    if (!strcmp(method, "GET") && !strcmp(path, "/v1/schema")) {
+        on_schema(c);
         return;
     }
     if (strcmp(method, "POST")) {

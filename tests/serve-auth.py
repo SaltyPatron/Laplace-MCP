@@ -95,7 +95,7 @@ with tempfile.TemporaryDirectory(prefix='lpm-serve-auth-') as d:
         try:
             status, body, _ = call(p, '/health')
             assert (status, body) == (200, {'ok': True}), (status, body)
-            for path, data in (('/v1/surface', None), ('/mcp', ingest), ('/v1/search', {'input': 'x'}), ('/health', {'x': 1})):
+            for path, data in (('/v1/surface', None), ('/v1/schema', None), ('/mcp', ingest), ('/v1/search', {'input': 'x'}), ('/health', {'x': 1})):
                 for token, scheme in ((None, 'Bearer'), ('wrong' * 13, 'Bearer'), (TOKEN[:-1], 'Bearer'),
                                       (TOKEN + 'x', 'Bearer'), (TOKEN, 'Basic'), ('', 'Bearer')):
                     status, body, headers = call(p, path, data, token, scheme)
@@ -105,6 +105,9 @@ with tempfile.TemporaryDirectory(prefix='lpm-serve-auth-') as d:
             assert status == 200 and body.get('service') == 'Laplace-MCP', (status, body)
             status, body, _ = call(p, '/v1/surface', token=TOKEN, scheme='bearer')
             assert status == 200, status
+            status, body, _ = call(p, '/v1/schema', token=TOKEN)
+            assert status == 200 and body['schema']=='laplace-view-schema/v1', (status,body)
+            assert len(body['highway'])==64 and body['banks'] and body['vertex_roles'],body
             status, body, _ = call(p, '/mcp', {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}, TOKEN)
             assert status == 200 and any(t['name'] == 'ingest' for t in body['result']['tools']), (status, body)
         finally:

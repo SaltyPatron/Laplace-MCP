@@ -9,6 +9,8 @@ This file distinguishes delivered browser read workflows from full product accep
 - Query, kind/tier filters, selected resource and selected view survive reload and browser Back/Forward.
 - A child, claim, physicality, assertion or source reference opens through shared resource detail. Following a link retains lookup context.
 - Ordered constituent positions preserve repeated equal identities. Unknown labels and unavailable standing stay explicit.
+- Native model discovery supplies view descriptions, occurrence roles, mask classifications and operation forms. These view projections do not define separate entity identities.
+- Text modality tiers remain distinct from stored metadata during migration. XML, JSON and TSV references resolve to the same canonical word and its physicality; packaging depth cannot renumber the word.
 - Source/file trunks are discovered through stored physicality roles. Containment provenance and registry metadata are separate; registry counts are not a census of witness trunks.
 - Research references and notes persist locally; exported notes and live native data are valid JSON with read context.
 - Sign-in controls discover the installed identity service and produce real provider challenges. No account consent or payment completion is simulated.

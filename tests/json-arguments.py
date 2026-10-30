@@ -13,6 +13,7 @@ requests = [
     {'jsonrpc':'2.0','id':'unicode-"direct','method':'tools/call','params':{'name':'embeddings','arguments':{'input':'café 🐕'}}},
     {'jsonrpc':'2.0','id':4,'method':'tools/call','params':{'name':'search','arguments':{'id':'f040f1c29f98d0f5d1bd7f265ac2e1de'}}},
     {'jsonrpc':'2.0','id':5,'method':'tools/call','params':{'name':'embeddings','arguments':{'input':'literal "id":99, {"input":"different"}\tend'}}},
+    {'jsonrpc':'2.0','id':6,'method':'tools/call','params':{'name':'embeddings','arguments':{'input':'z'*256}}},
 ]
 # The first representation escapes UTF-16 surrogate pairs, the second carries
 # UTF-8 directly. Both go through the real MCP transport and Native decomposer.
@@ -33,4 +34,9 @@ error,detail=content(3)
 assert error['isError'] and detail['error']=='database',detail
 last,literal=content(4)
 assert not last['isError'] and literal!=a
+bounded,long_word=content(5)
+assert not bounded['isError'],long_word
+record=long_word['data'][0]
+assert record['tier']==2 and record['parts_total']==256 and not record['parts_complete'],record
+assert len(record['parts'])==64 and len(set(record['parts']))==1,record
 print('JSON-RPC IDs and arguments are separate; escaped/direct Unicode agree; canonical ID reaches the database reader; quoted field names stay content')

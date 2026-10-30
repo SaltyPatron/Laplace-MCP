@@ -28,6 +28,10 @@ try{
   const source=discovery.items.find(x=>x.kind==='source');assert.ok(source,'Stored source discovery must be populated');
   assert.equal(discovery.database,'laplace');assert.ok(discovery.items.filter(x=>x.kind==='file').length>0);
   await page.getByRole('heading',{name:source.title,exact:true}).waitFor();
+  const model=await (await page.request.get(base+'api/schema')).json();
+  assert.equal(model.schema,'laplace-view-schema/v1');assert.ok(model.banks.length>0);
+  assert.deepEqual(model.operations.map(x=>x.name).sort(),['embeddings','forward','shape']);
+  assert.equal(await page.locator('.hero').count(),0);
   assert.ok(await page.locator('.file-card').count()>0);
   await page.getByRole('button',{name:'Sign in',exact:true}).waitFor();
   await snapshot('live-home');await scan('home');mark('Fresh home discovers and displays real stored sources and files without a query');
@@ -60,6 +64,8 @@ try{
   assert.equal(await page.locator('[data-filter=kind]').inputValue(),'all');
   assert.equal(await page.locator('.result').count(),5);
   await page.locator('.result').first().click();await waitDetail();
+  await page.locator('[data-tier-mismatch]').waitFor();
+  assert.match(await page.locator('[data-tier-mismatch]').innerText(),/Stored tier 1.*text modality tier 2/);
   await page.locator('.tabs').getByRole('link',{name:'Structure',exact:true}).click();
   await page.locator('tbody tr').first().waitFor();assert.equal(await page.locator('tbody tr').count(),8);
   const repeated=await page.locator('tbody tr').evaluateAll(rows=>[rows[1].cells[2].textContent,rows[5].cells[2].textContent]);assert.equal(repeated[0],repeated[1]);
@@ -94,7 +100,10 @@ try{
   assert.equal(exported.schema,'laplace-native-readback/v1');assert.equal(exported.query,'dog');assert.equal(exported.response.database,'laplace');assert.ok(exported.ancestry.nodes.some(n=>n.id===source.id));mark('A visible export control downloads the actual query response and traced ancestry');
 
   await page.getByRole('link',{name:'Workbench',exact:true}).click();await page.getByLabel('Content',{exact:true}).fill('sabotage');
-  await page.getByRole('button',{name:'Run native operation',exact:true}).click();await page.getByRole('heading',{name:'Native result',exact:true}).waitFor();assert.ok((await page.locator('.json-result').first().innerText()).includes('f040f1c29f98d0f5d1bd7f265ac2e1de'));mark('The workbench executes a native operation from an ordinary browser form');
+  assert.equal(await page.locator('textarea').count(),1);
+  await page.getByLabel('Operation',{exact:true}).selectOption('shape');assert.equal(await page.locator('textarea').count(),2);
+  await page.getByLabel('Operation',{exact:true}).selectOption('embeddings');assert.equal(await page.locator('textarea').count(),1);
+  await page.getByRole('button',{name:'Run native operation',exact:true}).click();await page.getByRole('heading',{name:'Native result',exact:true}).waitFor();assert.ok((await page.locator('.operation-result').innerText()).includes('f040f1c29f98d0f5d1bd7f265ac2e1de'));mark('Native input schemas drive operation fields and results contain navigable canonical references');
 
   await page.getByRole('button',{name:'Sign in',exact:true}).click();const dialog=page.getByRole('dialog');await dialog.waitFor();
   for(const provider of ['google','microsoft']){

@@ -47,6 +47,13 @@ try:
             (definitions/'facts.recipe').write_text('name scope-'+source+'\nmatch *.tsv\ntier row by \\n\nnames thing value\ntier field by \\t\nthing row thing\ncontent thing value\nrelation "has value" value\nattest row value\n',encoding='utf-8',newline='\n')
             data=root/'data'/source;data.mkdir(parents=True)
             (data/'facts.tsv').write_text('dog\twarm\ncat\tcold\n',encoding='utf-8',newline='\n')
+            if source=='first':
+                # Actual, different packaging ASTs reference the same text
+                # entities. These are parsed by the normal grammar pipeline.
+                (definitions/'xml.recipe').write_text('name scope-xml\nmatch *.xml\ngrammar xml\n',encoding='utf-8')
+                (definitions/'json.recipe').write_text('name scope-json\nmatch *.json\ngrammar json\n',encoding='utf-8')
+                (data/'facts.xml').write_text('<facts><row value="dog">dog</row></facts>',encoding='utf-8')
+                (data/'facts.json').write_text('{"thing":"dog","nested":["dog"]}',encoding='utf-8')
         env=dict(os.environ,LAPLACE_DATA=str(root/'data'),LAPLACE_WORK=str(root/'work'),
                  LAPLACE_RECIPES=str(recipes),LAPLACE_ENGINE=str(engine),LAPLACE_INGEST_ONE='1',OMP_NUM_THREADS='2')
 
@@ -137,6 +144,30 @@ try:
         assert any(part.get('constituents') for part in source['constituents']),source
         assert all(part['tier']>=0 for part in source['constituents']),source
         library=request('/v1/library',{})
+        schema=request('/v1/schema')
+        assert schema['schema']=='laplace-view-schema/v1' and len(schema['highway'])==64,schema
+        assert any(bank['name']=='kind' and bank['encoding']=='flags' for bank in schema['banks']),schema
+        assert schema['views']['physicality']['name']=='Physicality',schema
+        assert any(role['name']=='Metadata' for role in schema['vertex_roles']),schema
+        assert first['stored_tier']==first['computed_tier']==2,first
+        assert direct['stored_tier']==2 and direct['computed_tier'] is None,direct
+        assert first['storage']=='database' and 'entity_facets' in first,first
+        assert any(field['bank']=='kind' and any(value['label']=='file' for value in field['values'])
+                   for field in source['physicality'][0]['facets']),source
+        sql(name,"UPDATE public.entity SET mask=mask | public.laplace_mask_slot('upos','NOUN') "
+                 f"WHERE id='{first['id']}'::public.blake3")
+        classified=request('/v1/search',{'id':first['id']})
+        noun=request('/v1/embeddings',{'input':'NOUN'})['data'][0]['id']
+        assert any(field['bank']=='upos' and field['carrier']=='entity' and field['encoding']=='enum'
+                   and any(value['id']==noun and value['label']=='NOUN' for value in field['values'])
+                   for field in classified['entity_facets']),classified
+        cache_only=request('/v1/search',{'id':noun,'display':True})
+        assert not cache_only['recorded'] and cache_only['storage']=='highway-cache',cache_only
+        assert cache_only['canonical_tier']==2 and len(cache_only['parts'])==4,cache_only
+        assert any(label['id']==noun and label['text']=='NOUN' for label in cache_only['labels']),cache_only
+        scalar=request('/v1/embeddings',{'input':'N'})['data'][0]['id']
+        atom=request('/v1/search',{'id':scalar,'display':True})
+        assert not atom['recorded'] and atom['storage']=='tier0-cache' and atom['tier']==0,atom
         discovered={item['id']:item for item in library['items']}
         assert next(iter(before)) in discovered,library
         assert discovered[next(iter(before))]['kind']=='source',library
@@ -145,7 +176,27 @@ try:
         assert graph['complete'] and graph['edges'],graph
         assert before<={node['id'] for node in graph['nodes'] if node['metadata_trunk'] and node['root']},graph
         assert all('position' in edge and 'ordinal' in edge for edge in graph['edges']),graph
+        file_labels=[node['label'] for node in graph['nodes'] if node.get('trunk_kind')=='file']
+        assert all(any(label.endswith('facts.'+extension) for label in file_labels)
+                   for extension in ['tsv','xml','json']),graph
+        assert first['physicality'][0]['n']==3 and first['physicality'][0]['tier']==2,first
         assert connections()==pids
+        # Reproduce the former text-floor regression in this private database.
+        # A current text identity must still discover parents stored at its
+        # computed tier. Never substitute the computed tier for stored metadata.
+        sql(name,'CREATE TABLE saved_content_tiers AS SELECT id,tier FROM public.entity; '
+                 'UPDATE public.entity SET tier=greatest(1,tier-1) WHERE tier>0; '
+                 'UPDATE public.physicality SET tier=greatest(1,tier-1) WHERE tier>0')
+        legacy=request('/v1/search',{'input':'dog'})
+        assert legacy['id']==first['id'] and legacy['stored_tier']==legacy['tier']==1,legacy
+        assert legacy['computed_tier']==2,legacy
+        assert {row['entity'] for row in legacy['claims']}==set(counts),legacy
+        legacy_sentence=request('/v1/search',{'input':'dog warm'})
+        assert any(part['id']==first['id'] and part['tier']==1 and part['claims']
+                   for part in legacy_sentence['constituents']),legacy_sentence
+        sql(name,'UPDATE public.entity e SET tier=s.tier FROM saved_content_tiers s WHERE e.id=s.id; '
+                 'UPDATE public.physicality p SET tier=s.tier FROM saved_content_tiers s WHERE p.entity=s.id; '
+                 'DROP TABLE saved_content_tiers')
         ingest('second')
         second=request('/v1/search',{'input':'dog'})
         after={row['trunk'] for row in second['attestations'] if row['witness']}
@@ -159,6 +210,6 @@ try:
         third=request('/v1/search',{'input':'dog'})
         assert next(row['matches'] for row in third['claims'] if row['entity']==claim)==wide_count,third
         assert connections()==pids
-        print('read-snapshot: one connection owns the snapshot and Native reads; source authority and 64-bit counts refresh between requests; all transactions released and connection PIDs reused')
+        print('read-snapshot: XML, JSON and TSV reference the same tier-2 word and physicality; legacy tiers do not hide parents; snapshot, source refresh, 64-bit counts and connection reuse passed')
 finally:
     if created:sql('postgres',f'DROP DATABASE "{name}" WITH (FORCE)')

@@ -76,7 +76,7 @@ Use a same-origin browser gateway for sessions, workspace authorization, anti-fo
 
 The existing shared modular bearer token is a service credential, not a browser identity. Never embed it in JavaScript, browser storage or a downloadable configuration. The trusted gateway must enforce resource scope; longer-term native request context must carry the relevant authorization/world and program scope without relying on a single global token as per-user authority.
 
-`openapi.json` defines a **proposed** browser contract. Paths are namespaced under `/browser/v1` so they are not misrepresented as routes already served by the native process. The contract is a starting boundary for implementation, not an exhaustive list of invention operations. Resource kinds and operation inputs remain discoverable.
+`openapi.json` describes the implemented `/api` browser boundary. `/api/schema` obtains view projections, mask banks, occurrence roles and operation input schemas from Native. Entity identity is shared across these projections: a format tree references a content entity rather than renumbering or cloning it. The broader research, ingestion, synthesis and commerce interfaces discussed here remain design work beyond that deployed boundary.
 
 Important contract rules:
 
@@ -143,4 +143,4 @@ No live OAuth or payment flows were executed. No application source or installed
 
 This is dependency ordering, not permission to declare the whole product complete after identity or one lookup. `ACCEPTANCE.md` lists the acceptance boundaries.
 
-Standards: [OpenAPI 3.1.2](https://spec.openapis.org/oas/v3.1.2.html) is an intentionally pinned contract format; newer releases do not require inventing a custom API description. [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457.html) defines the Problem Details envelope used here.
+The installed API contract uses [OpenAPI 3.1.2](https://spec.openapis.org/oas/v3.1.2.html) and JSON Schema. The current host returns `error` and `detail` fields for failed reads; the earlier Problem Details design is not its deployed error contract.

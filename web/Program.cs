@@ -47,6 +47,7 @@ app.MapGet("/health", () => Results.Json(new
 }));
 
 static bool IsId(string id) => id.Length == 32 && id.All(Uri.IsHexDigit);
+static bool IsReadOperation(string? name) => name is "forward" or "shape" or "embeddings";
 app.MapGet("/api/lookup", async (string q, NativeRuntime native, CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(q) || System.Text.Encoding.UTF8.GetByteCount(q) > 4096) return Results.BadRequest(new { error = "Enter content or a canonical ID, up to 4096 UTF-8 bytes." });
@@ -62,10 +63,41 @@ app.MapGet("/api/library", async (string? after, NativeRuntime native, Cancellat
     ? Results.Json(await native.Read("/v1/library", new { after = after ?? "" }, ct)) : Results.BadRequest());
 app.MapGet("/api/sources", async (NativeRuntime native, CancellationToken ct) => Results.Json(await native.Read("/v1/sources", new { }, ct)));
 app.MapGet("/api/surface", async (NativeRuntime native, CancellationToken ct) => Results.Json(await native.Read("/v1/surface", null, ct)));
+app.MapGet("/api/schema", async (NativeRuntime native, CancellationToken ct) =>
+{
+    var schema = await native.Read("/v1/schema", null, ct);
+    // Discovery describes the native model; execution remains an explicit
+    // server permission. Reuse the native MCP JSON Schemas for permitted forms.
+    var operations = schema.GetProperty("operations").GetProperty("tools").EnumerateArray()
+        .Where(tool => IsReadOperation(tool.GetProperty("name").GetString()))
+        .Select(tool => new
+        {
+            name = tool.GetProperty("name").GetString(),
+            description = tool.GetProperty("description"),
+            inputSchema = new
+            {
+                type = "object",
+                properties = tool.GetProperty("inputSchema").GetProperty("properties").EnumerateObject()
+                    .Where(field => field.Name is "input" or "other")
+                    .ToDictionary(field => field.Name, field => field.Value.Clone()),
+                required = tool.GetProperty("name").GetString() == "shape" ? new[] { "input", "other" } : new[] { "input" }
+            }
+        }).ToArray();
+    return Results.Json(new
+    {
+        schema = schema.GetProperty("schema"),
+        highway = schema.GetProperty("highway"),
+        identity = schema.GetProperty("identity"),
+        views = schema.GetProperty("views"),
+        banks = schema.GetProperty("banks"),
+        vertex_roles = schema.GetProperty("vertex_roles"),
+        operations
+    });
+});
 // Explicit read operations only. No shell, arbitrary path, ingestion or write proxy.
 app.MapPost("/api/operations/{operation}", async (string operation, JsonElement body, NativeRuntime native, CancellationToken ct) =>
 {
-    if (operation is not ("forward" or "shape" or "embeddings")) return Results.NotFound();
+    if (!IsReadOperation(operation)) return Results.NotFound();
     if (!body.TryGetProperty("input", out var value) || value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString()) || System.Text.Encoding.UTF8.GetByteCount(value.GetString()!) > 4096) return Results.BadRequest();
     if (operation == "shape")
     {

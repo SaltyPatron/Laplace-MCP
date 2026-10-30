@@ -2,321 +2,275 @@
   "openapi": "3.1.2",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
-    "title": "Laplace modular browser boundary — proposed contract",
-    "version": "0.1.0-design",
-    "description": "DESIGN PROPOSAL. These paths are not implemented or deployed. Existing native /v1 endpoints remain the semantic owner; the browser gateway owns sessions, resource authorization and integration orchestration. Operation input/output schemas are discoverable and preserve full invention scope."
+    "title": "Laplace modular browser API",
+    "version": "1.0.0",
+    "description": "Implemented IIS browser boundary over the native Laplace reader. Entity identity and physicality semantics remain native-owned. Shared sign-in is discovered through runtime.js identityPath."
   },
   "servers": [
     {
-      "url": "/",
-      "description": "Same-origin modular browser host; deployment origin not yet assigned."
-    }
-  ],
-  "security": [
-    {
-      "browserSession": []
+      "url": ".",
+      "description": "Relative to this installed modular application"
     }
   ],
   "paths": {
-    "/browser/v1/auth/config": {
+    "/api/schema": {
       "get": {
-        "operationId": "authConfig",
-        "summary": "Available provider registrations for this origin",
+        "summary": "Discover native view projections, mask fields, occurrence roles and permitted operation schemas",
         "responses": {
           "200": {
-            "description": "Structured result",
+            "description": "Native read result",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AuthConfig"
+                  "$ref": "#/components/schemas/ViewSchema"
                 }
               }
             }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "security": []
-      }
-    },
-    "/browser/v1/auth/session": {
-      "get": {
-        "operationId": "readSession",
-        "summary": "Current session; anonymous state is a valid response",
-        "responses": {
-          "200": {
-            "description": "Structured result",
+          "400": {
+            "description": "Invalid input or unavailable native reader",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Session"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "security": []
-      }
-    },
-    "/browser/v1/auth/login/{provider}": {
-      "get": {
-        "operationId": "beginLogin",
-        "summary": "Begin supported middleware OIDC code/PKCE flow",
-        "security": [],
-        "parameters": [
-          {
-            "name": "provider",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "returnPath",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "description": "Validated local path; preserve authorized research context."
-          }
-        ],
-        "responses": {
-          "302": {
-            "description": "Redirect to configured provider; state/nonce/correlation managed server-side"
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        }
-      }
-    },
-    "/browser/v1/auth/logout": {
-      "post": {
-        "operationId": "logout",
-        "summary": "Revoke browser session",
-        "security": [
-          {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Session revoked"
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        }
-      }
-    },
-    "/browser/v1/auth/sessions": {
-      "get": {
-        "operationId": "listSessions",
-        "summary": "Account sessions",
-        "responses": {
-          "200": {
-            "description": "Sessions",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/SessionRecord"
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
                   }
                 }
               }
             }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        }
-      }
-    },
-    "/browser/v1/auth/sessions/{sessionId}": {
-      "delete": {
-        "operationId": "revokeSession",
-        "summary": "Revoke an owned session",
-        "parameters": [
-          {
-            "name": "sessionId",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "security": [
-          {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Session revoked"
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        }
-      }
-    },
-    "/browser/v1/discovery": {
-      "get": {
-        "operationId": "discover",
-        "summary": "Authorized resource, type, facet, relation, mask and operation discovery",
-        "responses": {
-          "200": {
-            "description": "Structured result",
+          "503": {
+            "description": "Invalid input or unavailable native reader",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Discovery"
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/catalog": {
+      "get": {
+        "summary": "Read exact counts and the connected database identity",
+        "responses": {
+          "200": {
+            "description": "Native read result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "database",
+                    "entities",
+                    "physicalities",
+                    "database_bytes",
+                    "as_of"
+                  ],
+                  "properties": {
+                    "database": {
+                      "type": "string"
+                    },
+                    "entities": {
+                      "type": "string",
+                      "pattern": "^[0-9]+$"
+                    },
+                    "physicalities": {
+                      "type": "string",
+                      "pattern": "^[0-9]+$"
+                    },
+                    "database_bytes": {
+                      "type": "string",
+                      "pattern": "^[0-9]+$"
+                    },
+                    "registered_witness_rows": {
+                      "type": "string",
+                      "description": "Registry rows; not a census of source trunks"
+                    },
+                    "as_of": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
                 }
               }
             }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
+          "400": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
     },
-    "/browser/v1/search": {
-      "post": {
-        "operationId": "lookup",
-        "summary": "Resolve input and retain multiple interpretations, typed matches and unresolved obligations",
-        "security": [
-          {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Lookup"
+    "/api/library": {
+      "get": {
+        "summary": "Browse stored source and file trunks by canonical ID cursor",
+        "responses": {
+          "200": {
+            "description": "Native read result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "database": {
+                      "type": "string"
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{32}$"
+                          },
+                          "kind": {
+                            "type": "string"
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "tier": {
+                            "type": "integer"
+                          },
+                          "metadata": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{32}$"
+                          },
+                          "content": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{32}$"
+                          },
+                          "children": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "pattern": "^[0-9a-f]{32}$"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "has_more": {
+                      "type": "boolean"
+                    },
+                    "next": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
               }
             }
           }
         },
-        "responses": {
-          "200": {
-            "description": "Structured result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LookupResult"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        }
-      }
-    },
-    "/browser/v1/collections/{kind}": {
-      "get": {
-        "operationId": "listResources",
-        "summary": "Snapshot-scoped collection; query grammar is declared by discovery",
-        "responses": {
-          "200": {
-            "description": "Structured result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Page"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
         "parameters": [
           {
-            "name": "kind",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "world",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "workspace",
+            "name": "after",
             "in": "query",
             "required": false,
             "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "cursor",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "filter",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            },
-            "description": "Encoded typed filter expression validated by the collection schema."
-          },
-          {
-            "name": "sort",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 200
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
             }
           }
         ]
       }
     },
-    "/browser/v1/resources/{kind}/{key}": {
+    "/api/lookup": {
       "get": {
-        "operationId": "readResource",
-        "summary": "Exact typed resource address; canonical entity keys retain BLAKE3 identity",
+        "summary": "Resolve text or an ID and read its physicality, containing paths and attestations",
         "responses": {
           "200": {
-            "description": "Structured result",
+            "description": "Native read result",
             "content": {
               "application/json": {
                 "schema": {
@@ -325,626 +279,328 @@
               }
             }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "parameters": [
-          {
-            "name": "kind",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "key",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "world",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "workspace",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "snapshot",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ]
-      }
-    },
-    "/browser/v1/resources/{kind}/{key}/connections": {
-      "get": {
-        "operationId": "readConnections",
-        "summary": "Typed directed or role-bearing related resource collection",
-        "responses": {
-          "200": {
-            "description": "Structured result",
+          "400": {
+            "description": "Invalid input or unavailable native reader",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "parameters": [
-          {
-            "name": "kind",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "key",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "world",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "workspace",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "snapshot",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "relation",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "cursor",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ]
-      }
-    },
-    "/browser/v1/resources/batch": {
-      "post": {
-        "operationId": "readResources",
-        "summary": "Bounded batched identity/label/structure reads",
-        "security": [
-          {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "scope": {
-                    "$ref": "#/components/schemas/Scope"
-                  },
-                  "resources": {
-                    "type": "array",
-                    "items": {
-                      "$ref": "#/components/schemas/ResourceRef"
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
                     }
                   }
-                },
-                "required": [
-                  "scope",
-                  "resources"
-                ],
-                "additionalProperties": false
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Structured result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Page"
                 }
               }
             }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
+          "503": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
-        }
-      }
-    },
-    "/browser/v1/research": {
-      "post": {
-        "operationId": "createResearch",
-        "summary": "Create authorized persistent research context",
-        "security": [
+        },
+        "parameters": [
           {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Research"
-              }
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Content or canonical ID, up to 4096 UTF-8 bytes"
             }
           }
-        },
-        "responses": {
-          "201": {
-            "description": "Structured result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Research"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        }
+        ]
       }
     },
-    "/browser/v1/research/{researchId}": {
+    "/api/resources/{id}": {
       "get": {
-        "operationId": "readResearch",
-        "summary": "Read saved investigation",
+        "summary": "Read canonical content by ID",
         "responses": {
           "200": {
-            "description": "Structured result",
+            "description": "Native read result",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Research"
+                  "$ref": "#/components/schemas/Resource"
                 }
               }
             }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "parameters": [
-          {
-            "name": "researchId",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ]
-      },
-      "put": {
-        "operationId": "updateResearch",
-        "summary": "Update with version/ETag precondition; do not lose concurrent edits",
-        "security": [
-          {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Research"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Structured result",
+          "400": {
+            "description": "Invalid input or unavailable native reader",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Research"
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
                 }
               }
             }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
+          "503": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "parameters": [
           {
-            "name": "researchId",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "If-Match",
-            "in": "header",
-            "required": true,
-            "schema": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
             }
           }
         ]
       }
     },
-    "/browser/v1/operations": {
-      "post": {
-        "operationId": "runOperation",
-        "summary": "Execute an authorized discovered native program with explicit work envelope",
-        "security": [
-          {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RunRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "202": {
-            "description": "Structured result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Job"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "parameters": [
-          {
-            "name": "Idempotency-Key",
-            "in": "header",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ]
-      }
-    },
-    "/browser/v1/jobs/{jobId}": {
+    "/api/provenance/{id}": {
       "get": {
-        "operationId": "readJob",
-        "summary": "Read durable progress, outputs, partial state and receipt",
+        "summary": "Trace bounded containment ancestry through records, files and source trunks",
         "responses": {
           "200": {
-            "description": "Structured result",
+            "description": "Native read result",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Job"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "parameters": [
-          {
-            "name": "jobId",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ]
-      }
-    },
-    "/browser/v1/jobs/{jobId}/cancel": {
-      "post": {
-        "operationId": "cancelJob",
-        "summary": "Request cancellation; preserve already committed effects",
-        "security": [
-          {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "reason": {
-                    "anyOf": [
-                      {
-                        "type": "string"
-                      },
-                      {
-                        "type": "null"
+                  "type": "object",
+                  "properties": {
+                    "complete": {
+                      "type": "boolean"
+                    },
+                    "nodes": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
                       }
-                    ]
+                    },
+                    "edges": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "limits": {
+                      "type": "object"
+                    }
                   }
-                },
-                "required": [
-                  "reason"
-                ],
-                "additionalProperties": false
-              }
-            }
-          }
-        },
-        "responses": {
-          "202": {
-            "description": "Structured result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Job"
                 }
               }
             }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
+          "400": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "parameters": [
           {
-            "name": "jobId",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
             }
           }
         ]
       }
     },
-    "/browser/v1/receipts/{receiptId}": {
+    "/api/sources": {
       "get": {
-        "operationId": "readReceipt",
-        "summary": "Read semantic program, scope, outcomes, attribution and unresolved obligations",
+        "summary": "Read source registration metadata",
         "responses": {
           "200": {
-            "description": "Structured result",
+            "description": "Native read result",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Receipt"
+                  "type": "object",
+                  "description": "Registry metadata remains distinct from physical source trunks discovered through /api/library."
                 }
               }
             }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "parameters": [
-          {
-            "name": "receiptId",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ]
-      }
-    },
-    "/browser/v1/exports/quotes": {
-      "post": {
-        "operationId": "quoteExport",
-        "summary": "Validate scope, rights, target and work before quoting a concrete artifact",
-        "security": [
-          {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ExportRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "Structured result",
+          "400": {
+            "description": "Invalid input or unavailable native reader",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Quote"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "parameters": [
-          {
-            "name": "Idempotency-Key",
-            "in": "header",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ]
-      }
-    },
-    "/browser/v1/billing/checkout": {
-      "post": {
-        "operationId": "createCheckout",
-        "summary": "Create explicit export purchase, subscription or donation Checkout session",
-        "security": [
-          {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CheckoutRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "Structured result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HostedSession"
-                }
-              }
-            }
-          },
-          "default": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "parameters": [
-          {
-            "name": "Idempotency-Key",
-            "in": "header",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ]
-      }
-    },
-    "/browser/v1/billing/portal": {
-      "post": {
-        "operationId": "createPortal",
-        "summary": "Create authenticated customer portal session",
-        "security": [
-          {
-            "browserSession": [],
-            "csrf": []
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "type": "object",
-                "properties": {
-                  "returnPath": {
-                    "type": "string"
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
                   }
-                },
-                "required": [
-                  "returnPath"
-                ],
-                "additionalProperties": false
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "Structured result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HostedSession"
                 }
               }
             }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
+          "503": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
     },
-    "/browser/v1/billing/webhook": {
+    "/api/surface": {
+      "get": {
+        "summary": "Discover the underlying native service routes",
+        "responses": {
+          "200": {
+            "description": "Native read result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/operations/{operation}": {
       "post": {
-        "operationId": "stripeWebhook",
-        "summary": "Validate raw Stripe-signed payload and durably reconcile events; not a browser action",
-        "security": [
+        "summary": "Execute a permitted native read operation",
+        "parameters": [
           {
-            "stripeSignature": []
+            "name": "operation",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "embeddings",
+                "forward",
+                "shape"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -953,1782 +609,346 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "description": "Stripe event for the pinned integration API version; verified before processing."
+                "required": [
+                  "input"
+                ],
+                "properties": {
+                  "input": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "other": {
+                    "type": "string",
+                    "description": "Required for shape; up to 4096 UTF-8 bytes per field"
+                  }
+                }
               }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "Durably accepted/deduplicated event"
+            "description": "Native read result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Native result; the operation input schema is discovered from /api/schema."
+                }
+              }
+            }
           },
-          "default": {
-            "$ref": "#/components/responses/Problem"
+          "400": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Invalid input or unavailable native reader",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "detail": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
     }
   },
   "components": {
-    "securitySchemes": {
-      "browserSession": {
-        "type": "apiKey",
-        "in": "cookie",
-        "name": "__Host-laplace-session",
-        "description": "Opaque Secure HttpOnly SameSite session reference, with durable revocation; never the shared native service token."
-      },
-      "csrf": {
-        "type": "apiKey",
-        "in": "header",
-        "name": "X-CSRF-Token",
-        "description": "Session-bound anti-forgery value for browser mutations."
-      },
-      "stripeSignature": {
-        "type": "apiKey",
-        "in": "header",
-        "name": "Stripe-Signature",
-        "description": "Verify raw body and signature timestamp using the endpoint signing secret."
-      }
-    },
     "schemas": {
-      "Problem": {
-        "type": "object",
-        "description": "RFC 9457; type selects a defined recovery flow. Never include credentials or raw SQL.",
-        "properties": {
-          "type": {
-            "type": "string",
-            "format": "uri-reference"
-          },
-          "title": {
-            "type": "string"
-          },
-          "status": {
-            "type": "integer",
-            "minimum": 100,
-            "maximum": 599
-          },
-          "detail": {
-            "type": "string"
-          },
-          "instance": {
-            "type": "string",
-            "format": "uri-reference"
-          },
-          "traceId": {
-            "type": "string"
-          },
-          "recovery": {
-            "type": "string",
-            "enum": [
-              "sign_in",
-              "request_access",
-              "retry",
-              "refresh_snapshot",
-              "change_scope",
-              "configure_capability"
-            ]
-          }
-        },
-        "required": [
-          "type",
-          "title",
-          "status"
-        ]
-      },
-      "Scope": {
-        "type": "object",
-        "properties": {
-          "world": {
-            "type": "string"
-          },
-          "workspace": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "snapshot": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "asOf": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "date-time"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "world",
-          "workspace",
-          "snapshot",
-          "asOf"
-        ],
-        "additionalProperties": false
-      },
-      "Count": {
-        "type": "object",
-        "properties": {
-          "value": {
-            "anyOf": [
-              {
-                "type": "string",
-                "pattern": "^(0|[1-9][0-9]*)$",
-                "description": "Unsigned decimal integer string; preserve precision in JavaScript."
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "qualification": {
-            "type": "string",
-            "enum": [
-              "exact",
-              "estimate",
-              "lower_bound",
-              "unknown"
-            ]
-          },
-          "scope": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "value",
-          "qualification",
-          "scope"
-        ],
-        "additionalProperties": false
-      },
-      "Link": {
-        "type": "object",
-        "properties": {
-          "rel": {
-            "type": "string"
-          },
-          "href": {
-            "type": "string",
-            "format": "uri-reference"
-          },
-          "target": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ResourceRef"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "label": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "rel",
-          "href",
-          "target",
-          "label"
-        ],
-        "additionalProperties": false
-      },
-      "ResourceRef": {
-        "type": "object",
-        "properties": {
-          "kind": {
-            "type": "string"
-          },
-          "key": {
-            "type": "string"
-          },
-          "canonicalId": {
-            "anyOf": [
-              {
-                "type": "string",
-                "pattern": "^[0-9a-f]{32}$",
-                "description": "Canonical 16-byte BLAKE3 identity as 32 lowercase hexadecimal digits."
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "label": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "kind",
-          "key",
-          "canonicalId",
-          "label"
-        ],
-        "additionalProperties": false
-      },
-      "Capability": {
-        "type": "object",
-        "properties": {
-          "operation": {
-            "type": "string"
-          },
-          "state": {
-            "type": "string",
-            "enum": [
-              "available",
-              "needs_identity",
-              "denied",
-              "unavailable",
-              "not_resident",
-              "requires_quote"
-            ]
-          },
-          "reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "operation",
-          "state",
-          "reason"
-        ],
-        "additionalProperties": false
-      },
-      "QualifiedValue": {
-        "type": "object",
-        "properties": {
-          "state": {
-            "type": "string",
-            "enum": [
-              "known",
-              "unknown",
-              "not_requested",
-              "unavailable"
-            ]
-          },
-          "value": {},
-          "unit": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "source": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ResourceRef"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "state",
-          "value"
-        ],
-        "additionalProperties": false
-      },
-      "Standing": {
-        "type": "object",
-        "properties": {
-          "state": {
-            "type": "string",
-            "enum": [
-              "available",
-              "unavailable",
-              "not_requested"
-            ]
-          },
-          "strength": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "deviation": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "volatility": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "observations": {
-            "anyOf": [
-              {
-                "type": "string",
-                "pattern": "^(0|[1-9][0-9]*)$",
-                "description": "Unsigned decimal integer string; preserve precision in JavaScript."
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "witnessBreadth": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Count"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "dependenceRoots": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ResourceRef"
-            }
-          }
-        },
-        "required": [
-          "state",
-          "strength",
-          "deviation",
-          "volatility",
-          "observations",
-          "witnessBreadth",
-          "dependenceRoots"
-        ],
-        "additionalProperties": false
-      },
-      "Occurrence": {
-        "type": "object",
-        "properties": {
-          "anchor": {
-            "type": "string"
-          },
-          "parent": {
-            "$ref": "#/components/schemas/ResourceRef"
-          },
-          "content": {
-            "$ref": "#/components/schemas/ResourceRef"
-          },
-          "ordinal": {
-            "type": "string",
-            "pattern": "^(0|[1-9][0-9]*)$",
-            "description": "Unsigned decimal integer string; preserve precision in JavaScript."
-          },
-          "runLength": {
-            "type": "string",
-            "pattern": "^(0|[1-9][0-9]*)$",
-            "description": "Unsigned decimal integer string; preserve precision in JavaScript."
-          },
-          "context": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ResourceRef"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "anchor",
-          "parent",
-          "content",
-          "ordinal",
-          "runLength",
-          "context"
-        ],
-        "additionalProperties": false
-      },
-      "Member": {
-        "type": "object",
-        "properties": {
-          "ordinal": {
-            "type": "string",
-            "pattern": "^(0|[1-9][0-9]*)$",
-            "description": "Unsigned decimal integer string; preserve precision in JavaScript."
-          },
-          "content": {
-            "$ref": "#/components/schemas/ResourceRef"
-          },
-          "role": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ResourceRef"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "occurrence": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Occurrence"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "ordinal",
-          "content",
-          "role",
-          "occurrence"
-        ],
-        "additionalProperties": false
-      },
-      "Resource": {
-        "type": "object",
-        "properties": {
-          "ref": {
-            "$ref": "#/components/schemas/ResourceRef"
-          },
-          "schemaVersion": {
-            "type": "string"
-          },
-          "types": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ResourceRef"
-            }
-          },
-          "scope": {
-            "$ref": "#/components/schemas/Scope"
-          },
-          "summary": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "fields": {
-            "type": "object",
-            "additionalProperties": {
-              "$ref": "#/components/schemas/QualifiedValue"
-            }
-          },
-          "structure": {
-            "anyOf": [
-              {
-                "type": "object",
-                "properties": {
-                  "selector": {
-                    "type": "string"
-                  },
-                  "tier": {
-                    "type": "string",
-                    "pattern": "^(0|[1-9][0-9]*)$",
-                    "description": "Unsigned decimal integer string; preserve precision in JavaScript."
-                  },
-                  "members": {
-                    "type": "array",
-                    "items": {
-                      "$ref": "#/components/schemas/Member"
-                    }
-                  },
-                  "count": {
-                    "$ref": "#/components/schemas/Count"
-                  }
-                },
-                "required": [
-                  "selector",
-                  "tier",
-                  "members",
-                  "count"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "standing": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Standing"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "links": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Link"
-            }
-          },
-          "capabilities": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Capability"
-            }
-          },
-          "receipt": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ResourceRef"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "ref",
-          "schemaVersion",
-          "types",
-          "scope",
-          "summary",
-          "fields",
-          "structure",
-          "standing",
-          "links",
-          "capabilities",
-          "receipt"
-        ],
-        "additionalProperties": false
-      },
-      "Page": {
-        "type": "object",
-        "properties": {
-          "scope": {
-            "$ref": "#/components/schemas/Scope"
-          },
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Resource"
-            }
-          },
-          "count": {
-            "$ref": "#/components/schemas/Count"
-          },
-          "next": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "links": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Link"
-            }
-          }
-        },
-        "required": [
-          "scope",
-          "items",
-          "count",
-          "next",
-          "links"
-        ],
-        "additionalProperties": false
-      },
       "Facet": {
         "type": "object",
         "properties": {
-          "key": {
+          "bank": {
             "type": "string"
           },
-          "label": {
+          "carrier": {
             "type": "string"
           },
-          "valueSchema": {
-            "type": "object",
-            "description": "JSON Schema defining the filter operand."
+          "encoding": {
+            "enum": [
+              "flags",
+              "enum"
+            ]
           },
-          "operators": {
+          "values": {
             "type": "array",
             "items": {
-              "type": "string"
+              "type": "object",
+              "properties": {
+                "slot": {
+                  "type": "integer"
+                },
+                "id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$"
+                },
+                "label": {
+                  "type": "string"
+                }
+              }
             }
-          },
-          "scope": {
-            "type": "string",
-            "enum": [
-              "entity",
-              "structure",
-              "occurrence",
-              "claim",
-              "attestation",
-              "source",
-              "operation"
-            ]
           }
-        },
-        "required": [
-          "key",
-          "label",
-          "valueSchema",
-          "operators",
-          "scope"
-        ],
-        "additionalProperties": false
+        }
       },
-      "ResourceKind": {
+      "Vertex": {
         "type": "object",
         "properties": {
-          "key": {
+          "id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "ordinal": {
+            "type": "integer"
+          },
+          "position": {
+            "type": "integer"
+          },
+          "run": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "said": {
+            "type": "integer",
+            "description": "Occurrence role decoded by /api/schema vertex_roles"
+          },
+          "outcome": {
+            "type": "integer"
+          },
+          "spare": {
+            "type": "integer"
+          }
+        }
+      },
+      "Physicality": {
+        "type": "object",
+        "properties": {
+          "tier": {
+            "type": "integer"
+          },
+          "n": {
+            "type": "integer"
+          },
+          "mask": {
             "type": "string"
           },
-          "label": {
-            "type": "string"
+          "claim": {
+            "type": "boolean"
           },
-          "schema": {
-            "type": "object",
-            "description": "Resource field schema, never executable UI."
-          },
-          "views": {
+          "constituents": {
             "type": "array",
             "items": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
             }
           },
-          "renderer": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
+          "vertices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Vertex"
+            }
           },
           "facets": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/Facet"
             }
-          },
-          "relations": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "key": {
-                  "type": "string"
-                },
-                "label": {
-                  "type": "string"
-                },
-                "direction": {
-                  "type": "string",
-                  "enum": [
-                    "incoming",
-                    "outgoing",
-                    "symmetric",
-                    "role_based"
-                  ]
-                },
-                "memberRoles": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              },
-              "required": [
-                "key",
-                "label",
-                "direction",
-                "memberRoles"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "operations": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
           }
-        },
-        "required": [
-          "key",
-          "label",
-          "schema",
-          "views",
-          "renderer",
-          "facets",
-          "relations",
-          "operations"
-        ],
-        "additionalProperties": false
+        }
       },
-      "MaskBank": {
+      "Resource": {
         "type": "object",
+        "required": [
+          "id",
+          "tier",
+          "recorded",
+          "physicality"
+        ],
         "properties": {
-          "key": {
-            "type": "string"
-          },
-          "scope": {
-            "type": "string"
-          },
-          "encoding": {
+          "id": {
             "type": "string",
-            "enum": [
-              "flags",
-              "enum"
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "tier": {
+            "type": "integer",
+            "description": "Stored tier when present; computed text modality tier otherwise"
+          },
+          "stored_tier": {
+            "type": [
+              "integer",
+              "null"
             ]
           },
-          "offset": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 63
-          },
-          "width": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 64
-          },
-          "slots": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "slot": {
-                  "type": "string",
-                  "pattern": "^(0|[1-9][0-9]*)$",
-                  "description": "Unsigned decimal integer string; preserve precision in JavaScript."
-                },
-                "content": {
-                  "$ref": "#/components/schemas/ResourceRef"
-                },
-                "label": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "slot",
-                "content",
-                "label"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "absentValue": {
-            "type": "string",
-            "pattern": "^(0|[1-9][0-9]*)$",
-            "description": "Unsigned decimal integer string; preserve precision in JavaScript."
-          }
-        },
-        "required": [
-          "key",
-          "scope",
-          "encoding",
-          "offset",
-          "width",
-          "slots",
-          "absentValue"
-        ],
-        "additionalProperties": false
-      },
-      "Discovery": {
-        "type": "object",
-        "properties": {
-          "version": {
-            "type": "string"
-          },
-          "kinds": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ResourceKind"
-            }
-          },
-          "operations": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Operation"
-            }
-          },
-          "maskManifest": {
-            "type": "object",
-            "properties": {
-              "digest": {
-                "type": "string"
-              },
-              "banks": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/MaskBank"
-                }
-              }
-            },
-            "required": [
-              "digest",
-              "banks"
+          "computed_tier": {
+            "type": [
+              "integer",
+              "null"
             ],
-            "additionalProperties": false
+            "description": "Computed for text input; null for ID-only reads"
           },
-          "capabilities": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Capability"
-            }
-          },
-          "links": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Link"
-            }
-          }
-        },
-        "required": [
-          "version",
-          "kinds",
-          "operations",
-          "maskManifest",
-          "capabilities",
-          "links"
-        ],
-        "additionalProperties": false
-      },
-      "Filter": {
-        "type": "object",
-        "properties": {
-          "field": {
-            "type": "string"
-          },
-          "operator": {
-            "type": "string"
-          },
-          "value": {}
-        },
-        "required": [
-          "field",
-          "operator",
-          "value"
-        ],
-        "additionalProperties": false
-      },
-      "Lookup": {
-        "type": "object",
-        "properties": {
-          "input": {
-            "type": "string"
-          },
-          "scope": {
-            "$ref": "#/components/schemas/Scope"
-          },
-          "filters": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Filter"
-            }
-          },
-          "cursor": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "limit": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 200
-          }
-        },
-        "required": [
-          "input",
-          "scope"
-        ],
-        "additionalProperties": false
-      },
-      "LookupResult": {
-        "type": "object",
-        "properties": {
-          "scope": {
-            "$ref": "#/components/schemas/Scope"
-          },
-          "interpretations": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "ref": {
-                  "$ref": "#/components/schemas/ResourceRef"
-                },
-                "kind": {
-                  "type": "string"
-                },
-                "explanation": {
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "receipt": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/ResourceRef"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                }
-              },
-              "required": [
-                "ref",
-                "kind",
-                "explanation",
-                "receipt"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "results": {
-            "$ref": "#/components/schemas/Page"
-          },
-          "unresolved": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "code": {
-                  "type": "string"
-                },
-                "label": {
-                  "type": "string"
-                },
-                "related": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ResourceRef"
-                  }
-                }
-              },
-              "required": [
-                "code",
-                "label",
-                "related"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "receipt": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ResourceRef"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "scope",
-          "interpretations",
-          "results",
-          "unresolved",
-          "receipt"
-        ],
-        "additionalProperties": false
-      },
-      "Operation": {
-        "type": "object",
-        "properties": {
-          "key": {
-            "type": "string"
-          },
-          "label": {
-            "type": "string"
-          },
-          "inputSchema": {
-            "type": "object"
-          },
-          "outputSchema": {
-            "type": "object"
-          },
-          "effect": {
-            "type": "string",
+          "storage": {
             "enum": [
-              "read",
-              "calculate",
-              "write",
-              "external"
+              "database",
+              "tier0-cache",
+              "highway-cache",
+              "computed",
+              "unresolved"
             ]
           },
-          "requiredCapabilities": {
+          "recorded": {
+            "type": "boolean"
+          },
+          "parts": {
             "type": "array",
             "items": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
             }
           },
-          "progress": {
+          "parts_total": {
+            "type": "integer"
+          },
+          "parts_complete": {
             "type": "boolean"
           },
-          "cancellable": {
-            "type": "boolean"
+          "physicality": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Physicality"
+            }
+          },
+          "entity_facets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Facet"
+            }
+          },
+          "claims": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "occurrences": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "attestations": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "canonical_tier": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Tier computed from available canonical content, including mapped identifiers"
+          },
+          "cache_tier": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Tier recorded in the selected perf-cache, independently of database metadata"
           }
-        },
-        "required": [
-          "key",
-          "label",
-          "inputSchema",
-          "outputSchema",
-          "effect",
-          "requiredCapabilities",
-          "progress",
-          "cancellable"
-        ],
-        "additionalProperties": false
+        }
       },
-      "WorkEnvelope": {
+      "ViewSchema": {
         "type": "object",
         "properties": {
-          "limits": {
+          "schema": {
+            "const": "laplace-view-schema/v1"
+          },
+          "highway": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "identity": {
+            "type": "object"
+          },
+          "views": {
             "type": "object",
             "additionalProperties": {
-              "$ref": "#/components/schemas/QualifiedValue"
+              "type": "object"
             }
           },
-          "policy": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "limits",
-          "policy"
-        ],
-        "additionalProperties": false
-      },
-      "RunRequest": {
-        "type": "object",
-        "properties": {
-          "operation": {
-            "type": "string"
-          },
-          "scope": {
-            "$ref": "#/components/schemas/Scope"
-          },
-          "inputs": {
-            "type": "object"
-          },
-          "work": {
-            "$ref": "#/components/schemas/WorkEnvelope"
-          },
-          "quote": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "operation",
-          "scope",
-          "inputs",
-          "work",
-          "quote"
-        ],
-        "additionalProperties": false
-      },
-      "Job": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "operation": {
-            "type": "string"
-          },
-          "state": {
-            "type": "string",
-            "enum": [
-              "queued",
-              "running",
-              "partial",
-              "succeeded",
-              "failed",
-              "cancelling",
-              "cancelled"
-            ]
-          },
-          "scope": {
-            "$ref": "#/components/schemas/Scope"
-          },
-          "progress": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/QualifiedValue"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "outputs": {
+          "banks": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/ResourceRef"
+              "type": "object"
             }
           },
-          "unresolved": {
+          "vertex_roles": {
             "type": "array",
             "items": {
-              "type": "string"
+              "type": "object"
             }
           },
-          "receipt": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ResourceRef"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "links": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Link"
-            }
-          }
-        },
-        "required": [
-          "id",
-          "operation",
-          "state",
-          "scope",
-          "progress",
-          "outputs",
-          "unresolved",
-          "receipt",
-          "links"
-        ],
-        "additionalProperties": false
-      },
-      "Receipt": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "program": {
-            "type": "string"
-          },
-          "version": {
-            "type": "string"
-          },
-          "scope": {
-            "$ref": "#/components/schemas/Scope"
-          },
-          "inputs": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ResourceRef"
-            }
-          },
-          "outputs": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ResourceRef"
-            }
-          },
-          "work": {
-            "$ref": "#/components/schemas/WorkEnvelope"
-          },
-          "unresolved": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "attribution": {
+          "operations": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
-                "witness": {
-                  "$ref": "#/components/schemas/ResourceRef"
-                },
-                "shareBasisPoints": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 10000
-                }
-              },
-              "required": [
-                "witness",
-                "shareBasisPoints"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "outcome": {
-            "type": "string"
-          },
-          "links": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Link"
-            }
-          }
-        },
-        "required": [
-          "id",
-          "program",
-          "version",
-          "scope",
-          "inputs",
-          "outputs",
-          "work",
-          "unresolved",
-          "attribution",
-          "outcome",
-          "links"
-        ],
-        "additionalProperties": false
-      },
-      "AuthConfig": {
-        "type": "object",
-        "properties": {
-          "providers": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "key": {
+                "name": {
                   "type": "string"
                 },
-                "label": {
+                "description": {
                   "type": "string"
                 },
-                "available": {
-                  "type": "boolean"
-                },
-                "start": {
-                  "type": "string",
-                  "format": "uri-reference"
+                "inputSchema": {
+                  "type": "object"
                 }
-              },
-              "required": [
-                "key",
-                "label",
-                "available",
-                "start"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "links": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Link"
-            }
-          }
-        },
-        "required": [
-          "providers",
-          "links"
-        ],
-        "additionalProperties": false
-      },
-      "Session": {
-        "type": "object",
-        "properties": {
-          "authenticated": {
-            "type": "boolean"
-          },
-          "account": {
-            "anyOf": [
-              {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "string"
-                  },
-                  "label": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "id",
-                  "label"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "null"
               }
-            ]
-          },
-          "workspaces": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "type": "string"
-                },
-                "label": {
-                  "type": "string"
-                },
-                "roles": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              },
-              "required": [
-                "id",
-                "label",
-                "roles"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "capabilities": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Capability"
-            }
-          },
-          "csrfToken": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "authenticated",
-          "account",
-          "workspaces",
-          "capabilities",
-          "csrfToken"
-        ],
-        "additionalProperties": false
-      },
-      "SessionRecord": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "createdAt": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "expiresAt": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "current": {
-            "type": "boolean"
-          },
-          "deviceLabel": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "required": [
-          "id",
-          "createdAt",
-          "expiresAt",
-          "current",
-          "deviceLabel"
-        ],
-        "additionalProperties": false
-      },
-      "Research": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "version": {
-            "type": "string"
-          },
-          "label": {
-            "type": "string"
-          },
-          "scope": {
-            "$ref": "#/components/schemas/Scope"
-          },
-          "query": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/Lookup"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "references": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "resource": {
-                  "$ref": "#/components/schemas/ResourceRef"
-                },
-                "context": {
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                },
-                "receipt": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/ResourceRef"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ]
-                }
-              },
-              "required": [
-                "resource",
-                "context",
-                "receipt"
-              ],
-              "additionalProperties": false
-            }
-          },
-          "notes": {
-            "type": "string"
-          },
-          "trail": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Link"
-            }
-          },
-          "links": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Link"
-            }
-          }
-        },
-        "required": [
-          "id",
-          "version",
-          "label",
-          "scope",
-          "query",
-          "references",
-          "notes",
-          "trail",
-          "links"
-        ],
-        "additionalProperties": false
-      },
-      "ExportRequest": {
-        "type": "object",
-        "properties": {
-          "scope": {
-            "$ref": "#/components/schemas/Scope"
-          },
-          "selection": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ResourceRef"
-            }
-          },
-          "projection": {
-            "type": "string"
-          },
-          "recipe": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ResourceRef"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "target": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "work": {
-            "$ref": "#/components/schemas/WorkEnvelope"
-          }
-        },
-        "required": [
-          "scope",
-          "selection",
-          "projection",
-          "recipe",
-          "target",
-          "work"
-        ],
-        "additionalProperties": false
-      },
-      "Quote": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "expiresAt": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "deliverable": {
-            "$ref": "#/components/schemas/ExportRequest"
-          },
-          "currency": {
-            "type": "string"
-          },
-          "amountMinor": {
-            "type": "string",
-            "pattern": "^(0|[1-9][0-9]*)$",
-            "description": "Unsigned decimal integer string; preserve precision in JavaScript."
-          },
-          "chargeRequired": {
-            "type": "boolean"
-          },
-          "terms": {
-            "type": "string"
-          },
-          "attribution": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ResourceRef"
-            }
-          },
-          "links": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Link"
-            }
-          }
-        },
-        "required": [
-          "id",
-          "expiresAt",
-          "deliverable",
-          "currency",
-          "amountMinor",
-          "chargeRequired",
-          "terms",
-          "attribution",
-          "links"
-        ],
-        "additionalProperties": false
-      },
-      "CheckoutRequest": {
-        "type": "object",
-        "properties": {
-          "purpose": {
-            "type": "string",
-            "enum": [
-              "export",
-              "subscription",
-              "donation"
-            ]
-          },
-          "quote": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "offering": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "donation": {
-            "anyOf": [
-              {
-                "type": "object",
-                "properties": {
-                  "currency": {
-                    "type": "string"
-                  },
-                  "amountMinor": {
-                    "type": "string",
-                    "pattern": "^(0|[1-9][0-9]*)$",
-                    "description": "Unsigned decimal integer string; preserve precision in JavaScript."
-                  }
-                },
-                "required": [
-                  "currency",
-                  "amountMinor"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "returnPath": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "purpose",
-          "quote",
-          "offering",
-          "donation",
-          "returnPath"
-        ],
-        "additionalProperties": false
-      },
-      "HostedSession": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string"
-          },
-          "url": {
-            "type": "string",
-            "format": "uri"
-          },
-          "state": {
-            "type": "string",
-            "enum": [
-              "created",
-              "pending",
-              "confirmed",
-              "expired"
-            ]
-          }
-        },
-        "required": [
-          "id",
-          "url",
-          "state"
-        ],
-        "additionalProperties": false
-      }
-    },
-    "responses": {
-      "Problem": {
-        "description": "Typed error and recovery. 401 identifies an authentication requirement; 403 denies access; 409/412 includes scope/version recovery; 503 represents an unavailable dependency.",
-        "content": {
-          "application/problem+json": {
-            "schema": {
-              "$ref": "#/components/schemas/Problem"
             }
           }
         }
       }
     }
-  },
-  "x-implementation-status": "proposed-not-served",
-  "x-full-scope-note": "The discovered operation family must include cognition, conversation, ingestion/recipes, source management, code/domain construction, calculations, synthesis and export. This envelope is not proof those operations are implemented."
+  }
 }
