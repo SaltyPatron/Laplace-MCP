@@ -12,20 +12,26 @@ jobs:
   mcp:
     runs-on: [self-hosted, laplace, Laplace-MCP]
     steps:
-      - uses: actions/checkout@v4
-        with: { path: Laplace-MCP }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: 817f9b7ba32dc847225936f1db0fc8a69a7f2770, path: Laplace-Native }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: 5ca5fca9f15059215b8c6a1401f544928f1615bd, path: Laplace-Engine }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: 9486ad3fe58d55a637afafdb80d0afef38010734, path: Laplace-postgres }
-      - uses: actions/checkout@v4
-        with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}" }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: { path: Laplace-MCP, persist-credentials: false }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: eb00ac7f86318127f39605905641f8a90ba70f4e, path: Laplace-Native, persist-credentials: false }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: 11f6963af59a8c749b789ea7cf5a8bccc8436915, path: Laplace-Engine, persist-credentials: false }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: e9798bea425c6d1489252a74ec9d4fc61756b309, path: Laplace-postgres, persist-credentials: false }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}", persist-credentials: false }
       - name: Provide the pinned Tree-sitter generator toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: 1.90.0
+      - name: Select qualified Native inputs for the exact source revision
+        env:
+          GH_TOKEN: ${{ secrets.LAPLACE_CHECKOUT }}
+        run: bash Laplace-Operations/native-inputs.sh prepare "$GITHUB_WORKSPACE/Laplace-Native"
+      - name: Verify Native source selection across reconfiguration
+        run: cmake "-DSOURCE=$GITHUB_WORKSPACE/Laplace-MCP" "-DWORK=$RUNNER_TEMP/native-source-defaults" -P Laplace-MCP/tests/native-source-defaults.cmake
       - name: build
         run: |
           . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
@@ -38,7 +44,8 @@ jobs:
           export LAPLACE_GRAMMARS="$RUNNER_TEMP/mcp/grammars"
           python3 Laplace-Operations/installation/artifact_store.py --prepared "$prepared_grammars" --compiled "$compiled_grammars" --output "$LAPLACE_GRAMMARS"
           echo "LAPLACE_GRAMMARS=$LAPLACE_GRAMMARS" >> "$GITHUB_ENV"
-          cmake -S Laplace-MCP -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAPLACE_BUNDLE_ENGINE=ON -DLAPLACE_INSTALL_RECIPE_RESOURCES=OFF
+          cmake -S Laplace-MCP -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAPLACE_BUNDLE_ENGINE=ON -DLAPLACE_INSTALL_RECIPE_RESOURCES=OFF \
+            -DLAPLACE_TIER0:FILEPATH="$LAPLACE_TIER0" -DLAPLACE_NATIVE:PATH="$LAPLACE_NATIVE" -DLAPLACE_ENGINE_SRC:PATH="$LAPLACE_ENGINE_SRC" -DLAPLACE_OPERATIONS:PATH="$LAPLACE_OPERATIONS"
           cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib
           # A second build must leave every target current, including the shared Native dependency.
           cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib | tee "$RUNNER_TEMP/modular-noop.txt"
@@ -74,7 +81,7 @@ jobs:
   deploy:
     needs: mcp
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, laplace, Laplace-MCP]
     steps:
       - name: Deploy this exact revision through Operations
         env:
