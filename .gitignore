@@ -1,6 +1,0 @@
-lpm.records
-.venv
-__pycache__/
-*.pyc
-web/bin/
-web/obj/
