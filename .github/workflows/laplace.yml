@@ -15,13 +15,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { path: Laplace-MCP, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: 4cc4b8cd0a9afe1a8902790f812d5f84ecc8e10a, path: Laplace-Native, persist-credentials: false }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: d56fc6023cd51e64aa338d6a26e30eff3d985fbc, path: Laplace-Native, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: 11f6963af59a8c749b789ea7cf5a8bccc8436915, path: Laplace-Engine, persist-credentials: false }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: 8d6ffe52f90e349582cad5c51d582381a91a9bcc, path: Laplace-Engine, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: e9798bea425c6d1489252a74ec9d4fc61756b309, path: Laplace-postgres, persist-credentials: false }
+        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: b866be231281e3501509da52d9b73fb8890b4f2c, path: Laplace-postgres, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-Operations", path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}", persist-credentials: false }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Operations", ref: 84c50ef7479adcd1b556dbb20a853b75e387eb15, path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}", persist-credentials: false }
       - name: Provide the pinned Tree-sitter generator toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
