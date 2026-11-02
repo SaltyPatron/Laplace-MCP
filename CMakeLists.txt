@@ -16,11 +16,8 @@ include(${LAPLACE_NATIVE}/cmake/LaplaceWindowsUtf8.cmake)
 find_package(OpenMP REQUIRED)
 
 laplace_path(LAPLACE_ENGINE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../Laplace-Engine/src" "Laplace-Engine's sources: the reader this service links")
-foreach(f read.c read_ids.c read_text.c pg.c pg_plan.c pg_plan.h walk.c engine.h)
-  if(NOT EXISTS "${LAPLACE_ENGINE_SRC}/${f}")
-    message(FATAL_ERROR "LAPLACE_ENGINE_SRC: no ${f} at '${LAPLACE_ENGINE_SRC}'")
-  endif()
-endforeach()
+include("${LAPLACE_ENGINE_SRC}/../cmake/EngineReader.cmake")
+laplace_define_engine_reader("${LAPLACE_ENGINE_SRC}")
 
 # Connections belong to the installation, never the build cache or shipped binary.
 unset(LAPLACE_CONNINFO CACHE)
@@ -55,69 +52,35 @@ if(LAPLACE_BUNDLE_ENGINE AND NOT TARGET laplace_engine)
   add_subdirectory("${LAPLACE_ENGINE_SRC}/.." engine)
 endif()
 
-# A bundled Engine and MCP share the same pinned runtime and Native targets.
-if(NOT TARGET ts_runtime)
-  add_library(ts_runtime STATIC ${LAPLACE_TREESITTER}/lib/src/lib.c)
-  target_include_directories(ts_runtime PUBLIC ${LAPLACE_TREESITTER}/lib/include PRIVATE ${LAPLACE_TREESITTER}/lib/src ${LAPLACE_TREESITTER}/lib/src/wasm)
-  if(WIN32)
-    target_compile_options(ts_runtime PRIVATE /w /O2)
-  else()
-    target_compile_options(ts_runtime PRIVATE -w -O3 -fPIC)
-  endif()
-endif()
-
 # liblpm: the in-process client (check, text, admit, index, search); laplace_mcp.py loads it.
-add_library(lpm_lib SHARED native/lpm.c ${LAPLACE_ENGINE_SRC}/os.c)
+add_library(lpm_lib SHARED native/lpm.c)
 set_target_properties(lpm_lib PROPERTIES OUTPUT_NAME lpm WINDOWS_EXPORT_ALL_SYMBOLS ON)
 # Windows: the DLL's import library and export file must not share lpm.lib/lpm.exp with lpm.exe.
 if(WIN32)
   set_target_properties(lpm_lib PROPERTIES ARCHIVE_OUTPUT_NAME lpm_import)
 endif()
-target_include_directories(lpm_lib PUBLIC native PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_ENGINE_SRC} ${LAPLACE_NATIVE}/src)
+target_include_directories(lpm_lib PUBLIC native PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_NATIVE}/src)
 target_compile_options(lpm_lib PRIVATE ${LP_C_FLAGS})
-if(WIN32)
-  target_include_directories(lpm_lib BEFORE PRIVATE ${LAPLACE_ENGINE_SRC}/win)
-  target_compile_definitions(lpm_lib PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
-  target_link_libraries(lpm_lib PRIVATE laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime shlwapi ${LP_SYSLIBS})
-else()
-  target_link_libraries(lpm_lib PRIVATE laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime dl ${LP_SYSLIBS})
-endif()
+target_link_libraries(lpm_lib PRIVATE laplace_engine_os laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime ${LP_SYSLIBS})
 
 # lpm: the commands and the service (serve).
-add_executable(lpm_program native/main.c native/api.c native/semantic.c native/db_bridge.c ${LAPLACE_ENGINE_SRC}/os.c ${LAPLACE_ENGINE_SRC}/read.c ${LAPLACE_ENGINE_SRC}/read_ids.c ${LAPLACE_ENGINE_SRC}/read_text.c ${LAPLACE_ENGINE_SRC}/pg.c ${LAPLACE_ENGINE_SRC}/pg_plan.c ${LAPLACE_ENGINE_SRC}/walk.c)
+add_executable(lpm_program native/main.c native/api.c native/semantic.c native/db_bridge.c)
 laplace_utf8_executable(lpm_program)
 set_target_properties(lpm_program PROPERTIES OUTPUT_NAME lpm)
-target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_ENGINE_SRC} ${LAPLACE_NATIVE}/src
-                           ${LAPLACE_BLAKE3_DIR} ${LAPLACE_ICU_DIR}/include ${LAPLACE_PG_DIR}/include)
-target_link_directories(lpm_program PRIVATE ${LAPLACE_PG_DIR}/lib)
+target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_NATIVE}/src
+                           ${LAPLACE_BLAKE3_DIR} ${LAPLACE_ICU_DIR}/include)
 target_compile_options(lpm_program PRIVATE ${LP_C_FLAGS} -Wno-missing-field-initializers)
 if(WIN32)
   target_sources(lpm_program PRIVATE native/lpm.c)
-  target_include_directories(lpm_program BEFORE PRIVATE ${LAPLACE_ENGINE_SRC}/win)
-  target_compile_definitions(lpm_program PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
-  target_link_libraries(lpm_program PRIVATE laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime
-                        ${LAPLACE_PG_DIR}/lib/libpq.lib OpenMP::OpenMP_C ws2_32 shlwapi ${LP_SYSLIBS})
+  target_link_libraries(lpm_program PRIVATE laplace_engine_reader laplace_text ts_runtime ws2_32 ${LP_SYSLIBS})
 else()
-  target_link_libraries(lpm_program PRIVATE lpm_lib laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime pq OpenMP::OpenMP_C dl ${LP_SYSLIBS})
+  target_link_libraries(lpm_program PRIVATE lpm_lib laplace_engine_reader laplace_text ts_runtime ${LP_SYSLIBS})
   set_target_properties(lpm_lib lpm_program PROPERTIES
     BUILD_RPATH "${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib"
     INSTALL_RPATH "\$ORIGIN/../lib;${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib")
 endif()
 
 enable_testing()
-if(WIN32)
-  # Select the declared ICU imports explicitly; LIB may contain another ICU.
-  # CORE-MATH's int128 conversion uses the compiler's matching builtins runtime.
-  execute_process(COMMAND "${CMAKE_C_COMPILER}" -print-resource-dir
-    OUTPUT_VARIABLE _compiler_resource OUTPUT_STRIP_TRAILING_WHITESPACE)
-  find_library(_compiler_builtins NAMES clang_rt.builtins-x86_64
-    PATHS "${_compiler_resource}/lib/windows" NO_DEFAULT_PATH REQUIRED)
-  foreach(_target lpm_program lpm_lib)
-    target_link_libraries(${_target} PRIVATE
-      "${LAPLACE_ICU_DIR}/lib64/icuin.lib" "${LAPLACE_ICU_DIR}/lib64/icuuc.lib"
-      "${LAPLACE_ICU_DIR}/lib64/icudt.lib" "${_compiler_builtins}")
-  endforeach()
-endif()
 add_test(NAME check COMMAND lpm_program check)
 
 include(GNUInstallDirs)

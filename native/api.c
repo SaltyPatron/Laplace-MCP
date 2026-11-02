@@ -478,6 +478,7 @@ static void on_embeddings(int c, const char *body) {
 typedef struct {
     lp_id id;
     int tier;
+    int stored_tier;
     int cp;
     int have_c;
     lp_coord c;
@@ -490,6 +491,35 @@ typedef struct {
     int *kcp;
     int nkids;
 } Down;
+
+/* A deterministic identity is not presence. Prepared canonical content and
+ * database recording are separate bases; neither implies testimony. */
+static const char *content_storage(const lp_id *id, int stored_tier) {
+    if (stored_tier >= 0) return "database";
+    if (lp_tier0_codepoint(T0, id) >= 0) return "tier0-cache";
+    return lp_highway_find(view_highway(), id) ? "highway-cache" : "unresolved";
+}
+
+static void emit_content_state(char **out, size_t *n, size_t *cap, const lp_id *id, int stored_tier) {
+    const char *storage = content_storage(id, stored_tier);
+    buf_fmt(out, n, cap, ",\"recorded\":%s,\"storage\":\"%s\",\"stored_tier\":", stored_tier >= 0 ? "true" : "false", storage);
+    if (stored_tier >= 0) buf_fmt(out, n, cap, "%d", stored_tier);
+    else buf_fmt(out, n, cap, "null");
+}
+
+static void emit_discovery_match(char **out, size_t *n, size_t *cap, const lp_id *id,
+                                 int tier, int stored_tier, const char *kind,
+                                 const lp_id *parent, int ordinal, int *shown) {
+    if (!strcmp(content_storage(id, stored_tier), "unresolved")) return;
+    char hex[33]; hex_id(id, hex);
+    buf_fmt(out, n, cap, "%s{\"id\":\"%s\",\"tier\":%d,\"match\":\"%s\"", (*shown)++ ? "," : "", hex, tier, kind);
+    emit_content_state(out, n, cap, id, stored_tier);
+    if (parent) {
+        hex_id(parent, hex);
+        buf_fmt(out, n, cap, ",\"via\":\"%s\",\"ordinal\":%d", hex, ordinal);
+    }
+    buf_fmt(out, n, cap, "}");
+}
 
 static void downs_free(Down *d, int n) {
     if (!d) return;
@@ -539,6 +569,7 @@ static void emit_down(char **b, size_t *n, size_t *cap, const Down *d, int fan) 
     char eid[33], cj[160];
     hex_id(&d->id, eid);
     buf_fmt(b, n, cap, "{\"id\":\"%s\",\"tier\":%d", eid, d->tier);
+    emit_content_state(b, n, cap, &d->id, d->stored_tier);
     if (d->cp >= 0) buf_fmt(b, n, cap, ",\"codepoint\":%d", d->cp);
     if (d->have_c) {
         lp_ref r;
@@ -642,7 +673,7 @@ static void on_search(int c, const char *body) {
     int fan = 0;
     jint(body, "fan", &fan);
     int text_input=np>0;
-    if(!text_input)lp_id_unhex(idbuf,&trunk.id);
+    if(!text_input){lp_id_unhex(idbuf,&trunk.id);hex_id(&trunk.id,idbuf);}
     const lp_tier0_record *cached=lp_highway_find(view_highway(),&trunk.id);
     int64_t codepoint=lp_tier0_codepoint(T0,&trunk.id);
     if(!text_input && codepoint>=0){trunk=lp_ref_atom(T0,(uint32_t)codepoint);parts[0]=trunk;np=total_parts=1;}
@@ -690,6 +721,7 @@ static void on_search(int c, const char *body) {
         tiers_of(pg,ids,ndown,stored);
         for (int i = 0; i < ndown; i++) {
             down[i].id = parts[i].id;
+            down[i].stored_tier = stored[i];
             down[i].tier = stored[i]>=0?stored[i]:parts[i].tier;
             down[i].cp = (int)lp_tier0_codepoint(T0, &parts[i].id);
             down[i].have_c = 1;
@@ -706,6 +738,7 @@ static void on_search(int c, const char *body) {
         int *tiers=malloc(sizeof(int)*(m?m:1));tiers_of(pg,ids,ndown,tiers);
         for (int i = 0; i < ndown; i++) {
             down[i].id=ids[i];down[i].cp=(int)lp_tier0_codepoint(T0,ids+i);
+            down[i].stored_tier=tiers[i];
             down[i].tier=down[i].cp>=0?0:tiers[i];
         }
         free(tiers);
@@ -846,6 +879,15 @@ static void on_search(int c, const char *body) {
     buf_fmt(&out,&un,&ucap,",\"cache_tier\":");if(codepoint>=0)buf_fmt(&out,&un,&ucap,"0");else if(cached)buf_fmt(&out,&un,&ucap,"%u",cached->pad);else buf_fmt(&out,&un,&ucap,"null");
     buf_fmt(&out,&un,&ucap,",\"storage\":\"%s\",\"entity_facets\":",PQntuples(entity_row)?"database":codepoint>=0?"tier0-cache":cached?"highway-cache":text_input?"computed":"unresolved");
     if(PQntuples(entity_row))emit_mask_values(&out,&un,&ucap,PQgetvalue(entity_row,0,1),PQgetlength(entity_row,0,1));else buf_fmt(&out,&un,&ucap,"[]");
+    buf_fmt(&out,&un,&ucap,",\"discovery\":{\"schema\":\"laplace-discovery/v1\",\"query_kind\":\"%s\",\"root_present\":%s,\"members_complete\":%s,\"scope\":\"returned-read\",\"matches\":[",
+            text_input ? "text" : "id", strcmp(content_storage(&trunk.id,recorded),"unresolved") ? "true" : "false", total_parts==np ? "true" : "false");
+    int discovered=0;
+    emit_discovery_match(&out,&un,&ucap,&trunk.id,recorded>=0?recorded:trunk.tier,recorded,"exact",NULL,0,&discovered);
+    for(int i=0;i<ndown;i++){
+        if(!memcmp(&down[i].id,&trunk.id,sizeof(lp_id)))continue;
+        emit_discovery_match(&out,&un,&ucap,&down[i].id,down[i].tier,down[i].stored_tier,"member",&trunk.id,i,&discovered);
+    }
+    buf_fmt(&out,&un,&ucap,"]}");
     if(jbool(body,"display",0)){
         /* Native's selected-prefix reader shares a batched frontier. Labels are
          * a display projection, never an alternate browser-side decomposer. */
@@ -2912,7 +2954,7 @@ static const char *TOOLS =
     "{\"name\":\"recipe_catalog\",\"description\":\"Complete available ingestion sources, short aliases, content locations, recipes, file formats and prerequisites from the Engine; no database or corpus required.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},"
     "{\"name\":\"reindex\",\"description\":\"Bring the code index up to date with LAPLACE_CODE_ROOTS, or with one file or directory given as path: unchanged files (size and time, else content) are not read, changed and new files are admitted, files no longer there are removed. Returns the counts. The index also refreshes itself at most every LAPLACE_CODE_REFRESH_SECONDS.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[]}},"
     "{\"name\":\"rerank\",\"description\":\"Deterministic Laplace reranker (drop-in replacement for neural cross-encoders). Scores candidate documents against a query using IDF-weighted constituent overlap and 4D discrete Frechet trajectory distance.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"documents\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"top_n\":{\"type\":\"integer\"}},\"required\":[\"query\",\"documents\"]}},"
-    "{\"name\":\"search\",\"description\":\"Name text on the client from tier 0, or take an ID the caller already holds. The trunk and non-atomic constituent references are read with holds_above. A scalar stays in the path, in its place, with its codepoint. Stored tiers are returned separately from the computed text modality tier. fan, when sent, caps how many claims and occurrences are returned; omitted, all of them are.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"fan\":{\"type\":\"integer\"}},\"required\":[]}},"
+    "{\"name\":\"search\",\"description\":\"Name text on the client from tier 0, or take an ID the caller already holds. The trunk and non-atomic constituent references are read with holds_above. A scalar stays in the path, in its place, with its codepoint. Discovery matches report database or canonical-cache presence; a calculated root is not a discovery match. Member query ordinals remain distinct. Stored tiers are returned separately from the computed text modality tier. fan, when sent, caps how many claims and occurrences are returned; omitted, all of them are.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"fan\":{\"type\":\"integer\"}},\"required\":[]}},"
     "{\"name\":\"embeddings\",\"description\":\"Same call shape as an embedding endpoint. Returns the Laplace entity ID, tier, 4D coordinate (also exposed as OpenAI-compatible embedding array), Hilbert value, and constituent IDs. Does not touch the database.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"inputs\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[]}},"
     "{\"name\":\"shape\",\"description\":\"Discrete Frechet distance between two texts, laplace_frechet4d on the stored coordinates of their constituents.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"other\":{\"type\":\"string\"}},\"required\":[\"input\",\"other\"]}},"
     "{\"name\":\"forward\",\"description\":\"laplace_forward on the constituent IDs of a prompt: which spans are observed and what follows them.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[\"input\"]}},"
@@ -2946,7 +2988,17 @@ static void on_schema(int c){
     buf_fmt(&out,&n,&cap,"},\"banks\":[");
     for(size_t i=0;i<highway->nbanks;i++){
         const lp_bank *bank=highway->bank+i;
-        buf_fmt(&out,&n,&cap,"%s{\"name\":\"%s\",\"group\":\"%s\",\"carrier\":\"%s\",\"list\":\"%s\",\"width\":%u,\"offset\":%u,\"encoding\":\"%s\",\"slots\":%u}",i?",":"",bank->name,bank->group,bank->carrier,bank->list->name,bank->width,bank->offset,bank->flags?"flags":"enum",bank->list->count);
+        buf_fmt(&out,&n,&cap,"%s{\"name\":\"%s\",\"group\":\"%s\",\"carrier\":\"%s\",\"list\":\"%s\",\"width\":%u,\"offset\":%u,\"encoding\":\"%s\",\"slots\":%u,\"values\":[",i?",":"",bank->name,bank->group,bank->carrier,bank->list->name,bank->width,bank->offset,bank->flags?"flags":"enum",bank->list->count);
+        unsigned shown=0;
+        for(uint32_t slot=0;slot<bank->list->count;slot++){
+            const lp_tier0_record *record=lp_highway_at(highway,bank->list,slot);
+            const char *label=lp_highway_identifier(highway,bank->list,slot);
+            if(!record)continue;
+            char id[33];hex_id(&record->id,id);
+            buf_fmt(&out,&n,&cap,"%s{\"slot\":%u,\"id\":\"%s\",\"label\":\"",shown++?",":"",slot,id);
+            cw_str(&out,&n,&cap,label?label:"");buf_fmt(&out,&n,&cap,"\"}");
+        }
+        buf_fmt(&out,&n,&cap,"]}");
     }
     buf_fmt(&out,&n,&cap,"],\"vertex_roles\":[");
     static const struct {unsigned value;const char *name;} roles[]={
