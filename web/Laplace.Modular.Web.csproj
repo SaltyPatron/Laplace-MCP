@@ -5,5 +5,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <AssemblyName>Laplace.Modular.Web</AssemblyName>
+    <!-- UseStaticFiles serves the files directly; generated endpoint manifests
+         embed compressed-asset timestamps and prevent repeatable packages. -->
+    <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
   </PropertyGroup>
 </Project>

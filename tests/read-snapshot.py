@@ -147,11 +147,37 @@ try:
         schema=request('/v1/schema')
         assert schema['schema']=='laplace-view-schema/v1' and len(schema['highway'])==64,schema
         assert any(bank['name']=='kind' and bank['encoding']=='flags' for bank in schema['banks']),schema
+        for bank in schema['banks']:
+            assert len(bank['values'])==bank['slots'],bank
+            assert [value['slot'] for value in bank['values']]==list(range(bank['slots'])),bank
+            assert all(len(value['id'])==32 and value['label'] for value in bank['values']),bank
         assert schema['views']['physicality']['name']=='Physicality',schema
         assert any(role['name']=='Metadata' for role in schema['vertex_roles']),schema
         assert first['stored_tier']==first['computed_tier']==2,first
         assert direct['stored_tier']==2 and direct['computed_tier'] is None,direct
         assert first['storage']=='database' and 'entity_facets' in first,first
+        assert first['discovery']['root_present'] and first['discovery']['matches'][0]['match']=='exact',first
+        assert direct['discovery']['matches']==request('/v1/search',{'id':first['id'].upper()})['discovery']['matches'],direct
+        unknown=request('/v1/search',{'input':'QzxwvuUnobservedScope703','display':True})
+        assert not unknown['recorded'] and unknown['storage']=='computed',unknown
+        assert not unknown['discovery']['root_present'],unknown
+        assert unknown['id'] not in {match['id'] for match in unknown['discovery']['matches']},unknown
+        assert all(match['recorded'] or match['storage'] in ('highway-cache','tier0-cache')
+                   for match in unknown['discovery']['matches']),unknown
+        # No exact phrase was admitted. Its known words and their native paths
+        # remain independently discoverable, including duplicate occurrences.
+        phrase=request('/v1/search',{'input':'dog cat dog','display':True})
+        assert not phrase['discovery']['root_present'],phrase
+        dog_members=[match for match in phrase['discovery']['matches'] if match['id']==first['id']]
+        assert len(dog_members)==2 and len({match['ordinal'] for match in dog_members})==2,phrase
+        assert all(match['recorded'] and match['match']=='member' and match['via']==phrase['id'] for match in dog_members),phrase
+        rpc=request('/mcp',{'jsonrpc':'2.0','id':71,'method':'tools/call',
+                            'params':{'name':'search','arguments':{'input':'dog cat dog','display':True}}})
+        rpc_read=json.loads(rpc['result']['content'][0]['text'])
+        assert rpc_read['discovery']==phrase['discovery'],rpc_read
+        bounded=request('/v1/search',{'input':'Z'*100})
+        assert bounded['parts_total']==100 and not bounded['discovery']['members_complete'],bounded
+        assert len(bounded['discovery']['matches'])==64,bounded
         assert any(field['bank']=='kind' and any(value['label']=='file' for value in field['values'])
                    for field in source['physicality'][0]['facets']),source
         sql(name,"UPDATE public.entity SET mask=mask | public.laplace_mask_slot('upos','NOUN') "
@@ -163,11 +189,13 @@ try:
                    for field in classified['entity_facets']),classified
         cache_only=request('/v1/search',{'id':noun,'display':True})
         assert not cache_only['recorded'] and cache_only['storage']=='highway-cache',cache_only
+        assert cache_only['discovery']['root_present'] and cache_only['discovery']['matches'][0]['storage']=='highway-cache',cache_only
         assert cache_only['canonical_tier']==2 and len(cache_only['parts'])==4,cache_only
         assert any(label['id']==noun and label['text']=='NOUN' for label in cache_only['labels']),cache_only
         scalar=request('/v1/embeddings',{'input':'N'})['data'][0]['id']
         atom=request('/v1/search',{'id':scalar,'display':True})
         assert not atom['recorded'] and atom['storage']=='tier0-cache' and atom['tier']==0,atom
+        assert atom['discovery']['root_present'] and atom['discovery']['matches'][0]['storage']=='tier0-cache',atom
         discovered={item['id']:item for item in library['items']}
         assert next(iter(before)) in discovered,library
         assert discovered[next(iter(before))]['kind']=='source',library
