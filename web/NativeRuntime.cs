@@ -14,7 +14,7 @@ using Microsoft.Win32.SafeHandles;
 sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> logger) : IDisposable
 {
     readonly SemaphoreSlim gate = new(1, 1);
-    readonly HttpClient client = new() { Timeout = TimeSpan.FromSeconds(45) };
+    readonly HttpClient client = new() { Timeout = Timeout.InfiniteTimeSpan };
     readonly HttpClient identity = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(15) };
     static readonly JsonSerializerOptions Json = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
     Process? process;
@@ -81,6 +81,9 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
 
     public async Task<JsonElement> Read(string path, object? body, CancellationToken cancellationToken)
     {
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(TimeSpan.FromSeconds(path == "/mcp" ? 120 : 45));
+        cancellationToken = budget.Token;
         await gate.WaitAsync(cancellationToken);
         try
         {
