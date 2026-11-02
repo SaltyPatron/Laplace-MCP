@@ -37,14 +37,49 @@ app.MapGet("/runtime.js", (HttpContext context) =>
     };
     return Results.Text("window.LAPLACE_RUNTIME = " + JsonSerializer.Serialize(settings) + ";\n", "text/javascript");
 });
-app.MapGet("/health", () => Results.Json(new
+app.MapGet("/health", (NativeRuntime native) => Results.Json(new
 {
     status = "ok",
     service = "laplace-modular-web",
     release = builder.Configuration["ReleaseId"] ?? "source",
     identity = "shared-same-origin",
-    data = "native-live"
+    data = "native-live",
+    reader = native.ReaderEvidence()
 }));
+
+app.MapMethods("/mcp", ["POST", "GET", "DELETE"], async (HttpContext context, NativeRuntime native) =>
+{
+    var identityEndpoint = new Uri(builder.Configuration["McpIdentityEndpoint"] ?? throw new NativeUnavailableException("MCP identity is not configured."));
+    if (context.Request.Headers.TryGetValue("Origin", out var origins)
+        && (origins.Count != 1 || origins[0] != identityEndpoint.GetLeftPart(UriPartial.Authority)))
+    { context.Response.StatusCode = 403; return; }
+    if (context.Request.Headers.Authorization.Count != 1
+        || !await native.AuthorizeMcp(context.Request.Headers.Authorization.ToString(), context.RequestAborted))
+    { context.Response.Headers.WWWAuthenticate = "Bearer realm=\"laplace-native-mcp\""; context.Response.StatusCode = 401; return; }
+    if (context.Request.Method == "DELETE") { context.Response.StatusCode = 204; return; }
+    if (context.Request.Method != "POST") { context.Response.Headers.Allow = "POST, DELETE"; context.Response.StatusCode = 405; return; }
+    if (!context.Request.HasJsonContentType()) { context.Response.StatusCode = 415; return; }
+    using var body = new MemoryStream();
+    var buffer = new byte[8192];
+    int count;
+    while ((count = await context.Request.Body.ReadAsync(buffer, context.RequestAborted)) != 0)
+    {
+        if (body.Length + count > 1024 * 1024) { context.Response.StatusCode = 413; return; }
+        body.Write(buffer, 0, count);
+    }
+    JsonDocument message;
+    try { message = JsonDocument.Parse(body.ToArray()); }
+    catch (JsonException) { context.Response.StatusCode = 400; return; }
+    using (message)
+    {
+        var value = message.RootElement;
+        if (value.ValueKind != JsonValueKind.Object || !value.TryGetProperty("jsonrpc", out var version)
+            || version.GetString() != "2.0" || !value.TryGetProperty("method", out var method) || method.ValueKind != JsonValueKind.String)
+        { context.Response.StatusCode = 400; return; }
+        if (!value.TryGetProperty("id", out _)) { context.Response.StatusCode = 202; return; }
+        await Results.Json(await native.Read("/mcp", value, context.RequestAborted)).ExecuteAsync(context);
+    }
+});
 
 static bool IsId(string id) => id.Length == 32 && id.All(Uri.IsHexDigit);
 static bool IsReadOperation(string? name) => name is "forward" or "shape" or "embeddings";

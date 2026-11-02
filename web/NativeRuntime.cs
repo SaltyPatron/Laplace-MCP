@@ -15,12 +15,69 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
 {
     readonly SemaphoreSlim gate = new(1, 1);
     readonly HttpClient client = new() { Timeout = TimeSpan.FromSeconds(45) };
+    readonly HttpClient identity = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(15) };
     static readonly JsonSerializerOptions Json = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
     Process? process;
     SafeFileHandle? job;
     Uri? origin;
     string token = "";
+    string imageHash = "";
     bool disposed;
+
+    public object? ReaderEvidence()
+    {
+        try
+        {
+            return process is { HasExited: false } reader ? new
+            {
+                pid = reader.Id,
+                parent_pid = Environment.ProcessId,
+                started_utc = reader.StartTime.ToUniversalTime().ToString("o"),
+                executable_sha256 = imageHash
+            } : null;
+        }
+        catch (InvalidOperationException) { return null; }
+    }
+
+    public async Task<bool> AuthorizeMcp(string authorization, CancellationToken cancellationToken)
+    {
+        if (!AuthenticationHeaderValue.TryParse(authorization, out var bearer)
+            || !string.Equals(bearer.Scheme, "Bearer", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrWhiteSpace(bearer.Parameter)) return false;
+        if (!Uri.TryCreate(configuration["McpIdentityEndpoint"], UriKind.Absolute, out var endpoint)
+            || endpoint.Scheme != Uri.UriSchemeHttps)
+            throw new NativeUnavailableException("The MCP identity endpoint is not configured.");
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+        request.Headers.Authorization = bearer;
+        request.Headers.Accept.ParseAdd("application/json, text/event-stream");
+        request.Content = new StringContent(JsonSerializer.Serialize(new
+        {
+            jsonrpc = "2.0", id = 1, method = "initialize",
+            @params = new { protocolVersion = "2025-06-18", capabilities = new { }, clientInfo = new { name = "laplace-native-iis", version = "1" } }
+        }), Encoding.UTF8, "application/json");
+        using var response = await identity.SendAsync(request, cancellationToken);
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return false;
+        if (!response.IsSuccessStatusCode || !response.Headers.TryGetValues("Mcp-Session-Id", out var sessions))
+            throw new NativeUnavailableException("The MCP identity service did not verify this request.");
+        var session = sessions.SingleOrDefault();
+        if (string.IsNullOrWhiteSpace(session)) throw new NativeUnavailableException("The MCP identity service did not issue a verification session.");
+        try
+        {
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+            return document.RootElement.TryGetProperty("result", out var result)
+                && result.TryGetProperty("serverInfo", out var server)
+                && server.GetProperty("name").GetString() == "laplace-substrate";
+        }
+        finally
+        {
+            using var close = new HttpRequestMessage(HttpMethod.Delete, endpoint);
+            close.Headers.Authorization = bearer;
+            close.Headers.Add("Mcp-Session-Id", session);
+            using var closed = await identity.SendAsync(close, cancellationToken);
+            if (closed.StatusCode != HttpStatusCode.NoContent)
+                throw new NativeUnavailableException("The MCP identity verification session could not be closed.");
+        }
+    }
 
     public async Task<JsonElement> Read(string path, object? body, CancellationToken cancellationToken)
     {
@@ -92,12 +149,21 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         start.Environment["LAPLACE_GRAMMARS"] = Path.Combine(release, "share", "grammars");
         start.Environment["LAPLACE_FIRMWARE"] = Path.Combine(release, "share", "firmware");
         start.Environment["LAPLACE_ENGINE"] = Path.Combine(bin, "laplace.exe");
-        start.Environment["LAPLACE_CODE_ROOTS"] = "";
+        start.Environment["LAPLACE_CODE_ROOTS"] = config.TryGetProperty("code_roots", out var roots)
+            ? string.Join(Path.PathSeparator, roots.EnumerateArray().Select(root => root.GetString())) : "";
+        if (config.TryGetProperty("work", out var work))
+        {
+            var directory = work.GetString() ?? throw new NativeUnavailableException("Native work storage is not configured.");
+            Directory.CreateDirectory(directory);
+            start.Environment["LAPLACE_WORK"] = directory;
+            start.Environment["LAPLACE_CODE_RECORDS"] = Path.Combine(directory, "workspace.lpm");
+        }
         var threads = config.TryGetProperty("threads", out var selectedThreads) ? Math.Clamp(selectedThreads.GetInt32(), 1, 8) : 2;
         start.Environment["OMP_NUM_THREADS"] = threads.ToString(System.Globalization.CultureInfo.InvariantCulture);
         start.Environment["MKL_NUM_THREADS"] = "1";
         start.Environment["PATH"] = bin + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH");
         process = Process.Start(start) ?? throw new NativeUnavailableException("The native reader did not start.");
+        imageHash = Convert.ToHexStringLower(SHA256.HashData(await File.ReadAllBytesAsync(executable, cancellationToken)));
         // IIS recycling and unexpected host termination must not orphan readers.
         job = CreateJobObject(IntPtr.Zero, null);
         var limits = new JobLimits { Basic = new BasicLimits { LimitFlags = 0x2000 } }; // KILL_ON_JOB_CLOSE
@@ -129,7 +195,7 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         job?.Dispose(); job = null;
         if (process is not null) { try { if (!process.HasExited) process.Kill(true); } catch (InvalidOperationException) { } process.Dispose(); process = null; }
     }
-    public void Dispose() { disposed = true; Stop(); client.Dispose(); gate.Dispose(); }
+    public void Dispose() { disposed = true; Stop(); client.Dispose(); identity.Dispose(); gate.Dispose(); }
     [StructLayout(LayoutKind.Sequential)] struct BasicLimits { public long ProcessTime, JobTime; public uint LimitFlags; public UIntPtr MinimumWorkingSet, MaximumWorkingSet; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass, SchedulingClass; }
     [StructLayout(LayoutKind.Sequential)] struct IoCounters { public ulong ReadOperations, WriteOperations, OtherOperations, ReadBytes, WriteBytes, OtherBytes; }
     [StructLayout(LayoutKind.Sequential)] struct JobLimits { public BasicLimits Basic; public IoCounters Io; public UIntPtr ProcessMemory, JobMemory, PeakProcessMemory, PeakJobMemory; }
