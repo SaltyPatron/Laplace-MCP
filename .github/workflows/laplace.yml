@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: d56fc6023cd51e64aa338d6a26e30eff3d985fbc, path: Laplace-Native, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: 8d6ffe52f90e349582cad5c51d582381a91a9bcc, path: Laplace-Engine, persist-credentials: false }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: 8cc1ace76834de361b684efe1f5a8974b1a685b6, path: Laplace-Engine, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: b866be231281e3501509da52d9b73fb8890b4f2c, path: Laplace-postgres, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
