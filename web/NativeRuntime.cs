@@ -82,7 +82,7 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
     public async Task<JsonElement> Read(string path, object? body, CancellationToken cancellationToken)
     {
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        budget.CancelAfter(TimeSpan.FromSeconds(path == "/mcp" ? 120 : 45));
+        budget.CancelAfter(TimeSpan.FromSeconds(path == "/mcp" ? 300 : 45));
         cancellationToken = budget.Token;
         await gate.WaitAsync(cancellationToken);
         try
