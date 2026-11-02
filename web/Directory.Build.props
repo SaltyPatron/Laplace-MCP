@@ -1,4 +1,8 @@
 <Project>
+  <PropertyGroup>
+    <!-- Default and relocated builds may coexist. Neither output tree is source. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);$(MSBuildProjectDirectory)/bin/**;$(MSBuildProjectDirectory)/obj/**</DefaultItemExcludes>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(LAPLACE_WEB_BUILD)' != ''">
     <BaseOutputPath>$(LAPLACE_WEB_BUILD)/bin/</BaseOutputPath>
     <BaseIntermediateOutputPath>$(LAPLACE_WEB_BUILD)/obj/</BaseIntermediateOutputPath>

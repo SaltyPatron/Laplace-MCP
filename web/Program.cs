@@ -56,8 +56,19 @@ app.MapGet("/api/lookup", async (string q, NativeRuntime native, CancellationTok
 });
 app.MapGet("/api/resources/{id}", async (string id, NativeRuntime native, CancellationToken ct) => IsId(id)
     ? Results.Json(await native.Read("/v1/search", new { id = id.ToLowerInvariant(), fan = 24, display = true }, ct)) : Results.BadRequest());
+app.MapGet("/api/continuations", async (string q, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(q) || System.Text.Encoding.UTF8.GetByteCount(q) > 4096)
+        return Results.BadRequest(new { error = "Enter content, up to 4096 UTF-8 bytes." });
+    // Forward reads observe spans and continuations. Canonical-ID queries use
+    // the structural read rather than decomposing a hexadecimal display value.
+    if (IsId(q.Trim())) return Results.Json(new { forward = Array.Empty<object>(), scope = "not applied to canonical IDs" });
+    return Results.Json(await native.Read("/v1/forward", new { input = q }, ct));
+});
 app.MapGet("/api/provenance/{id}", async (string id, NativeRuntime native, CancellationToken ct) => IsId(id)
     ? Results.Json(await native.Read("/v1/provenance", new { id = id.ToLowerInvariant() }, ct)) : Results.BadRequest());
+app.MapGet("/api/files/{id}", async (string id, NativeRuntime native, CancellationToken ct) => IsId(id)
+    ? Results.Json(await native.Read("/v1/file_outline", new { file = id.ToLowerInvariant(), include_text = true }, ct)) : Results.BadRequest());
 app.MapGet("/api/catalog", async (NativeRuntime native, CancellationToken ct) => Results.Json(await native.Read("/v1/catalog", new { }, ct)));
 app.MapGet("/api/library", async (string? after, NativeRuntime native, CancellationToken ct) => string.IsNullOrEmpty(after) || IsId(after)
     ? Results.Json(await native.Read("/v1/library", new { after = after ?? "" }, ct)) : Results.BadRequest());

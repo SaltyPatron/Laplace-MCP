@@ -49,6 +49,12 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
             Stop();
             throw new NativeUnavailableException("The native reader is reconnecting. Retry the request.");
         }
+        catch (System.ComponentModel.Win32Exception ex)
+        {
+            logger.LogWarning("Native process startup failed with Windows error {NativeErrorCode}", ex.NativeErrorCode);
+            Stop();
+            throw new NativeUnavailableException("The installed native reader could not be started. Retry the request.");
+        }
         finally { gate.Release(); }
     }
 
@@ -56,7 +62,8 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
     {
         if (process is { HasExited: false }) return;
         Stop();
-        var file = configuration["NativeConfigFile"] ?? throw new NativeUnavailableException("Native reader installation is not configured.");
+        var configuredFile = configuration["NativeConfigFile"] ?? throw new NativeUnavailableException("Native reader installation is not configured.");
+        var file = Path.GetFullPath(configuredFile, AppContext.BaseDirectory);
         using var document = JsonDocument.Parse(await File.ReadAllTextAsync(file, cancellationToken));
         var config = document.RootElement;
         string Value(string name) => config.GetProperty(name).GetString() ?? throw new InvalidOperationException($"Missing native setting: {name}");
@@ -65,7 +72,7 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         var prepared = Path.Combine(release, "share", "prepared");
         var executable = Path.Combine(AppContext.BaseDirectory, "native", "lpm.exe");
         var highway = Path.Combine(AppContext.BaseDirectory, "native", "tier0.highway");
-        if (!File.Exists(executable) || !File.Exists(highway) || !File.Exists(Path.Combine(prepared, "tier0.bin")))
+        if (!Directory.Exists(bin) || !File.Exists(executable) || !File.Exists(highway) || !File.Exists(Path.Combine(prepared, "tier0.bin")))
             throw new NativeUnavailableException("The installed native reader or perf-cache is unavailable.");
         using var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
