@@ -77,6 +77,18 @@ void api_buf_fmt(char **b, size_t *n, size_t *cap, const char *fmt, ...);
 void api_cw_str(char **out, size_t *on, size_t *ocap, const char *s);
 char *api_cw_file_name(Reader *rd, const lp_id *file);
 
+typedef struct { lp_id id; uint8_t file; } CwNode;
+typedef struct { CwNode *n; size_t nn, cn; lp_idmap *m; } CwDag;
+typedef struct { char *kind, *name, *source; size_t line, start, length, name_at; } FoDecl;
+
+int cw_walk_many(PGconn *pg, const lp_id *names, size_t count, CwDag *d, size_t max_nodes, int *levels, int *cut);
+int cw_walk(PGconn *pg, const lp_id *name, CwDag *d, size_t max_nodes, int *levels, int *cut);
+size_t cw_lines(const char *text, size_t upto);
+int fo_word(char c);
+void fo_free(FoDecl *d, size_t n);
+size_t fo_outline(PGconn *pg, Reader *rd, const lp_id *file, FoDecl **declp, char **textp, size_t *tnp);
+long fo_holder(const FoDecl *declarations, size_t count, size_t position);
+
 int api_name_entity(const char *text, lp_ref *trunk, lp_ref *parts, size_t cap, size_t *nparts);
 void api_parts_json(const lp_ref *parts, size_t n, char *out, size_t cap);
 int api_part_list(const lp_ref *parts, size_t n, char *out, size_t cap);

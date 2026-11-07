@@ -130,4 +130,15 @@ int lpm_is_test_path(const char *path);
 lp_ref lpm_lower_token_ref(Lpm *ix, const uint8_t *w, size_t n, int register_ent);
 void lpm_collect_subtoken_feats(Lpm *ix, const uint8_t *s, size_t n);
 
+uint32_t lpm_count_lines(const uint8_t *s, size_t n);
+lp_ref lpm_text_cached(Lpm *ix, const uint8_t *s, size_t n);
+lp_ref lpm_admit_delimited(Lpm *ix, const uint8_t *s, size_t n, int comma);
+const void *lpm_load_lang(const char *name);
+const char *lpm_path_basename(const char *path);
+const char *lpm_last_path_segments(const char *path, int nseg);
+size_t lpm_header_comment_bytes(const uint8_t *s, size_t n);
+const char *lpm_grammar_name(const char *path);
+void lpm_push_doc(Lpm *ix, const lp_ref *r, uint32_t l0, uint32_t l1, uint32_t bytes, uint32_t path_off, size_t f0);
+lp_ref lpm_admit_grammar(Lpm *ix, const char *name, const uint8_t *s, size_t n, uint32_t path_off, uint32_t file_lines);
+
 #endif
