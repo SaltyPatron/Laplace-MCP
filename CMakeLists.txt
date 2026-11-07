@@ -53,7 +53,8 @@ if(LAPLACE_BUNDLE_ENGINE AND NOT TARGET laplace_engine)
 endif()
 
 # liblpm: the in-process client (check, text, admit, index, search); laplace_mcp.py loads it.
-add_library(lpm_lib SHARED native/lpm.c)
+set(LPM_CORE_SOURCES native/lpm.c native/lpm_admit.c native/lpm_rerank.c native/lpm_store.c)
+add_library(lpm_lib SHARED ${LPM_CORE_SOURCES})
 set_target_properties(lpm_lib PROPERTIES OUTPUT_NAME lpm WINDOWS_EXPORT_ALL_SYMBOLS ON)
 # Windows: the DLL's import library and export file must not share lpm.lib/lpm.exp with lpm.exe.
 if(WIN32)
@@ -64,14 +65,14 @@ target_compile_options(lpm_lib PRIVATE ${LP_C_FLAGS})
 target_link_libraries(lpm_lib PRIVATE laplace_engine_os laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime ${LP_SYSLIBS})
 
 # lpm: the commands and the service (serve).
-add_executable(lpm_program native/main.c native/api.c native/semantic.c native/db_bridge.c)
+add_executable(lpm_program native/main.c native/api.c native/api_mcp.c native/api_substrate.c native/api_search.c native/api_code_db.c native/api_catalog.c native/db_bridge.c)
 laplace_utf8_executable(lpm_program)
 set_target_properties(lpm_program PROPERTIES OUTPUT_NAME lpm)
 target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_NATIVE}/src
                            ${LAPLACE_BLAKE3_DIR} ${LAPLACE_ICU_DIR}/include)
 target_compile_options(lpm_program PRIVATE ${LP_C_FLAGS} -Wno-missing-field-initializers)
 if(WIN32)
-  target_sources(lpm_program PRIVATE native/lpm.c)
+  target_sources(lpm_program PRIVATE ${LPM_CORE_SOURCES})
   target_link_libraries(lpm_program PRIVATE laplace_engine_reader laplace_text ts_runtime ws2_32 ${LP_SYSLIBS})
 else()
   target_link_libraries(lpm_program PRIVATE lpm_lib laplace_engine_reader laplace_text ts_runtime ${LP_SYSLIBS})

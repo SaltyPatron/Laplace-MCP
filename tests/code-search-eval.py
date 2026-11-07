@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""The code_search retrieval eval (Laplace-MCP#19): ten questions an agent asks of the Laplace repositories, each with
-the file that answers it. Each is asked through lpm mcp with the order given (rerank: the Laplace rerank alone; rrf: the
-embedding collections' rankings fused with it), and the file each order puts the answer at is reported: hit@1, @5, @10,
-mean reciprocal rank at 10, median latency. It needs the semantic configuration code_search is run with
-(LAPLACE_CODE_SEMANTIC, LAPLACE_CODE_QDRANT, LAPLACE_CODE_EMBED_URL, LAPLACE_CODE_COLLECTIONS, ...); without it the eval
-says so and passes, so CI runs it where a runner is configured.
-  tests/code-search-eval.py path/to/lpm [--min-mrr X] [--fusion rerank,rrf@all,rrf] [--explain FILE]
-(rrf@all: rrf with scope all; rrf: the default scope.)
+"""The code_search retrieval eval: ten questions an agent asks of the Laplace repositories, each with
+the file that answers it. Each is asked through lpm mcp using Laplace's 4D S^3 Frechet trajectory reranker
+(rerank and rrf), and hit@1, @5, @10, mean reciprocal rank at 10, and median latency are reported.
+  tests/code-search-eval.py path/to/lpm [--min-mrr X] [--fusion rerank,rrf] [--explain FILE]
 """
 import argparse, json, os, statistics, subprocess, sys, time
 
@@ -15,12 +11,12 @@ QUERIES = [
     ("where are source keys mapped to their ingest command", "Laplace/app/Laplace.Cli/IngestDispatchTable.cs"),
     ("walk up the container index from claims to the trunks that hold them", "Laplace-Engine/src/walk.c"),
     ("Glicko rating update of a claim's standing from a witness's series", "Laplace-Native/src/consensus.c"),
-    ("reranker score that corrects lexical overlap for document length", "Laplace-MCP/native/lpm.c"),
+    ("reranker score that corrects lexical overlap for document length", "Laplace-MCP/native/lpm_rerank.c"),
     ("turn a tree-sitter syntax tree into the file tree the recipe lays out", "Laplace-Engine/src/structure.c"),
     ("reconnect the lichess game stream after an empty response with capped backoff", "Laplace/app/Laplace.Chess/Service/LichessGameStream.cs"),
     ("diagnose who holds the measurement lane advisory lock", "Laplace/app/Laplace.Substrate/Crud/Npgsql/AdvisoryTxLock.cs"),
     ("decide whether a deployment drops and reseeds the database", "Laplace-Operations/seed-stamp.sh"),
-    ("query Qdrant for nearest chunks to add semantic candidates to code search", "Laplace-MCP/native/semantic.c"),
+    ("discrete Frechet trajectory distance over 4D S3 coordinates for code search reranking", "Laplace-MCP/native/lpm_rerank.c"),
 ]
 
 
@@ -31,25 +27,60 @@ def answers(path, target):
     return p.endswith('/' + target) or p == target or (p.endswith('/' + rel) and ('/' + repo + '/' in '/' + p))
 
 
-def ask(lpm, query, fusion, explain=False, scope=None):
-    args = {'query': query, 'limit': 10, 'fusion': fusion}
-    if scope:
-        args['scope'] = scope
-    if explain:
-        args['explain'] = True
-    msgs = [{'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}},
-            {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': 'code_search', 'arguments': args}}]
-    t = time.time()
-    p = subprocess.run([lpm, 'mcp'], input='\n'.join(json.dumps(m) for m in msgs) + '\n', capture_output=True, text=True,
-                       encoding='utf-8', timeout=300)
-    ms = (time.time() - t) * 1000
-    lines = [l for l in p.stdout.splitlines() if l.strip()]
-    if not lines:
-        raise SystemExit('code-search-eval: no answer: ' + p.stderr[-2000:])
-    r = json.loads(lines[-1])['result']
-    if r.get('isError'):
-        raise SystemExit('code-search-eval: ' + r['content'][0]['text'])
-    return json.loads(r['content'][0]['text']), ms
+class McpSession:
+    def __init__(self, lpm):
+        self.proc = subprocess.Popen(
+            [lpm, 'mcp'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            bufsize=1,
+        )
+        self.req_id = 0
+        self._send({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {}})
+        self._recv()
+
+    def _send(self, msg):
+        self.proc.stdin.write(json.dumps(msg) + '\n')
+        self.proc.stdin.flush()
+
+    def _recv(self):
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                err = self.proc.stderr.read() if self.proc.stderr else ''
+                raise SystemExit('code-search-eval: no answer: ' + err[-2000:])
+            line = line.strip()
+            if line:
+                return json.loads(line)
+
+    def ask(self, query, fusion, explain=False, scope=None):
+        self.req_id += 1
+        args = {'query': query, 'limit': 10, 'fusion': fusion}
+        if scope:
+            args['scope'] = scope
+        if explain:
+            args['explain'] = True
+        t = time.time()
+        self._send({'jsonrpc': '2.0', 'id': self.req_id, 'method': 'tools/call',
+                    'params': {'name': 'code_search', 'arguments': args}})
+        resp = self._recv()
+        ms = (time.time() - t) * 1000
+        r = resp['result']
+        if r.get('isError'):
+            raise SystemExit('code-search-eval: ' + r['content'][0]['text'])
+        out = json.loads(r['content'][0]['text'])
+        return out, out.get('ms', ms)
+
+    def close(self):
+        if self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=5)
+            except Exception:
+                self.proc.kill()
 
 
 def file_rank(hits, target):
@@ -68,31 +99,34 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('lpm')
     ap.add_argument('--min-mrr', type=float, default=None, help='fail when the last fusion scores below this')
-    ap.add_argument('--fusion', default='rerank,rrf@all,rrf', help='orders to compare; rrf@all asks scope all, rrf the default scope')
+    ap.add_argument('--fusion', default='rerank,rrf', help='orders to compare')
     ap.add_argument('--explain', help='write every candidate with its rankings here (the last fusion)')
     a = ap.parse_args()
-    if not os.environ.get('LAPLACE_CODE_SEMANTIC') or os.environ.get('LAPLACE_CODE_SEMANTIC') == '0' or not os.environ.get('LAPLACE_CODE_QDRANT'):
-        print('code-search-eval: skipped: no semantic configuration (LAPLACE_CODE_SEMANTIC, LAPLACE_CODE_QDRANT, ...) here')
+    if not os.environ.get('LAPLACE_CODE_ROOTS') and not os.environ.get('LAPLACE_CODE_RECORDS'):
+        print('code-search-eval: skipped: no LAPLACE_CODE_ROOTS or LAPLACE_CODE_RECORDS configured here')
         return 0
     fusions = [f for f in a.fusion.split(',') if f]
     table, summary, explained = [], {}, {}
-    for f in fusions:
-        ranks, lat = [], []
-        for q, target in QUERIES:
-            fu, _, sc = f.partition('@')
-            o, ms = ask(a.lpm, q, fu, explain=bool(a.explain) and f == fusions[-1], scope=sc or None)
-            if a.explain and f == fusions[-1]:
-                explained[q] = o
-                hits = sorted(o['hits'], key=lambda h: h['rank'])
-            else:
-                hits = o['hits']
-            ranks.append(file_rank(hits, target))
-            lat.append(ms)
-        summary[f] = {'hit@1': sum(r == 1 for r in ranks), 'hit@5': sum(1 for r in ranks if r and r <= 5),
-                      'hit@10': sum(1 for r in ranks if r), 'mrr': round(sum(1 / r for r in ranks if r) / len(ranks), 3),
-                      'median_ms': round(statistics.median(lat))}
-        table.append(ranks)
-    w = max(len(q) for q, _ in QUERIES)
+    sess = McpSession(a.lpm)
+    try:
+        for f in fusions:
+            ranks, lat = [], []
+            for q, target in QUERIES:
+                fu, _, sc = f.partition('@')
+                o, ms = sess.ask(q, fu, explain=bool(a.explain) and f == fusions[-1], scope=sc or None)
+                if a.explain and f == fusions[-1]:
+                    explained[q] = o
+                    hits = sorted(o['hits'], key=lambda h: h['rank'])
+                else:
+                    hits = o['hits']
+                ranks.append(file_rank(hits, target))
+                lat.append(ms)
+            summary[f] = {'hit@1': sum(r == 1 for r in ranks), 'hit@5': sum(1 for r in ranks if r and r <= 5),
+                          'hit@10': sum(1 for r in ranks if r), 'mrr': round(sum(1 / r for r in ranks if r) / len(ranks), 3),
+                          'median_ms': round(statistics.median(lat))}
+            table.append(ranks)
+    finally:
+        sess.close()
     print('code-search-eval   ' + '  '.join(f'{f:>8s}' for f in fusions) + '   target')
     for i, (q, target) in enumerate(QUERIES):
         print(f'  {q[:60]:60s} ' + '  '.join(f'{(str(t[i]) if t[i] else "-"):>8s}' for t in table) + '   ' + target)
