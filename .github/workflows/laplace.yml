@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: 9ef653f5b81f2a6755bf45b0f5a60f2e5da9d940, path: Laplace-Engine, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: bb811662c1aff5389bb97aaf80783f59509e53cd, path: Laplace-postgres, persist-credentials: false }
+        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: befb0ef76c0eb3dc4ba9f6278bfbcdd43000b057, path: Laplace-postgres, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { repository: "${{ github.repository_owner }}/Laplace-Operations", ref: 84c50ef7479adcd1b556dbb20a853b75e387eb15, path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}", persist-credentials: false }
       - name: Provide the pinned Tree-sitter generator toolchain
