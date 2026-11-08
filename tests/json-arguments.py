@@ -37,6 +37,6 @@ assert not last['isError'] and literal!=a
 bounded,long_word=content(5)
 assert not bounded['isError'],long_word
 record=long_word['data'][0]
-assert record['tier']==2 and record['parts_total']==256 and not record['parts_complete'],record
+assert record['tier']==1 and record['parts_total']==256 and not record['parts_complete'],record
 assert len(record['parts'])==64 and len(set(record['parts']))==1,record
 print('JSON-RPC IDs and arguments are separate; escaped/direct Unicode agree; canonical ID reaches the database reader; quoted field names stay content')

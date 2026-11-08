@@ -153,8 +153,8 @@ try:
             assert all(len(value['id'])==32 and value['label'] for value in bank['values']),bank
         assert schema['views']['physicality']['name']=='Physicality',schema
         assert any(role['name']=='Metadata' for role in schema['vertex_roles']),schema
-        assert first['stored_tier']==first['computed_tier']==2,first
-        assert direct['stored_tier']==2 and direct['computed_tier'] is None,direct
+        assert first['stored_tier']==first['computed_tier']==1,first
+        assert direct['stored_tier']==1 and direct['computed_tier'] is None,direct
         assert first['storage']=='database' and 'entity_facets' in first,first
         assert first['discovery']['root_present'] and first['discovery']['matches'][0]['match']=='exact',first
         assert direct['discovery']['matches']==request('/v1/search',{'id':first['id'].upper()})['discovery']['matches'],direct
@@ -190,7 +190,7 @@ try:
         cache_only=request('/v1/search',{'id':noun,'display':True})
         assert not cache_only['recorded'] and cache_only['storage']=='highway-cache',cache_only
         assert cache_only['discovery']['root_present'] and cache_only['discovery']['matches'][0]['storage']=='highway-cache',cache_only
-        assert cache_only['canonical_tier']==2 and len(cache_only['parts'])==4,cache_only
+        assert cache_only['canonical_tier']==1 and len(cache_only['parts'])==4,cache_only
         assert any(label['id']==noun and label['text']=='NOUN' for label in cache_only['labels']),cache_only
         scalar=request('/v1/embeddings',{'input':'N'})['data'][0]['id']
         atom=request('/v1/search',{'id':scalar,'display':True})
@@ -207,20 +207,20 @@ try:
         file_labels=[node['label'] for node in graph['nodes'] if node.get('trunk_kind')=='file']
         assert all(any(label.endswith('facts.'+extension) for label in file_labels)
                    for extension in ['tsv','xml','json']),graph
-        assert first['physicality'][0]['n']==3 and first['physicality'][0]['tier']==2,first
+        assert first['physicality'][0]['n']==3 and first['physicality'][0]['tier']==1,first
         assert connections()==pids
         # Reproduce the former text-floor regression in this private database.
         # A current text identity must still discover parents stored at its
         # computed tier. Never substitute the computed tier for stored metadata.
         sql(name,'CREATE TABLE saved_content_tiers AS SELECT id,tier FROM public.entity; '
-                 'UPDATE public.entity SET tier=greatest(1,tier-1) WHERE tier>0; '
-                 'UPDATE public.physicality SET tier=greatest(1,tier-1) WHERE tier>0')
+                 'UPDATE public.entity SET tier=tier+1 WHERE tier>1; '
+                 f"UPDATE public.physicality SET tier=tier+1 WHERE tier>1; UPDATE public.entity SET tier=2 WHERE id='{first['id']}'::public.blake3; UPDATE public.physicality SET tier=2 WHERE entity='{first['id']}'::public.blake3")
         legacy=request('/v1/search',{'input':'dog'})
-        assert legacy['id']==first['id'] and legacy['stored_tier']==legacy['tier']==1,legacy
-        assert legacy['computed_tier']==2,legacy
+        assert legacy['id']==first['id'] and legacy['stored_tier']==legacy['tier']==2,legacy
+        assert legacy['computed_tier']==1,legacy
         assert {row['entity'] for row in legacy['claims']}==set(counts),legacy
         legacy_sentence=request('/v1/search',{'input':'dog warm'})
-        assert any(part['id']==first['id'] and part['tier']==1 and part['claims']
+        assert any(part['id']==first['id'] and part['tier']==2 and part['claims']
                    for part in legacy_sentence['constituents']),legacy_sentence
         sql(name,'UPDATE public.entity e SET tier=s.tier FROM saved_content_tiers s WHERE e.id=s.id; '
                  'UPDATE public.physicality p SET tier=s.tier FROM saved_content_tiers s WHERE p.entity=s.id; '
