@@ -116,6 +116,7 @@ void on_hop(int c, const char *body);
 void on_text(int c, const char *body);
 void on_translate(int c, const char *body);
 void on_pull(int c, const char *body);
+void on_turn(int c, const char *body);
 void on_degrees(int c, const char *body);
 void on_code_search(int c, const char *body);
 void on_reindex(int c, const char *body);

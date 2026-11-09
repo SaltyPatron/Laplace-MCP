@@ -28,11 +28,12 @@ static const char *SURFACE =
     "{\"method\":\"POST\",\"path\":\"/v1/text\",\"body\":\"{\\\"input\\\":\\\"32 hex\\\"}\",\"does\":\"laplace text\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/translate\",\"body\":\"{\\\"input\\\":\\\"word\\\",\\\"from\\\":\\\"en\\\",\\\"to\\\":\\\"fr\\\"}\",\"does\":\"laplace translate\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/pull\",\"body\":\"{\\\"input\\\":\\\"text\\\"}\",\"does\":\"laplace pull\"},"
+    "{\"method\":\"POST\",\"path\":\"/v1/turn\",\"body\":\"{\\\"input\\\":\\\"prompt\\\",\\\"session\\\":\\\"optional\\\",\\\"user\\\":\\\"optional\\\",\\\"read\\\":true}\",\"does\":\"laplace turn: 11-stage stateful forward program (RESOLVE..WITNESS)\"},"
     "{\"method\":\"POST\",\"path\":\"/v1/degrees\",\"body\":\"{\\\"input\\\":\\\"text\\\",\\\"other\\\":\\\"text\\\"}\",\"does\":\"laplace degrees\"},"
     "{\"method\":\"GET\",\"path\":\"/v1/surface\"},"
     "{\"method\":\"GET\",\"path\":\"/v1/schema\",\"does\":\"native view descriptors, mask banks, occurrence roles and operation input schemas\"},"
     "{\"method\":\"GET\",\"path\":\"/health\"},"
-    "{\"method\":\"POST\",\"path\":\"/mcp\",\"body\":\"JSON-RPC 2.0 MCP or op: embeddings|rerank|code_search|reindex|code_where|code_callers|code_callees|sources|ingest_status|file_outline|recipe_plan|recipe_catalog|search|forward|shape|frechet|ingest|hop|text|translate|degrees|pull|surface\"}"
+    "{\"method\":\"POST\",\"path\":\"/mcp\",\"body\":\"JSON-RPC 2.0 MCP or op: embeddings|rerank|code_search|reindex|code_where|code_callers|code_callees|sources|ingest_status|file_outline|recipe_plan|recipe_catalog|search|forward|shape|frechet|ingest|hop|text|translate|degrees|pull|turn|surface\"}"
     "],"
     "\"database_functions\":[\"laplace_containers\",\"laplace_claims\",\"laplace_claims_each\",\"laplace_text\",\"laplace_fills\",\"laplace_forward\",\"laplace_frechet4d\",\"laplace_dtw4d\",\"laplace_edr4d\",\"laplace_distance4d\",\"laplace_couple\",\"laplace_follows\",\"laplace_paths\",\"laplace_attested\",\"laplace_compose\",\"laplace_parts\"],"
     "\"engine_commands\":[\"tier0\",\"flags\",\"highway\",\"deploy\",\"sources\",\"ingest\",\"forget\",\"sweep\",\"index\",\"structure\",\"tree\",\"text\",\"pull\",\"turn\",\"hop\",\"translate\",\"degrees\",\"fills\",\"status\",\"bench\",\"model\"]}";
@@ -79,7 +80,8 @@ static const char *TOOLS =
     "{\"name\":\"text\",\"description\":\"laplace text: the entity ID, coordinate, and constituents, computed on the client. No database.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[\"input\"]}},"
     "{\"name\":\"translate\",\"description\":\"laplace translate: a word up through its concepts and down into another language. Languages as the resources write them, such as en, de, fr, ja.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"}},\"required\":[\"input\",\"from\",\"to\"]}},"
     "{\"name\":\"degrees\",\"description\":\"laplace degrees: how far one entity is from another over rated claims.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"other\":{\"type\":\"string\"}},\"required\":[\"input\",\"other\"]}},"
-    "{\"name\":\"pull\",\"description\":\"laplace pull: the forward pass. The prompt is decomposed, trajectories give precedes, contains and co-occurrence, claims tug back by their Glicko standing, and the firmware's take steps choose the segment. No fan cap is passed; the firmware's own fan and hops apply.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[\"input\"]}}"
+    "{\"name\":\"pull\",\"description\":\"laplace pull: the forward pass. The prompt is decomposed, trajectories give precedes, contains and co-occurrence, claims tug back by their Glicko standing, and the firmware's take steps choose the segment. No fan cap is passed; the firmware's own fan and hops apply.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"}},\"required\":[\"input\"]}},"
+    "{\"name\":\"turn\",\"description\":\"laplace turn: the 11-stage stateful forward program (RESOLVE -> COUPLE -> ORIENT -> ROUTE -> SCAN -> COMPOSE -> PROPOSE -> STEER -> SELECT -> REALIZE -> WITNESS). Defaults to read=true when session is omitted.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"input\":{\"type\":\"string\"},\"session\":{\"type\":\"string\"},\"user\":{\"type\":\"string\"},\"read\":{\"type\":\"boolean\"}},\"required\":[\"input\"]}}"
     "]}";
 
 /* View projections are not entity subclasses. Every canonical ID still names
@@ -196,6 +198,7 @@ static void mcp_rpc(int c, const char *body) {
         else if (!strcmp(name, "translate")) on_translate(c, body);
         else if (!strcmp(name, "degrees")) on_degrees(c, body);
         else if (!strcmp(name, "pull")) on_pull(c, body);
+        else if (!strcmp(name, "turn")) on_turn(c, body);
         else {
             api_capture_end(0, NULL);
             char out[160];
@@ -258,6 +261,7 @@ void api_dispatch(int c, const char *method, const char *path, const char *body)
         else if (!strcmp(op, "translate")) path = "/v1/translate";
         else if (!strcmp(op, "degrees")) path = "/v1/degrees";
         else if (!strcmp(op, "pull")) path = "/v1/pull";
+        else if (!strcmp(op, "turn")) path = "/v1/turn";
         else if (!strcmp(op, "surface")) path = "/v1/surface";
         else {
             api_http(c, 400, "{\"error\":\"op\"}");
@@ -305,6 +309,7 @@ void api_dispatch(int c, const char *method, const char *path, const char *body)
     else if (!strcmp(path, "/v1/translate")) on_translate(c, body);
     else if (!strcmp(path, "/v1/degrees")) on_degrees(c, body);
     else if (!strcmp(path, "/v1/pull")) on_pull(c, body);
+    else if (!strcmp(path, "/v1/turn")) on_turn(c, body);
     else api_http(c, 404, "{\"error\":\"not found\"}");
 }
 

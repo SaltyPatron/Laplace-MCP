@@ -167,6 +167,27 @@ void on_pull(int c, const char *body) {
     api_on_engine(c, av);
 }
 
+void on_turn(int c, const char *body) {
+    char text[8192], session[256] = "", user[256] = "";
+    if (!api_jstr(body, "input", text, sizeof text) || !api_plain_arg(text)) {
+        api_http(c, 400, "{\"error\":\"input\"}");
+        return;
+    }
+    int has_session = api_jstr(body, "session", session, sizeof session) && api_plain_arg(session);
+    int has_user = api_jstr(body, "user", user, sizeof user) && api_plain_arg(user);
+    int read_only = api_jbool(body, "read", !has_session);
+    char *av[12];
+    int k = 0;
+    av[k++] = (char *)ENGINE;
+    av[k++] = "turn";
+    if (read_only) av[k++] = "--read";
+    if (has_session) { av[k++] = "--session"; av[k++] = session; }
+    if (has_user) { av[k++] = "--as"; av[k++] = user; }
+    av[k++] = text;
+    av[k] = NULL;
+    api_on_engine(c, av);
+}
+
 void on_degrees(int c, const char *body) {
     char a[8192], b[8192];
     if (!api_jstr(body, "input", a, sizeof a) || !api_jstr(body, "other", b, sizeof b) || !api_plain_arg(a) || !api_plain_arg(b)) {
