@@ -17,9 +17,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: 5edf722e08b097df18ec85764dfc93ac6a2414a9, path: Laplace-Native, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: 270f95d21afb489ca5f3a66c1f4cdd4061f8c515, path: Laplace-Engine, persist-credentials: false }
+        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: be8f9b273f6894546a0238b6943349f5918b5603, path: Laplace-Engine, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: befb0ef76c0eb3dc4ba9f6278bfbcdd43000b057, path: Laplace-postgres, persist-credentials: false }
+        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: a78be9c31fc4a7600779f45b413c79c6b3681295, path: Laplace-postgres, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { repository: "${{ github.repository_owner }}/Laplace-Operations", ref: 84c50ef7479adcd1b556dbb20a853b75e387eb15, path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}", persist-credentials: false }
       - name: Provide the pinned Tree-sitter generator toolchain

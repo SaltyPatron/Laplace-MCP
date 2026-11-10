@@ -124,11 +124,8 @@ void lpm_file_kill(Lpm *ix, uint32_t i);
 uint32_t lpm_file_add(Lpm *ix, uint32_t path_off, uint64_t size, int64_t mtime, uint64_t hash);
 void lpm_norm_path(char *out, size_t cap, const char *in);
 int lpm_is_utf8(const uint8_t *s, size_t n);
-size_t lpm_stem_ascii(const uint8_t *w, size_t n, uint8_t out[64]);
 int lpm_is_prose_or_data_path(const char *path);
 int lpm_is_test_path(const char *path);
-lp_ref lpm_lower_token_ref(Lpm *ix, const uint8_t *w, size_t n, int register_ent);
-void lpm_collect_subtoken_feats(Lpm *ix, const uint8_t *s, size_t n);
 
 uint32_t lpm_count_lines(const uint8_t *s, size_t n);
 lp_ref lpm_text_cached(Lpm *ix, const uint8_t *s, size_t n);

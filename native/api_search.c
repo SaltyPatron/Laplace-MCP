@@ -122,90 +122,6 @@ static const char *tail_path_segments(const char *path, int nseg) {
     return path;
 }
 
-static double basename_stem_boost(const char *path, const char *query) {
-    const char *base = tail_path_segments(path, 1);
-    if (!base || !*base || !query || !*query) return 1.0;
-    size_t blen = strlen(base);
-    const char *dot = strrchr(base, '.');
-    if (dot && dot > base) blen = (size_t)(dot - base);
-
-    uint8_t qstems[64][64];
-    size_t qslen[64];
-    size_t nq = 0;
-    size_t i = 0, qn = strlen(query);
-    while (i < qn && nq < 64) {
-        while (i < qn && !lpm_is_ascii_alnum((uint8_t)query[i])) i++;
-        if (i >= qn) break;
-        size_t w0 = i;
-        while (i < qn && lpm_is_ascii_alnum((uint8_t)query[i])) i++;
-        size_t sub0 = w0;
-        for (size_t k = w0 + 1; k <= i && nq < 64; k++) {
-            int split = (k == i);
-            if (!split) {
-                uint8_t prev = (uint8_t)query[k - 1], cur = (uint8_t)query[k];
-                int prev_lo = (prev >= 'a' && prev <= 'z');
-                int prev_up = (prev >= 'A' && prev <= 'Z');
-                int prev_dg = (prev >= '0' && prev <= '9');
-                int cur_up  = (cur >= 'A' && cur <= 'Z');
-                int cur_dg  = (cur >= '0' && cur <= '9');
-                int next_lo = (k + 1 < i) && (query[k + 1] >= 'a' && query[k + 1] <= 'z');
-                if ((prev_lo && cur_up) || (prev_up && cur_up && next_lo) || (prev_dg != cur_dg)) split = 1;
-            }
-            if (split) {
-                size_t slen = k - sub0;
-                if (slen >= 3 && slen <= 64) {
-                    qslen[nq] = lpm_stem_ascii((const uint8_t *)query + sub0, slen, qstems[nq]);
-                    if (qslen[nq] >= 3) nq++;
-                }
-                sub0 = k;
-            }
-        }
-    }
-
-    int matches = 0;
-    i = 0;
-    while (i < blen) {
-        while (i < blen && !lpm_is_ascii_alnum((uint8_t)base[i])) i++;
-        if (i >= blen) break;
-        size_t w0 = i;
-        while (i < blen && lpm_is_ascii_alnum((uint8_t)base[i])) i++;
-        size_t sub0 = w0;
-        for (size_t k = w0 + 1; k <= i; k++) {
-            int split = (k == i);
-            if (!split) {
-                uint8_t prev = (uint8_t)base[k - 1], cur = (uint8_t)base[k];
-                int prev_lo = (prev >= 'a' && prev <= 'z');
-                int prev_up = (prev >= 'A' && prev <= 'Z');
-                int prev_dg = (prev >= '0' && prev <= '9');
-                int cur_up  = (cur >= 'A' && cur <= 'Z');
-                int cur_dg  = (cur >= '0' && cur <= '9');
-                int next_lo = (k + 1 < i) && (base[k + 1] >= 'a' && base[k + 1] <= 'z');
-                if ((prev_lo && cur_up) || (prev_up && cur_up && next_lo) || (prev_dg != cur_dg)) split = 1;
-            }
-            if (split) {
-                size_t slen = k - sub0;
-                if (slen >= 3 && slen <= 64) {
-                    uint8_t bstem[64];
-                    size_t bslen = lpm_stem_ascii((const uint8_t *)base + sub0, slen, bstem);
-                    if (bslen >= 3) {
-                        for (size_t m = 0; m < nq; m++) {
-                            if (qslen[m] == bslen && !memcmp(qstems[m], bstem, bslen)) {
-                                matches++;
-                                break;
-                            }
-                        }
-                    }
-                }
-                sub0 = k;
-            }
-        }
-    }
-    if (!matches) return 1.0;
-    if (matches == 1) return 1.03;
-    double boost = 1.0 + 0.14 * (double)matches;
-    return boost > 1.35 ? 1.35 : boost;
-}
-
 /* A code_search candidate from the multi-tier Laplace AST/text index, reranked by 4D Frechet trajectory distance. */
 typedef struct {
     char path[4096];
@@ -464,7 +380,6 @@ void on_code_search(int c, const char *body) {
             if (sn < 0) sn = 0;
             if ((size_t)sn >= sizeof full_snip) sn = (int)(sizeof full_snip - 1);
             k->rerank = lpm_rerank(ix, rq, strlen(rq), full_snip, (size_t)sn, &k->shared, &k->frechet);
-            k->rerank *= basename_stem_boost(k->path, rq);
             if (!strcmp(scope_s, "all")) {
                 if (lpm_is_prose_or_data_path(k->path)) k->rerank *= 0.35;
                 else if (lpm_is_test_path(k->path)) k->rerank *= 0.25;
