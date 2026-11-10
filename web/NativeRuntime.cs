@@ -152,6 +152,10 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         start.Environment["LAPLACE_GRAMMARS"] = Path.Combine(release, "share", "grammars");
         start.Environment["LAPLACE_FIRMWARE"] = Path.Combine(release, "share", "firmware", "program.firmware");
         start.Environment["LAPLACE_ENGINE"] = Path.Combine(bin, "laplace.exe");
+        // Source declarations root at $LAPLACE_DATA, $LAPLACE_SRC and $LAPLACE_MODELS.
+        foreach (var (property, variable) in new[] { ("data", "LAPLACE_DATA"), ("src", "LAPLACE_SRC"), ("models", "LAPLACE_MODELS") })
+            if (config.TryGetProperty(property, out var located) && located.GetString() is { Length: > 0 } path)
+                start.Environment[variable] = path;
         start.Environment["LAPLACE_CODE_ROOTS"] = config.TryGetProperty("code_roots", out var roots)
             ? string.Join(Path.PathSeparator, roots.EnumerateArray().Select(root => root.GetString())) : "";
         if (config.TryGetProperty("work", out var work))

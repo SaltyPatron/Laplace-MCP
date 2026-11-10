@@ -17,7 +17,7 @@ void on_ingest_status(int c, const char *body) {
     PGconn *pg = api_cc_db(c);
     if (!pg) return;
     uint64_t t0 = api_nsec();
-    PGresult *r = db_exec_params(pg, "SELECT id, trust FROM @extschema@.witness", 0, NULL, NULL, NULL, NULL, 1);
+    PGresult *r = db_exec_params(pg, "SELECT DISTINCT ON (witness) witness, trust FROM @extschema@.attestation ORDER BY witness, lineage NULLS FIRST", 0, NULL, NULL, NULL, NULL, 1);
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         char e[512], b[640];
         api_json_esc(PQerrorMessage(pg), e, sizeof e);
@@ -156,7 +156,7 @@ void on_sources(int c, const char *body) {
     (void)body;
     PGconn *pg = api_db();
     if (!pg) { api_http(c, 503, "{\"error\":\"database\"}"); return; }
-    PGresult *r = db_exec_params(pg, "SELECT id, trust FROM @extschema@.witness", 0, NULL, NULL, NULL, NULL, 1);
+    PGresult *r = db_exec_params(pg, "SELECT DISTINCT ON (witness) witness, trust FROM @extschema@.attestation ORDER BY witness, lineage NULLS FIRST", 0, NULL, NULL, NULL, NULL, 1);
     if (PQresultStatus(r) != PGRES_TUPLES_OK) {
         char e[512], b[640];
         api_json_esc(PQerrorMessage(pg), e, sizeof e);
@@ -196,7 +196,8 @@ void on_catalog(int c,const char *body){
         "SELECT json_build_object('database',current_database(),'read_only',current_setting('transaction_read_only')::boolean,"
         "'database_bytes',pg_database_size(current_database())::text,'entities',(SELECT count(*)::text FROM @extschema@.entity),"
         "'physicalities',(SELECT count(*)::text FROM @extschema@.physicality),'standing_rows',(SELECT count(*)::text FROM @extschema@.consensus),"
-        "'registered_witness_rows',(SELECT count(*)::text FROM @extschema@.witness),'as_of',statement_timestamp(),'count_kind','exact')::text",
+        "'attestation_rows',(SELECT count(*)::text FROM @extschema@.attestation),"
+        "'registered_witness_rows',(SELECT count(DISTINCT witness)::text FROM @extschema@.attestation),'as_of',statement_timestamp(),'count_kind','exact')::text",
         0,NULL,NULL,NULL,NULL,0);
     if(PQresultStatus(r)!=PGRES_TUPLES_OK||PQntuples(r)!=1){PQclear(r);api_http(c,503,"{\"error\":\"catalog_unavailable\"}");return;}
     char *json=strdup(PQgetvalue(r,0,0));PQclear(r);api_http(c,200,json);free(json);
