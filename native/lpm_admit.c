@@ -37,6 +37,7 @@ lp_ref lpm_text_cached(Lpm *ix, const uint8_t *s, size_t n) {
     }
     size_t feat0 = ix->nfeat;
     lp_ref r = lp_text_decompose(ix->text, s, n, lpm_on_compose, ix);
+    lpm_collect_subtoken_feats(ix, s, n);
     if (ix->sc_pn + n > ix->sc_pcap) {
         ix->sc_pcap = (ix->sc_pn + n) * 2 + 4096;
         ix->sc_pool = lpm_grow(ix->sc_pool, ix->sc_pcap);

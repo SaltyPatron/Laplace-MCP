@@ -87,7 +87,7 @@ lp_ref lpm_on_compose(void *ud, const lp_ref *ch, uint32_t n, uint8_t tier) {
     ix->compositions++;
     int low = 1;
     for (uint32_t i = 0; i < n; i++) if (ch[i].tier > 1) { low = 0; break; }
-    if (low && n > 1 && ix->collecting) lpm_add_feat(ix, r.id.b);
+    if (low && n > 1 && ix->collecting == 1) lpm_add_feat(ix, r.id.b);
     return r;
 }
 
@@ -251,6 +251,48 @@ lp_ref lpm_compose_put(Lpm *ix, const lp_ref *ch, uint32_t n, uint8_t tier) {
     return r;
 }
 
+size_t lpm_stem_ascii(const uint8_t *w, size_t n, uint8_t out[64]) {
+    if (n > 64) n = 64;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = w[i];
+        out[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c - 'A' + 'a') : c;
+    }
+    if (n <= 3) return n;
+    if (n >= 5 && out[n - 3] == 'i' && out[n - 2] == 'e' && out[n - 1] == 's') {
+        out[n - 3] = 'y';
+        n -= 2;
+    } else if (n >= 5 && out[n - 3] == 'i' && out[n - 2] == 'e' && out[n - 1] == 'd') {
+        out[n - 3] = 'y';
+        n -= 2;
+    } else if (n >= 4 && out[n - 1] == 's' && out[n - 2] != 's' && out[n - 2] != 'u' && out[n - 2] != 'i') {
+        if (n >= 5 && out[n - 2] == 'e' && (out[n - 3] == 's' || out[n - 3] == 'x' || out[n - 3] == 'z' ||
+            (out[n - 3] == 'h' && (out[n - 4] == 'c' || out[n - 4] == 's')))) {
+            n -= 2;
+        } else {
+            n -= 1;
+        }
+    }
+    if (n >= 7 && !memcmp(out + n - 3, "tic", 3)) {
+        n -= 3;
+    } else if (n >= 6 && !memcmp(out + n - 3, "ing", 3)) {
+        n -= 3;
+        if (n >= 4 && out[n - 1] == out[n - 2] && out[n - 1] != 'l' && out[n - 1] != 's' && out[n - 1] != 'z') n--;
+    } else if (n >= 5 && !memcmp(out + n - 2, "ed", 2)) {
+        if (out[n - 3] == 'e') n -= 1;
+        else {
+            n -= 2;
+            if (n >= 3 && out[n - 1] == out[n - 2] && out[n - 1] != 'l' && out[n - 1] != 's' && out[n - 1] != 'z') n--;
+        }
+    }
+    if (n >= 6 && !memcmp(out + n - 2, "er", 2)) {
+        n -= 2;
+    }
+    if (n >= 6 && out[n - 1] == 'e' && out[n - 2] != 'e') {
+        n -= 1;
+    }
+    return n;
+}
+
 int lpm_is_prose_or_data_path(const char *path) {
     if (!path) return 0;
     if (strstr(path, "/Laplace-Wiki/") || strstr(path, "\\Laplace-Wiki\\") ||
@@ -275,6 +317,77 @@ int lpm_is_test_path(const char *path) {
            strstr(path, "Test.cs") != NULL;
 }
 
+lp_ref lpm_lower_token_ref(Lpm *ix, const uint8_t *w, size_t n, int register_ent) {
+    lp_ref ch[64];
+    if (n > 64) n = 64;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = w[i];
+        if (c >= 'A' && c <= 'Z') c = (uint8_t)(c - 'A' + 'a');
+        ch[i] = lp_ref_atom(ix->t0, (uint32_t)c);
+    }
+    lp_ref r = (n == 1) ? ch[0] : lp_ref_compose(ch, n, 2);
+    if (register_ent) {
+        int fresh = 0;
+        lpm_ent_put(ix, &r, &fresh);
+        if (ix->collecting && n >= 2) lpm_add_feat(ix, r.id.b);
+    }
+    return r;
+}
+
+static void register_token_and_stem(Lpm *ix, const uint8_t *w, size_t n) {
+    if (n < 2 || n > 64) return;
+    uint8_t stem[64];
+    size_t stlen = lpm_stem_ascii(w, n, stem);
+    if (ix->collecting == 2) {
+        /* Query mode: emit one canonical stem per token so inflected words are not double-counted. */
+        if (stlen >= 2) lpm_lower_token_ref(ix, stem, stlen, 1);
+        else lpm_lower_token_ref(ix, w, n, 1);
+        return;
+    }
+    lpm_lower_token_ref(ix, w, n, 1);
+    if (stlen >= 3 && stlen < n) lpm_lower_token_ref(ix, stem, stlen, 1);
+}
+
+void lpm_collect_subtoken_feats(Lpm *ix, const uint8_t *s, size_t n) {
+    if (!ix->collecting || !n) return;
+    size_t i = 0;
+    while (i < n) {
+        while (i < n && !lpm_is_ascii_alnum(s[i])) i++;
+        if (i >= n) break;
+        size_t w0 = i;
+        while (i < n && lpm_is_ascii_alnum(s[i])) i++;
+        size_t wlen = i - w0;
+        if (wlen >= 2 && wlen <= 64 && ix->collecting == 1) register_token_and_stem(ix, s + w0, wlen);
+        /* Split CamelCase / digit boundaries into sub-tokens */
+        size_t sub0 = w0;
+        int nsubs = 0;
+        for (size_t k = w0 + 1; k <= i; k++) {
+            int split = (k == i);
+            if (!split) {
+                uint8_t prev = s[k - 1], cur = s[k];
+                int prev_lo = (prev >= 'a' && prev <= 'z');
+                int prev_up = (prev >= 'A' && prev <= 'Z');
+                int prev_dg = (prev >= '0' && prev <= '9');
+                int cur_up  = (cur >= 'A' && cur <= 'Z');
+                int cur_dg  = (cur >= '0' && cur <= '9');
+                int next_lo = (k + 1 < i) && (s[k + 1] >= 'a' && s[k + 1] <= 'z');
+                if ((prev_lo && cur_up) || (prev_up && cur_up && next_lo) || (prev_dg != cur_dg)) split = 1;
+            }
+            if (split) {
+                size_t slen = k - sub0;
+                if (ix->collecting == 2) {
+                    if (slen >= 2 && slen <= 64) register_token_and_stem(ix, s + sub0, slen);
+                } else {
+                    if (slen >= 2 && slen < wlen && slen <= 64) register_token_and_stem(ix, s + sub0, slen);
+                }
+                sub0 = k;
+                nsubs++;
+            }
+        }
+        (void)nsubs;
+    }
+}
+
 int lpm_is_utf8(const uint8_t *s, size_t n) {
     size_t i = 0; uint32_t cp;
     while (i < n) if (!lp_utf8_next(s, n, &i, &cp)) return 0;
@@ -297,6 +410,7 @@ size_t lpm_search(Lpm *ix, const char *q, size_t n, LpmHit *out, size_t cap) {
     lp_ref trunk;
     if (utf8 && n) {
         trunk = lp_text_decompose(ix->text, s, n, lpm_on_compose, ix);
+        lpm_collect_subtoken_feats(ix, s, n);
     } else memset(&trunk, 0, sizeof trunk);
     lpm_add_feat(ix, trunk.id.b);
     ix->collecting = 0;

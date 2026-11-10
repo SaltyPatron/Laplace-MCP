@@ -136,14 +136,80 @@ double lpm_frechet(const Lpm *ix, const uint8_t a[16], const uint8_t b[16]) {
     return d;
 }
 
-static void extract_word_traj(Lpm *ix, const uint8_t id[16], const int64_t cent_m[4],
-                              double **pts_out, size_t *npts_out, double cent_out[4]) {
-    double *pts = NULL;
-    size_t npts = 0, cap = 0;
-    traj_walk(ix, id, &pts, &npts, &cap, 0);
+static void extract_word_traj(Lpm *ix, const uint8_t *s, size_t n, double **pts_out, size_t *npts_out, double cent_out[4]) {
+    lp_ref *refs = NULL;
+    size_t nrefs = 0, crefs = 0;
+    size_t i = 0;
+    while (i < n) {
+        while (i < n && !lpm_is_ascii_alnum(s[i])) i++;
+        if (i >= n) break;
+        size_t w0 = i;
+        while (i < n && lpm_is_ascii_alnum(s[i])) i++;
+        size_t sub0 = w0;
+        for (size_t k = w0 + 1; k <= i; k++) {
+            int split = (k == i);
+            if (!split) {
+                uint8_t prev = s[k - 1], cur = s[k];
+                int prev_lo = (prev >= 'a' && prev <= 'z');
+                int prev_up = (prev >= 'A' && prev <= 'Z');
+                int prev_dg = (prev >= '0' && prev <= '9');
+                int cur_up  = (cur >= 'A' && cur <= 'Z');
+                int cur_dg  = (cur >= '0' && cur <= '9');
+                int next_lo = (k + 1 < i) && (s[k + 1] >= 'a' && s[k + 1] <= 'z');
+                if ((prev_lo && cur_up) || (prev_up && cur_up && next_lo) || (prev_dg != cur_dg)) split = 1;
+            }
+            if (split) {
+                size_t slen = k - sub0;
+                if (slen >= 2 && slen <= 64) {
+                    uint8_t stem[64];
+                    size_t stlen = lpm_stem_ascii(s + sub0, slen, stem);
+                    lp_ref r = lpm_lower_token_ref(ix, stem, stlen, 0);
+                    if (nrefs == crefs) {
+                        crefs = crefs ? crefs * 2 : 32;
+                        refs = lpm_grow(refs, crefs * sizeof(*refs));
+                    }
+                    refs[nrefs++] = r;
+                }
+                sub0 = k;
+            }
+        }
+    }
+
+    size_t spec_count = 0;
+    size_t div = ix->ndocs >= 512 ? 25 : 6;
+    if (ix->ndocs >= 32) {
+        for (size_t m = 0; m < nrefs; m++) {
+            Ent *e = lpm_ent_find(ix, refs[m].id.b);
+            if (!e || (size_t)e->nd * div <= ix->ndocs) spec_count++;
+        }
+    }
+    int filter_common = (ix->ndocs >= 32 && spec_count >= 2);
+
+    double *pts = nrefs ? malloc(nrefs * 4 * sizeof(double)) : NULL;
+    size_t npts = 0;
+    double sum[4] = {0, 0, 0, 0};
+    for (size_t m = 0; m < nrefs; m++) {
+        if (filter_common) {
+            Ent *e = lpm_ent_find(ix, refs[m].id.b);
+            if (e && (size_t)e->nd * div > ix->ndocs) continue;
+        }
+        double pt[4];
+        unit_s3(refs[m].c.m, pt);
+        memcpy(pts + npts * 4, pt, 4 * sizeof(double));
+        npts++;
+        for (int d = 0; d < 4; d++) sum[d] += pt[d];
+    }
+    free(refs);
+
     *pts_out = pts;
     *npts_out = npts;
-    unit_s3(cent_m, cent_out);
+    double norm2 = sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2] + sum[3] * sum[3];
+    if (norm2 > 1e-30) {
+        double inv = 1.0 / sqrt(norm2);
+        for (int d = 0; d < 4; d++) cent_out[d] = sum[d] * inv;
+    } else {
+        cent_out[0] = 1.0; cent_out[1] = 0.0; cent_out[2] = 0.0; cent_out[3] = 0.0;
+    }
 }
 
 static size_t dedup_feat(uint8_t *buf, size_t n) {
@@ -180,6 +246,7 @@ void lpm_rerank_parts(Lpm *ix, const char *query, size_t qn, const char *doc, si
     lp_ref qr = {0};
     if (lpm_is_utf8((const uint8_t *)query, qn)) {
         qr = lp_text_decompose(ix->text, (const uint8_t *)query, qn, lpm_on_compose, ix);
+        lpm_collect_subtoken_feats(ix, (const uint8_t *)query, qn);
     }
     if (qr.tier) lpm_add_feat(ix, qr.id.b);
     size_t qfn = dedup_feat(ix->feat, ix->nfeat);
@@ -191,6 +258,7 @@ void lpm_rerank_parts(Lpm *ix, const char *query, size_t qn, const char *doc, si
     lp_ref dr = {0};
     if (lpm_is_utf8((const uint8_t *)doc, dn)) {
         dr = lp_text_decompose(ix->text, (const uint8_t *)doc, dn, lpm_on_compose, ix);
+        lpm_collect_subtoken_feats(ix, (const uint8_t *)doc, dn);
     }
     if (dr.tier) lpm_add_feat(ix, dr.id.b);
     size_t dfn = dedup_feat(ix->feat, ix->nfeat);
@@ -231,8 +299,8 @@ void lpm_rerank_parts(Lpm *ix, const char *query, size_t qn, const char *doc, si
     double *q_pts = NULL, *d_pts = NULL;
     size_t nq_pts = 0, nd_pts = 0;
     double q_cent[4], d_cent[4];
-    extract_word_traj(ix, qr.id.b, qr.c.m, &q_pts, &nq_pts, q_cent);
-    extract_word_traj(ix, dr.id.b, dr.c.m, &d_pts, &nd_pts, d_cent);
+    extract_word_traj(ix, (const uint8_t *)query, qn, &q_pts, &nq_pts, q_cent);
+    extract_word_traj(ix, (const uint8_t *)doc, dn, &d_pts, &nd_pts, d_cent);
 
     double fr = (nq_pts && nd_pts)
         ? subtraj_frechet4(q_pts, nq_pts, d_pts, nd_pts)

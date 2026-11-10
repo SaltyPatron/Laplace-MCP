@@ -85,10 +85,10 @@ int lpm_admit(Lpm *ix, const char *path, const uint8_t *s, size_t n) {
             free(ids);
         }
     }
-    /* Attach the file's path (last 3 segments) and, for .c files, its sibling .h opening header comment. */
+    /* Attach the file's path subtokens (last 3 segments) and, for .c files, its sibling .h opening header comment. */
     size_t pf0 = ix->nfeat;
     const char *rel = lpm_last_path_segments(ix->paths + path_off, 3);
-    if (rel && *rel) lpm_text_cached(ix, (const uint8_t *)rel, strlen(rel));
+    if (rel && *rel) lpm_collect_subtoken_feats(ix, (const uint8_t *)rel, strlen(rel));
     if (had_grammar && utf8 && dot && !strcmp(dot, ".c") && path && strlen(path) < 4090) {
         char hpath[4096];
         snprintf(hpath, sizeof hpath, "%s", path);
