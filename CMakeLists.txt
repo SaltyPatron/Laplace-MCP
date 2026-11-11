@@ -52,8 +52,8 @@ if(LAPLACE_BUNDLE_ENGINE AND NOT TARGET laplace_engine)
   add_subdirectory("${LAPLACE_ENGINE_SRC}/.." engine)
 endif()
 
-# liblpm: the in-process client (check, text, admit, index, search); laplace_mcp.py loads it.
-set(LPM_CORE_SOURCES native/lpm.c native/lpm_admit.c native/lpm_index.c native/lpm_rerank.c native/lpm_store.c)
+# liblpm: the in-process client (check, id, text): a text's entity and constituent tree, from the Native decomposer.
+set(LPM_CORE_SOURCES native/lpm.c)
 add_library(lpm_lib SHARED ${LPM_CORE_SOURCES})
 set_target_properties(lpm_lib PROPERTIES OUTPUT_NAME lpm WINDOWS_EXPORT_ALL_SYMBOLS ON)
 # Windows: the DLL's import library and export file must not share lpm.lib/lpm.exp with lpm.exe.
@@ -62,7 +62,7 @@ if(WIN32)
 endif()
 target_include_directories(lpm_lib PUBLIC native PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_NATIVE}/src)
 target_compile_options(lpm_lib PRIVATE ${LP_C_FLAGS})
-target_link_libraries(lpm_lib PRIVATE laplace_engine_os laplace_text laplace_static lp_crmath BLAKE3::blake3 ts_runtime ${LP_SYSLIBS})
+target_link_libraries(lpm_lib PRIVATE laplace_text laplace_static lp_crmath BLAKE3::blake3 ${LP_SYSLIBS})
 
 # lpm: the commands and the service (serve).
 add_executable(lpm_program native/main.c native/api.c native/api_serve.c native/api_mcp.c native/api_substrate.c native/api_search.c native/api_code_db.c native/api_code_graph.c native/api_catalog.c native/api_chess.c native/db_bridge.c)

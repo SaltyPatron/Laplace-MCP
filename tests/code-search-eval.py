@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The code_search retrieval eval: ten questions an agent asks of the Laplace repositories, each with
-the file that answers it. Each is asked through lpm mcp using Laplace's 4D S^3 Frechet trajectory reranker
-(rerank and rrf), and hit@1, @5, @10, mean reciprocal rank at 10, and median latency are reported.
+the file that answers it. Each is asked through lpm mcp, which answers from the database's ingest of the
+workspace (LAPLACE_CONNINFO; LAPLACE_CODE_SOURCE names its witness), and hit@1, @5, @10, mean reciprocal rank
+at 10, and median latency are reported. Skipped where no database is configured.
   tests/code-search-eval.py path/to/lpm [--min-mrr X] [--fusion rerank,rrf] [--explain FILE]
 """
 import argparse, json, os, statistics, subprocess, sys, time
@@ -99,16 +100,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('lpm')
     ap.add_argument('--min-mrr', type=float, default=None, help='fail when the last fusion scores below this')
-    ap.add_argument('--fusion', default='rerank,rrf', help='orders to compare')
+    ap.add_argument('--fusion', default='rerank', help='orders to compare')
     ap.add_argument('--explain', help='write every candidate with its rankings here (the last fusion)')
     a = ap.parse_args()
-    if not os.environ.get('LAPLACE_CODE_ROOTS') and not os.environ.get('LAPLACE_CODE_RECORDS'):
-        print('code-search-eval: skipped: no LAPLACE_CODE_ROOTS or LAPLACE_CODE_RECORDS configured here')
+    if not os.environ.get('LAPLACE_CONNINFO'):
+        print('code-search-eval: skipped: no LAPLACE_CONNINFO (a database holding the workspace) configured here')
         return 0
     fusions = [f for f in a.fusion.split(',') if f]
     table, summary, explained = [], {}, {}
     sess = McpSession(a.lpm)
     try:
+        probe, _ = sess.ask(QUERIES[0][0], fusions[0].partition('@')[0])
+        if not probe.get('witnesses'):
+            print('code-search-eval: skipped: the database holds no witness named ' + repr(probe.get('source')))
+            return 0
         for f in fusions:
             ranks, lat = [], []
             for q, target in QUERIES:

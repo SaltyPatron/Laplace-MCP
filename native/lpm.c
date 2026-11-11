@@ -12,7 +12,7 @@ static uint64_t mix(const uint8_t id[16]) {
     return x;
 }
 
-void lpm_rehash(Lpm *ix, size_t nslot) {
+static void rehash(Lpm *ix, size_t nslot) {
     Ent *n = calloc(nslot, sizeof *n);
     if (!n) abort();
     for (size_t i = 0; i < ix->nslot; i++) {
@@ -26,15 +26,11 @@ void lpm_rehash(Lpm *ix, size_t nslot) {
     ix->nslot = nslot;
 }
 
-Ent *lpm_ent_put(Lpm *ix, const lp_ref *r, int *fresh) {
-    if (ix->nent * 10 >= ix->nslot * 7) lpm_rehash(ix, ix->nslot ? ix->nslot * 2 : 1024);
+static Ent *ent_put(Lpm *ix, const lp_ref *r) {
+    if (ix->nent * 10 >= ix->nslot * 7) rehash(ix, ix->nslot ? ix->nslot * 2 : 1024);
     size_t k = mix(r->id.b) & (ix->nslot - 1);
     while (ix->slot[k].used) {
-        if (!memcmp(ix->slot[k].id, r->id.b, 16)) {
-            ix->slot[k].seen++;
-            *fresh = 0;
-            return &ix->slot[k];
-        }
+        if (!memcmp(ix->slot[k].id, r->id.b, 16)) { ix->slot[k].seen++; return &ix->slot[k]; }
         k = (k + 1) & (ix->nslot - 1);
     }
     Ent *e = &ix->slot[k];
@@ -45,7 +41,6 @@ Ent *lpm_ent_put(Lpm *ix, const lp_ref *r, int *fresh) {
     e->seen = 1;
     e->used = 1;
     ix->nent++;
-    *fresh = 1;
     return e;
 }
 
@@ -59,81 +54,16 @@ Ent *lpm_ent_find(const Lpm *ix, const uint8_t id[16]) {
     return NULL;
 }
 
-void lpm_add_feat(Lpm *ix, const uint8_t id[16]) {
-    if (!ix->collecting) return;
-    if (ix->nfeat == ix->cfeat) {
-        ix->cfeat = ix->cfeat ? ix->cfeat * 2 : 256;
-        ix->feat = lpm_grow(ix->feat, ix->cfeat * 16);
-    }
-    memcpy(ix->feat + ix->nfeat * 16, id, 16);
-    ix->nfeat++;
-}
-
-void lpm_ent_kids(Ent *e, const lp_ref *ch, uint32_t n) {
-    if (e->kids || n == 0 || n > 200000u) return;
-    e->kids = malloc((size_t)n * 16);
-    if (!e->kids) return;
-    for (uint32_t i = 0; i < n; i++) memcpy(e->kids + (size_t)i * 16, ch[i].id.b, 16);
-    e->nkids = n;
-}
-
 lp_ref lpm_on_compose(void *ud, const lp_ref *ch, uint32_t n, uint8_t tier) {
     Lpm *ix = ud;
     lp_ref r = lp_ref_compose(ch, n, tier);
-    int fresh = 0;
-    for (uint32_t i = 0; i < n; i++) lpm_ent_put(ix, &ch[i], &fresh);
-    Ent *e = lpm_ent_put(ix, &r, &fresh);
-    lpm_ent_kids(e, ch, n);
-    ix->compositions++;
-    int low = 1;
-    for (uint32_t i = 0; i < n; i++) if (ch[i].tier > 1) { low = 0; break; }
-    if (low && n > 1 && ix->collecting == 1) lpm_add_feat(ix, r.id.b);
+    for (uint32_t i = 0; i < n; i++) ent_put(ix, &ch[i]);
+    Ent *e = ent_put(ix, &r);
+    if (!e->kids && n && n <= 200000u && (e->kids = malloc((size_t)n * 16))) {
+        for (uint32_t i = 0; i < n; i++) memcpy(e->kids + (size_t)i * 16, ch[i].id.b, 16);
+        e->nkids = n;
+    }
     return r;
-}
-
-void lpm_post_features_range(Lpm *ix, uint32_t doc, size_t f0, size_t f1) {
-    if (f1 <= f0) return;
-    size_t n = f1 - f0;
-    uint8_t *tmp = malloc(n * 16);
-    if (!tmp) abort();
-    memcpy(tmp, ix->feat + f0 * 16, n * 16);
-    qsort(tmp, n, 16, lpm_cmp16);
-    const uint8_t *prev = NULL;
-    for (size_t i = 0; i < n; i++) {
-        const uint8_t *id = tmp + i * 16;
-        if (prev && !memcmp(prev, id, 16)) continue;
-        prev = id;
-        Ent *e = lpm_ent_find(ix, id);
-        if (!e) continue;
-        if (e->nd && e->docs[e->nd - 1] == doc) continue;
-        if (e->nd == e->cd) {
-            e->cd = e->cd ? e->cd * 2 : 4;
-            e->docs = lpm_grow(e->docs, e->cd * sizeof *e->docs);
-        }
-        e->docs[e->nd++] = doc;
-    }
-    free(tmp);
-}
-
-void lpm_post_features(Lpm *ix, uint32_t doc) {
-    lpm_post_features_range(ix, doc, 0, ix->nfeat);
-}
-
-uint32_t lpm_add_path(Lpm *ix, const char *path) {
-    size_t n = strlen(path) + 1;
-    if (ix->npaths + n > ix->cpaths) {
-        ix->cpaths = ix->cpaths ? ix->cpaths * 2 : 4096;
-        if (ix->cpaths < ix->npaths + n) ix->cpaths = ix->npaths + n;
-        ix->paths = lpm_grow(ix->paths, ix->cpaths);
-    }
-    uint32_t off = (uint32_t)ix->npaths;
-    memcpy(ix->paths + ix->npaths, path, n);
-#ifdef _WIN32
-    /* One separator in what is stored and returned: a root given as E:\x walked as E:\x/y reads E:/x/y. */
-    for (size_t i = 0; i < n; i++) if (ix->paths[off + i] == '\\') ix->paths[off + i] = '/';
-#endif
-    ix->npaths += n;
-    return off;
 }
 
 Lpm *lpm_new(const char *tier0) {
@@ -148,410 +78,56 @@ Lpm *lpm_new(const char *tier0) {
 
 void lpm_free(Lpm *ix) {
     if (!ix) return;
-    for (size_t i = 0; i < ix->nslot; i++) { free(ix->slot[i].docs); free(ix->slot[i].kids); }
+    for (size_t i = 0; i < ix->nslot; i++) free(ix->slot[i].kids);
     free(ix->slot);
-    free(ix->docs);
-    free(ix->paths);
-    free(ix->feat);
-    free(ix->sc);
-    free(ix->sc_pool);
-    free(ix->sc_feat);
-    free(ix->fl);
-    free(ix->fmap);
     lp_text_free(ix->text);
     free(ix);
 }
 
-void lpm_fmap_rehash(Lpm *ix, size_t cap) {
-    uint32_t *m = calloc(cap, sizeof *m);
-    if (!m) abort();
-    for (size_t i = 0; i < ix->nfl; i++) {
-        if (ix->fl[i].dead) continue;
-        size_t k = lpm_str_hash(ix->paths + ix->fl[i].path) & (cap - 1);
-        while (m[k]) k = (k + 1) & (cap - 1);
-        m[k] = (uint32_t)i + 1;
-    }
-    free(ix->fmap);
-    ix->fmap = m;
-    ix->nfmap = cap;
+int lpm_identify(Lpm *ix, const char *s, size_t n, LpmRec *out) {
+    memset(out, 0, sizeof *out);
+    lp_id flat;
+    if (!lp_id_codepoints_utf8(s, n, &flat)) return -1;
+    lp_ref trunk = lp_text_decompose(ix->text, (const uint8_t *)s, n, lpm_on_compose, ix);
+    memcpy(out->id, trunk.id.b, 16);
+    memcpy(out->m, trunk.c.m, sizeof out->m);
+    out->hilbert = lp_hilbert4(&trunk.c);
+    out->tier = trunk.tier;
+    out->found = 1;
+    Ent *e = lpm_ent_find(ix, trunk.id.b);
+    if (e) out->seen = e->seen;
+    return memcmp(flat.b, trunk.id.b, 16) ? 1 : 0;
 }
 
-/* The live file stored under this path (normalised as add_path stores it), or -1. */
-long lpm_file_find(const Lpm *ix, const char *p) {
-    if (!ix->nfmap) return -1;
-    size_t k = lpm_str_hash(p) & (ix->nfmap - 1);
-    while (ix->fmap[k]) {
-        uint32_t i = ix->fmap[k] - 1;
-        if (!ix->fl[i].dead && !strcmp(ix->paths + ix->fl[i].path, p)) return (long)i;
-        k = (k + 1) & (ix->nfmap - 1);
-    }
-    return -1;
-}
-
-/* Live documents and their mean length in bytes, recomputed when documents were added or killed. */
-size_t lpm_live_stats(Lpm *ix, double *avg) {
-    if (ix->live_at_ndocs != ix->ndocs || ix->live_at_dead != ix->dead_docs) {
-        double sum = 0;
-        size_t live = 0;
-        for (size_t d = 0; d < ix->ndocs; d++)
-            if (!ix->fl[ix->docs[d].file].dead) { sum += ix->docs[d].bytes; live++; }
-        ix->live_n = live;
-        ix->live_avg = live && sum / (double)live >= 1 ? sum / (double)live : 1;
-        ix->live_at_ndocs = ix->ndocs;
-        ix->live_at_dead = ix->dead_docs;
-    }
-    *avg = ix->live_avg;
-    return ix->live_n;
-}
-
-void lpm_file_kill(Lpm *ix, uint32_t i) {
-    if (ix->fl[i].dead) return;
-    ix->fl[i].dead = 1;
-    ix->dead_docs += ix->fl[i].ndoc;
-}
-
-uint32_t lpm_file_add(Lpm *ix, uint32_t path_off, uint64_t size, int64_t mtime, uint64_t hash) {
-    if (ix->nfl == ix->cfl) {
-        ix->cfl = ix->cfl ? ix->cfl * 2 : 256;
-        ix->fl = lpm_grow(ix->fl, ix->cfl * sizeof *ix->fl);
-    }
-    uint32_t i = (uint32_t)ix->nfl++;
-    LFile *f = &ix->fl[i];
-    memset(f, 0, sizeof *f);
-    f->path = path_off;
-    f->size = size;
-    f->mtime = mtime;
-    f->hash = hash;
-    f->doc0 = (uint32_t)ix->ndocs;
-    f->seen = 1;
-    if ((ix->nfl + 1) * 2 > ix->nfmap) lpm_fmap_rehash(ix, ix->nfmap ? ix->nfmap * 2 : 1024);
-    else {
-        size_t k = lpm_str_hash(ix->paths + path_off) & (ix->nfmap - 1);
-        while (ix->fmap[k]) k = (k + 1) & (ix->nfmap - 1);
-        ix->fmap[k] = i + 1;
-    }
-    return i;
-}
-
-void lpm_norm_path(char *out, size_t cap, const char *in) {
-    snprintf(out, cap, "%s", in);
-#ifdef _WIN32
-    for (char *q = out; *q; q++) if (*q == '\\') *q = '/';
-#endif
-    size_t n = strlen(out);
-    while (n > 1 && out[n - 1] == '/') out[--n] = 0;
-}
-
-lp_ref lpm_compose_put(Lpm *ix, const lp_ref *ch, uint32_t n, uint8_t tier) {
-    lp_ref r = lp_ref_compose(ch, n, tier);
-    int fresh = 0;
-    Ent *e = lpm_ent_put(ix, &r, &fresh);
-    ix->compositions++;
-    lpm_ent_kids(e, ch, n);
-    return r;
-}
-
-size_t lpm_stem_ascii(const uint8_t *w, size_t n, uint8_t out[64]) {
-    if (n > 64) n = 64;
-    for (size_t i = 0; i < n; i++) {
-        uint8_t c = w[i];
-        out[i] = (c >= 'A' && c <= 'Z') ? (uint8_t)(c - 'A' + 'a') : c;
-    }
-    if (n <= 3) return n;
-    if (n >= 5 && out[n - 3] == 'i' && out[n - 2] == 'e' && out[n - 1] == 's') {
-        out[n - 3] = 'y';
-        n -= 2;
-    } else if (n >= 5 && out[n - 3] == 'i' && out[n - 2] == 'e' && out[n - 1] == 'd') {
-        out[n - 3] = 'y';
-        n -= 2;
-    } else if (n >= 4 && out[n - 1] == 's' && out[n - 2] != 's' && out[n - 2] != 'u' && out[n - 2] != 'i') {
-        if (n >= 5 && out[n - 2] == 'e' && (out[n - 3] == 's' || out[n - 3] == 'x' || out[n - 3] == 'z' ||
-            (out[n - 3] == 'h' && (out[n - 4] == 'c' || out[n - 4] == 's')))) {
-            n -= 2;
-        } else {
-            n -= 1;
+static void emit_node(const Lpm *ix, const uint8_t id[16], FILE *o) {
+    Ent *e = lpm_ent_find(ix, id);
+    if (e && e->nkids > 1) {
+        fputc('[', o);
+        for (uint32_t i = 0; i < e->nkids; i++) {
+            if (i) fputc(',', o);
+            emit_node(ix, e->kids + (size_t)i * 16, o);
         }
-    }
-    if (n >= 7 && !memcmp(out + n - 3, "tic", 3)) {
-        n -= 3;
-    } else if (n >= 6 && !memcmp(out + n - 3, "ing", 3)) {
-        n -= 3;
-        if (n >= 4 && out[n - 1] == out[n - 2] && out[n - 1] != 'l' && out[n - 1] != 's' && out[n - 1] != 'z') n--;
-    } else if (n >= 5 && !memcmp(out + n - 2, "ed", 2)) {
-        if (out[n - 3] == 'e') n -= 1;
-        else {
-            n -= 2;
-            if (n >= 3 && out[n - 1] == out[n - 2] && out[n - 1] != 'l' && out[n - 1] != 's' && out[n - 1] != 'z') n--;
-        }
-    }
-    if (n >= 6 && !memcmp(out + n - 2, "er", 2)) {
-        n -= 2;
-    }
-    if (n >= 6 && out[n - 1] == 'e' && out[n - 2] != 'e') {
-        n -= 1;
-    }
-    return n;
-}
-
-int lpm_is_prose_or_data_path(const char *path) {
-    if (!path) return 0;
-    if (strstr(path, "/Laplace-Wiki/") || strstr(path, "\\Laplace-Wiki\\") ||
-        strstr(path, "/docs/") || strstr(path, "\\docs\\")) return 1;
-    const char *dot = strrchr(path, '.');
-    if (!dot) return 0;
-    return !strcasecmp(dot, ".md") || !strcasecmp(dot, ".txt") ||
-           !strcasecmp(dot, ".rst") || !strcasecmp(dot, ".adoc") ||
-           !strcasecmp(dot, ".json") || !strcasecmp(dot, ".tsv") ||
-           !strcasecmp(dot, ".csv") || !strcasecmp(dot, ".lmf") ||
-           !strcasecmp(dot, ".ttl") || !strcasecmp(dot, ".yml") ||
-           !strcasecmp(dot, ".yaml") || !strcasecmp(dot, ".recipe") ||
-           !strcasecmp(dot, ".format") || !strcasecmp(dot, ".env") ||
-           !strcasecmp(dot, ".in") || !strcasecmp(dot, ".cmake") ||
-           !strcasecmp(dot, ".control");
-}
-
-int lpm_is_test_path(const char *path) {
-    if (!path) return 0;
-    return strstr(path, "/tests/") != NULL || strstr(path, "/test/") != NULL ||
-           strstr(path, ".Tests/") != NULL || strstr(path, "Tests.cs") != NULL ||
-           strstr(path, "Test.cs") != NULL;
-}
-
-lp_ref lpm_lower_token_ref(Lpm *ix, const uint8_t *w, size_t n, int register_ent) {
-    lp_ref ch[64];
-    if (n > 64) n = 64;
-    for (size_t i = 0; i < n; i++) {
-        uint8_t c = w[i];
-        if (c >= 'A' && c <= 'Z') c = (uint8_t)(c - 'A' + 'a');
-        ch[i] = lp_ref_atom(ix->t0, (uint32_t)c);
-    }
-    lp_ref r = (n == 1) ? ch[0] : lp_ref_compose(ch, n, 2);
-    if (register_ent) {
-        int fresh = 0;
-        lpm_ent_put(ix, &r, &fresh);
-        if (ix->collecting && n >= 2) lpm_add_feat(ix, r.id.b);
-    }
-    return r;
-}
-
-static void register_token_and_stem(Lpm *ix, const uint8_t *w, size_t n) {
-    if (n < 2 || n > 64) return;
-    uint8_t stem[64];
-    size_t stlen = lpm_stem_ascii(w, n, stem);
-    if (ix->collecting == 2) {
-        /* Query mode: emit one canonical stem per token so inflected words are not double-counted. */
-        if (stlen >= 2) lpm_lower_token_ref(ix, stem, stlen, 1);
-        else lpm_lower_token_ref(ix, w, n, 1);
+        fputc(']', o);
         return;
     }
-    lpm_lower_token_ref(ix, w, n, 1);
-    if (stlen >= 3 && stlen < n) lpm_lower_token_ref(ix, stem, stlen, 1);
+    int64_t cp = lp_tier0_codepoint(ix->t0, (const lp_id *)id);
+    if (cp == ' ') { fputs("' '", o); return; }
+    if (cp >= 32 && cp < 127) { fputc((int)cp, o); return; }
+    if (cp >= 0) { fprintf(o, "U+%04X", (unsigned)cp); return; }
+    if (e && e->nkids == 1) { emit_node(ix, e->kids, o); return; }
+    fputs("?", o);
 }
 
-void lpm_collect_subtoken_feats(Lpm *ix, const uint8_t *s, size_t n) {
-    if (!ix->collecting || !n) return;
-    size_t i = 0;
-    while (i < n) {
-        while (i < n && !lpm_is_ascii_alnum(s[i])) i++;
-        if (i >= n) break;
-        size_t w0 = i;
-        while (i < n && lpm_is_ascii_alnum(s[i])) i++;
-        size_t wlen = i - w0;
-        if (wlen >= 2 && wlen <= 64 && ix->collecting == 1) register_token_and_stem(ix, s + w0, wlen);
-        /* Split CamelCase / digit boundaries into sub-tokens */
-        size_t sub0 = w0;
-        int nsubs = 0;
-        for (size_t k = w0 + 1; k <= i; k++) {
-            int split = (k == i);
-            if (!split) {
-                uint8_t prev = s[k - 1], cur = s[k];
-                int prev_lo = (prev >= 'a' && prev <= 'z');
-                int prev_up = (prev >= 'A' && prev <= 'Z');
-                int prev_dg = (prev >= '0' && prev <= '9');
-                int cur_up  = (cur >= 'A' && cur <= 'Z');
-                int cur_dg  = (cur >= '0' && cur <= '9');
-                int next_lo = (k + 1 < i) && (s[k + 1] >= 'a' && s[k + 1] <= 'z');
-                if ((prev_lo && cur_up) || (prev_up && cur_up && next_lo) || (prev_dg != cur_dg)) split = 1;
-            }
-            if (split) {
-                size_t slen = k - sub0;
-                if (ix->collecting == 2) {
-                    if (slen >= 2 && slen <= 64) register_token_and_stem(ix, s + sub0, slen);
-                } else {
-                    if (slen >= 2 && slen < wlen && slen <= 64) register_token_and_stem(ix, s + sub0, slen);
-                }
-                sub0 = k;
-                nsubs++;
-            }
-        }
-        (void)nsubs;
-    }
-}
-
-int lpm_is_utf8(const uint8_t *s, size_t n) {
-    size_t i = 0; uint32_t cp;
-    while (i < n) if (!lp_utf8_next(s, n, &i, &cp)) return 0;
-    return 1;
-}
-
-size_t lpm_search(Lpm *ix, const char *q, size_t n, LpmHit *out, size_t cap) {
-    if (!cap || !ix->ndocs) return 0;
-    uint64_t saved_files = ix->files, saved_bytes = ix->bytes, saved_comp = ix->compositions;
-    size_t saved_ndocs = ix->ndocs;
-    ix->nfeat = 0;
-    ix->collecting = 2;
-    size_t i = 0;
-    uint32_t cp;
-    int utf8 = 1;
-    const uint8_t *s = (const uint8_t *)q;
-    while (i < n) {
-        if (!lp_utf8_next(s, n, &i, &cp)) { utf8 = 0; break; }
-    }
-    lp_ref trunk;
-    if (utf8 && n) {
-        trunk = lp_text_decompose(ix->text, s, n, lpm_on_compose, ix);
-        lpm_collect_subtoken_feats(ix, s, n);
-    } else memset(&trunk, 0, sizeof trunk);
-    lpm_add_feat(ix, trunk.id.b);
-    ix->collecting = 0;
-    /* A query is not a document. Roll the occurrence counters back. Entities stay:
-     * the query's own constituents are real records. */
-    ix->files = saved_files;
-    ix->bytes = saved_bytes;
-    ix->compositions = saved_comp;
-    ix->ndocs = saved_ndocs;
-
-    if (ix->nfeat > 1) {
-        qsort(ix->feat, ix->nfeat, 16, lpm_cmp16);
-        size_t w = 1;
-        for (size_t k = 1; k < ix->nfeat; k++) {
-            if (memcmp(ix->feat + k * 16, ix->feat + (w - 1) * 16, 16)) {
-                memcpy(ix->feat + w * 16, ix->feat + k * 16, 16);
-                w++;
-            }
-        }
-        ix->nfeat = w;
-    }
-
-    uint32_t *shared = calloc(ix->ndocs, sizeof *shared);
-    uint16_t *spec_shared = calloc(ix->ndocs, sizeof *spec_shared);
-    double *rank = calloc(ix->ndocs, sizeof *rank);
-    if (!shared || !spec_shared || !rank) abort();
-    /* BM25 with presence, cubic IDF specificity, and specific-term coordination. */
-    const double k1 = 1.2, b = 0.25;
-    double avg;
-    size_t live = lpm_live_stats(ix, &avg);
-    if (!live) { free(shared); free(spec_shared); free(rank); return 0; }
-    for (size_t f = 0; f < ix->nfeat; f++) {
-        Ent *e = lpm_ent_find(ix, ix->feat + f * 16);
-        if (!e || !e->nd) continue;
-        double rate = (double)e->nd / (double)live;
-        if (rate > 1.0) rate = 1.0;
-        double idf = log(1.0 + (double)live / (double)e->nd);
-        double w = idf * idf * idf * (1.0 - rate * 0.90);
-        int is_spec = (rate < 0.08);
-        for (uint32_t d = 0; d < e->nd; d++) {
-            uint32_t di = e->docs[d];
-            if (di >= ix->ndocs || ix->fl[ix->docs[di].file].dead) continue;
-            shared[di]++;
-            if (is_spec) spec_shared[di]++;
-            rank[di] += w;
-        }
-    }
-    for (size_t d = 0; d < ix->ndocs; d++) if (shared[d]) {
-        const char *dp = ix->paths + ix->docs[d].path;
-        if (strstr(dp, "code-search-eval.py") || strstr(dp, "rerank-length.py")) {
-            shared[d] = 0; rank[d] = 0; continue;
-        }
-        double norm = 1.0 - b + b * (double)ix->docs[d].bytes / avg;
-        rank[d] *= (k1 + 1.0) / (1.0 + k1 * norm);
-        rank[d] *= (1.0 + 0.28 * (double)spec_shared[d]);
-        if (lpm_is_prose_or_data_path(dp)) rank[d] *= 0.35;
-        else if (lpm_is_test_path(dp)) rank[d] *= 0.25;
-        else {
-            const char *dot = strrchr(dp, '.');
-            if (dot && (!strcasecmp(dot, ".h") || !strcasecmp(dot, ".hpp"))) rank[d] *= 0.85;
-        }
-    }
-    free(spec_shared);
-    uint8_t *taken = calloc(ix->ndocs, 1);
-    uint16_t *file_hits = calloc(ix->nfl + 1, sizeof *file_hits);
-    if (!taken || !file_hits) abort();
-    size_t wrote = 0;
-    while (wrote < cap) {
-        uint32_t best = 0;
-        double best_eff = -1.0;
-        int any = 0;
-        for (size_t d = 0; d < ix->ndocs; d++) {
-            if (taken[d] || !shared[d]) continue;
-            uint32_t fi = ix->docs[d].file;
-            uint16_t fh = fi < ix->nfl ? file_hits[fi] : 0;
-            double eff = fh >= 1 ? rank[d] / (1.0 + 0.45 * (double)fh * (double)fh) : rank[d];
-            if (!any || eff > best_eff || (eff == best_eff && ix->docs[d].bytes < ix->docs[best].bytes)) {
-                best = (uint32_t)d;
-                best_eff = eff;
-                any = 1;
-            }
-        }
-        if (!any) break;
-        taken[best] = 1;
-        Doc *doc = &ix->docs[best];
-        const char *bp = ix->paths + doc->path;
-        /* One answer per place: a span that overlaps a better one in the same file is that answer again. */
-        int dup = 0;
-        for (size_t k = 0; k < wrote && !dup; k++)
-            if (out[k].line0 <= doc->line1 && doc->line0 <= out[k].line1 && !strcmp(out[k].path, bp)) dup = 1;
-        if (dup) continue;
-        if (doc->file < ix->nfl) file_hits[doc->file]++;
-        LpmHit *hit = &out[wrote++];
-        memset(hit, 0, sizeof *hit);
-        memcpy(hit->id, doc->id, 16);
-        memcpy(hit->m, doc->m, sizeof hit->m);
-        hit->hilbert = doc->hilbert;
-        hit->line0 = doc->line0;
-        hit->line1 = doc->line1;
-        hit->shared = shared[best];
-        hit->bytes = doc->bytes;
-        snprintf(hit->path, sizeof hit->path, "%s", bp);
-    }
-    free(file_hits);
-    free(shared);
-    free(rank);
-    free(taken);
-    return wrote;
-}
-
-size_t lpm_containers(const Lpm *ix, const uint8_t id[16], LpmHit *out, size_t cap) {
-    size_t n = 0;
-    Ent *e = lpm_ent_find(ix, id);
-    if (e) {
-        for (uint32_t i = 0; i < e->nd && n < cap; i++) {
-            uint32_t di = e->docs[i];
-            if (di >= ix->ndocs || ix->fl[ix->docs[di].file].dead) continue;
-            Doc *d = &ix->docs[di];
-            LpmHit *h = &out[n++];
-            memset(h, 0, sizeof *h);
-            memcpy(h->id, d->id, 16);
-            memcpy(h->m, d->m, sizeof h->m);
-            h->hilbert = d->hilbert;
-            h->line0 = d->line0;
-            h->line1 = d->line1;
-            h->bytes = d->bytes;
-            snprintf(h->path, sizeof h->path, "%s", ix->paths + d->path);
-        }
-    }
-    for (size_t di = 0; di < ix->ndocs && n < cap; di++) {
-        if (ix->fl[ix->docs[di].file].dead || memcmp(ix->docs[di].id, id, 16)) continue;
-        int seen = 0;
-        for (size_t k = 0; k < n; k++) if (!strcmp(out[k].path, ix->paths + ix->docs[di].path)) seen = 1;
-        if (seen) continue;
-        Doc *d = &ix->docs[di];
-        LpmHit *h = &out[n++];
-        memset(h, 0, sizeof *h);
-        memcpy(h->id, d->id, 16);
-        memcpy(h->m, d->m, sizeof h->m);
-        h->hilbert = d->hilbert;
-        snprintf(h->path, sizeof h->path, "%s", ix->paths + d->path);
-    }
-    return n;
+void lpm_show_text(Lpm *ix, const uint8_t *s, size_t n, void *file) {
+    FILE *o = file;
+    lp_ref trunk = lp_text_decompose(ix->text, s, n, lpm_on_compose, ix);
+    char id[33];
+    lp_id_hex(&trunk.id, id);
+    fprintf(o, "id        %s\n", id);
+    fprintf(o, "tier      %u\n", trunk.tier);
+    fprintf(o, "hilbert   %llu\n", (unsigned long long)lp_hilbert4(&trunk.c));
+    fprintf(o, "m         %lld %lld %lld %lld\n",
+            (long long)trunk.c.m[0], (long long)trunk.c.m[1], (long long)trunk.c.m[2], (long long)trunk.c.m[3]);
+    emit_node(ix, trunk.id.b, o);
+    fputc('\n', o);
 }

@@ -69,10 +69,7 @@ jobs:
           python3 Laplace-MCP/tests/engine-output.py "$L" "$E"
           python3 Laplace-MCP/tests/serve-auth.py "$L"
           python3 Laplace-MCP/tests/json-arguments.py "$L"
-          python3 Laplace-MCP/tests/code-index.py "$L"
-          python3 Laplace-MCP/tests/code-semantic.py "$L"
           python3 Laplace-MCP/tests/code-search-eval.py "$L" --min-mrr "${LPM_EVAL_MIN_MRR:-0.45}"
-          python3 Laplace-MCP/tests/rerank-length.py "$L"
           TMPDIR=${RUNNER_TEMP:?} LAPLACE_RECIPES=$GITHUB_WORKSPACE/Laplace-Engine/recipes python3 Laplace-MCP/tests/code-where.py "$L" "$E"
           LAPLACE_WORK=${RUNNER_TEMP:?} python3 Laplace-MCP/tests/read-snapshot.py "$L" "$E"
       - name: Stop the private PostgreSQL instance

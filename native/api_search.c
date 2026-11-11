@@ -1,243 +1,169 @@
 #define _GNU_SOURCE
 #include "api_internal.h"
-#include "lpm_internal.h"
 
-/* LAPLACE_CODE_ROOTS, each existing root in turn. */
-static void code_roots(void (*fn)(const char *root, void *ud), void *ud) {
-    const char *roots = getenv("LAPLACE_CODE_ROOTS");
-    if (!roots || !*roots) return;
-    char *copy = strdup(roots);
-    char *p = copy;
-    while (p && *p) {
-#ifdef _WIN32
-        char *sep = strchr(p, ';');
-#else
-        char *sep = strchr(p, ':');
-        if (!sep) sep = strchr(p, ';');
-#endif
-        if (sep) *sep = 0;
-        if (*p && os_exists(p)) fn(p, ud);
-        p = sep ? sep + 1 : NULL;
-    }
-    free(copy);
-}
+/* ---- code_search over the substrate: what an ingested source's files hold, read off the containment index. Nothing is
+ * indexed here and nothing is read from a working tree.
+ *
+ * The query is decomposed as everything is (Native UAX #29): its word segments, and each run of segments with no space
+ * between them (an identifier such as lp_ref_compose, a dotted or hyphenated name), are its terms, each the same entity
+ * wherever that content was recorded. From the terms the Engine's reader walks up the container index to the files that
+ * hold them (held_up), every node carrying which terms are below it. A term held directly by more than LAPLACE_CODE_HUB
+ * paths of a kind is a hub and is not walked. Files are those of the source's witness (LAPLACE_CODE_SOURCE, the witness's
+ * name, default "Laplace Workspace"); each scores the inverse document frequency, over those files, of the terms it
+ * holds. The retrieval unit of a file is the lowest node of its content that holds every term the file holds (their
+ * common ancestor), else the lowest that holds the most of them; its lines are where its recorded text stands in the
+ * file's recorded text. */
 
-static void root_index(const char *root, void *ud) { lpm_index_path((Lpm *)ud, root); }
-
-typedef struct { Lpm *ix; LpmUpdate u; } RootUpdate;
-static void root_update(const char *root, void *ud) {
-    RootUpdate *r = ud;
-    lpm_update_path(r->ix, root, &r->u);
-}
-
-static Lpm *code_build(void) {
-    Lpm *ix = lpm_new(NULL);
-    if (ix) code_roots(root_index, ix);
-    return ix;
-}
-
-static time_t CODE_CHECKED;
-
-/* Bring the index up to date with its roots. Unchanged files are not read. When the documents of changed and
- * removed files pass 30% of all of them, the index is built again from the roots. Saved when anything moved. */
-static int code_refresh(LpmUpdate *u, int *rebuilt) {
-    RootUpdate r = { CODE_IX, {0} };
-    code_roots(root_update, &r);
-    *u = r.u;
-    *rebuilt = 0;
-    LpmStats st;
-    lpm_stats(CODE_IX, &st);
-    if (st.stale * 10 > (st.documents + st.stale) * 3) {
-        Lpm *fresh = code_build();
-        if (!fresh) return -1;
-        lpm_free(CODE_IX);
-        CODE_IX = fresh;
-        *rebuilt = 1;
-    }
-    const char *rec = getenv("LAPLACE_CODE_RECORDS");
-    if (rec && *rec && (u->changed || u->added || u->removed || *rebuilt) && lpm_save(CODE_IX, rec)) return -1;
-    CODE_CHECKED = time(NULL);
+static int is_prose_or_data_path(const char *path) {
+    if (!path) return 0;
+    if (strstr(path, "/Laplace-Wiki/") || strstr(path, "\\Laplace-Wiki\\") ||
+        strstr(path, "/docs/") || strstr(path, "\\docs\\")) return 1;
+    const char *dot = strrchr(path, '.');
+    if (!dot) return 0;
+    static const char *const EXT[] = { ".md", ".txt", ".rst", ".adoc", ".json", ".tsv", ".csv", ".lmf", ".ttl", ".yml",
+                                       ".yaml", ".recipe", ".format", ".env", ".in", ".cmake", ".control" };
+    for (size_t i = 0; i < sizeof EXT / sizeof *EXT; i++) if (!strcasecmp(dot, EXT[i])) return 1;
     return 0;
 }
 
-/* The code index: the saved records when they load, else built from the roots (and saved). It is brought up to
- * date with its roots when it loads and then at most every LAPLACE_CODE_REFRESH_SECONDS (default 30; 0 never). */
-static Lpm *ensure_code_ix(void) {
-    const char *rec = getenv("LAPLACE_CODE_RECORDS");
-    if (!CODE_IX) {
-        if (rec && *rec && os_exists(rec)) CODE_IX = lpm_load(rec, NULL);
-        if (!CODE_IX) {
-            CODE_IX = code_build();
-            if (!CODE_IX) return NULL;
-            if (rec && *rec) lpm_save(CODE_IX, rec);
-            CODE_CHECKED = time(NULL);
-            return CODE_IX;
-        }
-        CODE_CHECKED = 0;
+static int is_test_path(const char *path) {
+    if (!path) return 0;
+    return strstr(path, "/tests/") != NULL || strstr(path, "/test/") != NULL ||
+           strstr(path, ".Tests/") != NULL || strstr(path, "Tests.cs") != NULL ||
+           strstr(path, "Test.cs") != NULL;
+}
+
+/* ---- the terms of a text: its word segments that hold a letter or digit, and its runs of segments with no space
+ * between them, each once, at most 64, in the order they first stand. */
+typedef struct { lp_id id[64]; char text[64][128]; int n; } Terms;
+typedef struct { size_t at, len; } Seg;
+typedef lp_vec(Seg) Segs;
+static void seg_put(void *sink, size_t offset, size_t length, const lp_ref *value) {
+    (void)value;
+    lp_push((Segs *)sink, ((Seg){ offset, length }));
+}
+static int seg_word(const char *s, const Seg *g) {
+    for (size_t i = 0; i < g->len; i++) {
+        unsigned char ch = (unsigned char)s[g->at + i];
+        if (ch >= 0x80 || isalnum(ch)) return 1;
     }
-    const char *ev = getenv("LAPLACE_CODE_REFRESH_SECONDS");
-    long every = ev && *ev ? strtol(ev, NULL, 10) : 30;
-    if (every > 0 && time(NULL) - CODE_CHECKED >= every) {
-        LpmUpdate u;
-        int rebuilt;
-        if (code_refresh(&u, &rebuilt)) return NULL;
-    }
-    return CODE_IX;
+    return 0;
 }
-
-static void read_lines_snippet(const char *path, uint32_t line0, uint32_t line1, char *out, size_t cap) {
-    out[0] = 0;
-    if (!path || !*path || cap < 2) return;
-    FILE *f = fopen(path, "rb");
-    if (!f) return;
-    if (line0 == 0) line0 = 1;
-    if (line1 < line0 || line1 - line0 > 60) line1 = line0 + 60;
-    uint32_t cur = 1;
-    size_t u = 0;
-    int ch;
-    while ((ch = fgetc(f)) != EOF) {
-        if (cur >= line0 && cur <= line1) {
-            if (ch != '\r' && u + 1 < cap) out[u++] = (char)ch;
+static int seg_space(const char *s, const Seg *g) {
+    for (size_t i = 0; i < g->len; i++) if (!isspace((unsigned char)s[g->at + i])) return 0;
+    return 1;
+}
+static void term_add(Terms *t, const char *s, size_t at, size_t len) {
+    if (t->n >= 64 || !len) return;
+    lp_id id;
+    if (!lp_text_id(TX, s + at, len, &id)) return;
+    for (int i = 0; i < t->n; i++) if (!memcmp(t->id[i].b, id.b, 16)) return;
+    t->id[t->n] = id;
+    size_t l = len < sizeof t->text[0] - 1 ? len : sizeof t->text[0] - 1;
+    memcpy(t->text[t->n], s + at, l);
+    t->text[t->n][l] = 0;
+    t->n++;
+}
+static void code_terms(const char *s, Terms *t) {
+    memset(t, 0, sizeof *t);
+    size_t n = strlen(s);
+    if (!TX || !n) return;
+    Segs segs = { 0 };
+    lp_text_segments(TX, (const uint8_t *)s, n, seg_put, &segs);
+    for (size_t i = 0; i < segs.n;) {
+        if (seg_space(s, &segs.v[i])) { i++; continue; }
+        size_t j = i, words = 0;
+        while (j < segs.n && !seg_space(s, &segs.v[j])) {
+            if (seg_word(s, &segs.v[j])) { term_add(t, s, segs.v[j].at, segs.v[j].len); words++; }
+            j++;
         }
-        if (ch == '\n') {
-            cur++;
-            if (cur > line1) break;
-        }
+        if (j - i > 1 && words) term_add(t, s, segs.v[i].at, segs.v[j - 1].at + segs.v[j - 1].len - segs.v[i].at);
+        i = j;
     }
-    out[u] = 0;
-    fclose(f);
+    lp_vec_free(&segs);
 }
 
-static const char *tail_path_segments(const char *path, int nseg) {
-    if (!path || !*path) return "";
-    const char *p = path + strlen(path);
-    int seen = 0;
-    while (p > path) {
-        p--;
-        if (*p == '/' || *p == '\\') {
-            seen++;
-            if (seen == nseg) return p + 1;
-        }
+/* Inverse document frequency of a term held by df of n documents. */
+static double term_idf(double df, double n) { return log(1.0 + (n - df + 0.5) / (df + 0.5)); }
+
+/* ---- the files of a source: the witness or witnesses named so (laplace_witness_trust; the first part of each trunk is
+ * its source record), and the files under each trunk, through whatever spine holds them. Kept until the witnesses change. */
+static lp_idmap *SCOPE;
+static char SCOPE_NAME[256];
+static uint8_t SCOPE_SIG[16];
+static int SCOPE_WITNESSES;
+static lp_idmap *code_scope(PGconn *pg, Reader *rd, const char *name, int *witnesses) {
+    PGresult *r = db_exec_params(pg, "SELECT witness FROM @extschema@.laplace_witness_trust() ORDER BY witness", 0, NULL, NULL, NULL, NULL, 1);
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); *witnesses = 0; return NULL; }
+    int nw = PQntuples(r);
+    lp_id *w = malloc(sizeof *w * (size_t)(nw ? nw : 1));
+    uint8_t sig[16] = { 0 };
+    for (int i = 0; i < nw; i++) {
+        memcpy(w[i].b, PQgetvalue(r, i, 0), 16);
+        for (int b = 0; b < 16; b++) sig[b] ^= w[i].b[b];
     }
-    return path;
-}
-
-static double basename_stem_boost(const char *path, const char *query) {
-    const char *base = tail_path_segments(path, 1);
-    if (!base || !*base || !query || !*query) return 1.0;
-    size_t blen = strlen(base);
-    const char *dot = strrchr(base, '.');
-    if (dot && dot > base) blen = (size_t)(dot - base);
-
-    uint8_t qstems[64][64];
-    size_t qslen[64];
-    size_t nq = 0;
-    size_t i = 0, qn = strlen(query);
-    while (i < qn && nq < 64) {
-        while (i < qn && !lpm_is_ascii_alnum((uint8_t)query[i])) i++;
-        if (i >= qn) break;
-        size_t w0 = i;
-        while (i < qn && lpm_is_ascii_alnum((uint8_t)query[i])) i++;
-        size_t sub0 = w0;
-        for (size_t k = w0 + 1; k <= i && nq < 64; k++) {
-            int split = (k == i);
-            if (!split) {
-                uint8_t prev = (uint8_t)query[k - 1], cur = (uint8_t)query[k];
-                int prev_lo = (prev >= 'a' && prev <= 'z');
-                int prev_up = (prev >= 'A' && prev <= 'Z');
-                int prev_dg = (prev >= '0' && prev <= '9');
-                int cur_up  = (cur >= 'A' && cur <= 'Z');
-                int cur_dg  = (cur >= '0' && cur <= '9');
-                int next_lo = (k + 1 < i) && (query[k + 1] >= 'a' && query[k + 1] <= 'z');
-                if ((prev_lo && cur_up) || (prev_up && cur_up && next_lo) || (prev_dg != cur_dg)) split = 1;
-            }
-            if (split) {
-                size_t slen = k - sub0;
-                if (slen >= 3 && slen <= 64) {
-                    qslen[nq] = lpm_stem_ascii((const uint8_t *)query + sub0, slen, qstems[nq]);
-                    if (qslen[nq] >= 3) nq++;
-                }
-                sub0 = k;
-            }
-        }
+    PQclear(r);
+    if (SCOPE_NAME[0] && !strcmp(SCOPE_NAME, name) && !memcmp(SCOPE_SIG, sig, 16)) { free(w); *witnesses = SCOPE_WITNESSES; return SCOPE; }
+    int nh = 0;
+    Hold *h = paths_of(pg, w, nw, &nh);
+    free(w);
+    lp_vec(lp_id) records = { 0 };
+    lp_vec(int) rows = { 0 };
+    lp_vec(lp_vertex) vx = { 0 };
+    for (int j = 0; j < nh; j++) {
+        size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
+        if (!nv) continue;
+        lp_vec_reserve(&vx, nv);
+        lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
+        lp_push(&records, vx.v[0].id);
+        lp_push(&rows, j);
     }
-
-    int matches = 0;
-    i = 0;
-    while (i < blen) {
-        while (i < blen && !lpm_is_ascii_alnum((uint8_t)base[i])) i++;
-        if (i >= blen) break;
-        size_t w0 = i;
-        while (i < blen && lpm_is_ascii_alnum((uint8_t)base[i])) i++;
-        size_t sub0 = w0;
-        for (size_t k = w0 + 1; k <= i; k++) {
-            int split = (k == i);
-            if (!split) {
-                uint8_t prev = (uint8_t)base[k - 1], cur = (uint8_t)base[k];
-                int prev_lo = (prev >= 'a' && prev <= 'z');
-                int prev_up = (prev >= 'A' && prev <= 'Z');
-                int prev_dg = (prev >= '0' && prev <= '9');
-                int cur_up  = (cur >= 'A' && cur <= 'Z');
-                int cur_dg  = (cur >= '0' && cur <= '9');
-                int next_lo = (k + 1 < i) && (base[k + 1] >= 'a' && base[k + 1] <= 'z');
-                if ((prev_lo && cur_up) || (prev_up && cur_up && next_lo) || (prev_dg != cur_dg)) split = 1;
-            }
-            if (split) {
-                size_t slen = k - sub0;
-                if (slen >= 3 && slen <= 64) {
-                    uint8_t bstem[64];
-                    size_t bslen = lpm_stem_ascii((const uint8_t *)base + sub0, slen, bstem);
-                    if (bslen >= 3) {
-                        for (size_t m = 0; m < nq; m++) {
-                            if (qslen[m] == bslen && !memcmp(qstems[m], bstem, bslen)) {
-                                matches++;
-                                break;
-                            }
-                        }
-                    }
-                }
-                sub0 = k;
-            }
+    reader_prefetch(rd, records.v, records.n, sizeof SCOPE_NAME);
+    lp_idmap *files = lp_idmap_new(), *front = lp_idmap_new();
+    int matched = 0;
+    for (size_t i = 0; i < records.n; i++) {
+        char *t = reader_text(rd, &records.v[i], sizeof SCOPE_NAME);
+        if (!strcmp(t, name)) {
+            const Hold *x = &h[rows.v[i]];
+            size_t nv = lp_path_vertices(x->path, (size_t)x->path_len, NULL, 0);
+            lp_vec_reserve(&vx, nv);
+            lp_path_vertices(x->path, (size_t)x->path_len, vx.v, nv);
+            for (size_t k = 1; k < nv; k++) lp_idmap_put(front, &vx.v[k].id, NULL);
+            matched++;
         }
+        free(t);
     }
-    if (!matches) return 1.0;
-    if (matches == 1) return 1.03;
-    double boost = 1.0 + 0.14 * (double)matches;
-    return boost > 1.35 ? 1.35 : boost;
+    holds_free(h, nh);
+    lp_vec_free(&records);
+    lp_vec_free(&rows);
+    /* down the spine to the files: a node whose first vertex is the OS's record is a file */
+    for (int depth = 0; depth < 16 && lp_idmap_count(front); depth++) {
+        Hold *p = paths_of(pg, lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
+        lp_idmap *next = lp_idmap_new();
+        for (int j = 0; j < nh; j++) {
+            size_t nv = lp_path_vertices(p[j].path, (size_t)p[j].path_len, NULL, 0);
+            if (!nv) continue;
+            lp_vec_reserve(&vx, nv);
+            lp_path_vertices(p[j].path, (size_t)p[j].path_len, vx.v, nv);
+            if (vx.v[0].said == LP_SAID_METADATA) { lp_idmap_put(files, &p[j].entity, NULL); continue; }
+            for (size_t k = 0; k < nv; k++) if (lp_idmap_find(files, &vx.v[k].id) < 0) lp_idmap_put(next, &vx.v[k].id, NULL);
+        }
+        holds_free(p, nh);
+        lp_idmap_free(front);
+        front = next;
+    }
+    lp_idmap_free(front);
+    lp_vec_free(&vx);
+    if (!matched) { lp_idmap_free(files); files = NULL; }
+    lp_idmap_free(SCOPE);
+    SCOPE = files;
+    snprintf(SCOPE_NAME, sizeof SCOPE_NAME, "%s", name);
+    memcpy(SCOPE_SIG, sig, 16);
+    SCOPE_WITNESSES = matched;
+    *witnesses = matched;
+    return files;
 }
 
-/* A code_search candidate from the multi-tier Laplace AST/text index, reranked by 4D Frechet trajectory distance. */
-typedef struct {
-    char path[4096];
-    uint32_t line0, line1;
-    int lexical;
-    int lex_rank, rr_rank;          /* where the constituent retrieval and the 4D Frechet rerank put it, from 1 */
-    double fused;
-    uint8_t id[16];
-    uint64_t hilbert;
-    uint32_t shared;
-    double rerank, frechet;
-    char *snippet;
-} CodeCand;
-
-static int cand_rerank_cmp(const void *a, const void *b) {
-    const CodeCand *x = *(CodeCand *const *)a, *y = *(CodeCand *const *)b;
-    if (x->rerank != y->rerank) return x->rerank < y->rerank ? 1 : -1;
-    if (x->shared != y->shared) return x->shared < y->shared ? 1 : -1;
-    return (int)(x->line1 - x->line0) - (int)(y->line1 - y->line0);
-}
-static int cand_rerank_cmp_v(const void *a, const void *b) {
-    const CodeCand *x = a, *y = b;
-    return cand_rerank_cmp(&x, &y);
-}
-static int cand_cmp(const void *a, const void *b) {
-    const CodeCand *x = a, *y = b;
-    if (x->fused != y->fused) return x->fused < y->fused ? 1 : -1;
-    if (x->rerank != y->rerank) return x->rerank < y->rerank ? 1 : -1;
-    return (int)(x->line1 - x->line0) - (int)(y->line1 - y->line0);
-}
-
-/* A weight from the environment: unset keeps *w; a number in [0, 1] replaces it; anything else is 0 (refused). */
 static int env_weight(const char *name, double *w) {
     const char *v = getenv(name);
     if (!v || !*v) return 1;
@@ -246,6 +172,13 @@ static int env_weight(const char *name, double *w) {
     if (e == v || *e || !(x >= 0.0 && x <= 1.0)) return 0;
     *w = x;
     return 1;
+}
+static long env_long(const char *name, long dflt) {
+    const char *v = getenv(name);
+    if (!v || !*v) return dflt;
+    char *e = NULL;
+    long x = strtol(v, &e, 10);
+    return e == v || *e ? dflt : x;
 }
 
 static int bridge_word_ok(const char *w) {
@@ -342,59 +275,143 @@ static char *bridge_query(const char *query, char *info, size_t icap, double *ms
     return out;
 }
 
+/* ---- one hit: a file, its score, and the unit of its content that answers */
+typedef struct {
+    lp_id file, unit;
+    double score, prior, seed;
+    uint64_t keys;
+    int shared, rank;
+    char *path, *snippet;
+    size_t line0, line1;
+    int64_t hilbert;
+} CodeHit;
+static int hit_cmp(const void *a, const void *b) {
+    const CodeHit *x = a, *y = b;
+    double sx = x->score * x->prior, sy = y->score * y->prior;
+    if (sx != sy) return sx < sy ? 1 : -1;
+    if (x->shared != y->shared) return y->shared - x->shared;
+    return memcmp(x->file.b, y->file.b, 16);
+}
+static int seed_cmp(const void *a, const void *b) {
+    const CodeHit *x = a, *y = b;
+    if (x->seed != y->seed) return x->seed < y->seed ? 1 : -1;
+    return memcmp(x->file.b, y->file.b, 16);
+}
+static int popcount64(uint64_t x) { int n = 0; while (x) { x &= x - 1; n++; } return n; }
+static size_t lines_to(const char *text, size_t upto) {
+    size_t l = 1;
+    for (size_t i = 0; i < upto && text[i]; i++) if (text[i] == '\n') l++;
+    return l;
+}
+
+/* A node's constituents as the reader holds them (what a record says, its claims, is not among them). */
+static size_t dag_parts(Reader *rd, const lp_id *id, lp_id **buf, size_t *cap) {
+    if (!*cap) { *cap = 64; *buf = malloc(sizeof **buf * *cap); }
+    for (;;) {
+        size_t n = reader_parts(rd, id, *buf, *cap);
+        if (n < *cap) return n;
+        *cap *= 4;
+        *buf = realloc(*buf, sizeof **buf * *cap);
+    }
+}
+/* Which terms a node holds, at any depth, and how many codepoints it spans, by its constituents as the reader read them
+ * (runs written out); memo holds each node's once. */
+typedef struct { uint64_t keys; double length; } DagNode;
+typedef struct { Reader *rd; lp_idmap *terms, *memo; } Dag;
+static DagNode dag_node(Dag *g, const lp_id *id, int depth) {
+    DagNode *seen = lp_idmap_lookup(g->memo, id);
+    if (seen) return *seen;
+    DagNode x = { 0, 1 };
+    int64_t t = lp_idmap_find(g->terms, id);
+    if (t >= 0) x.keys |= 1ull << t;
+    if (depth < 512 && lp_tier0_codepoint(T0, id) < 0) {
+        lp_id *kid = NULL;
+        size_t cap = 0, n = dag_parts(g->rd, id, &kid, &cap);
+        if (n) x.length = 0;
+        for (size_t i = 0; i < n; i++) {
+            DagNode k = dag_node(g, &kid[i], depth + 1);
+            x.keys |= k.keys;
+            x.length += k.length;
+        }
+        free(kid);
+    }
+    bool fresh;
+    *(DagNode *)lp_idmap_get(g->memo, id, &fresh) = x;
+    return x;
+}
+/* A unit's score: the weight of the terms it holds, each once, normalized by its length as BM25 does a document's
+ * (k1 1.2, b 0.75, against LAPLACE_CODE_UNIT_BYTES, default 2048). */
+static double unit_score(const DagNode *x, const double *idf, double average) {
+    double w = 0;
+    for (int b = 0; b < 64; b++) if (x->keys >> b & 1) w += idf[b];
+    return w * 2.2 / (1.0 + 1.2 * (0.25 + 0.75 * x->length / average));
+}
+/* The unit of a file: of the nodes of its content (not the OS's record of it), the one that scores most, the smallest
+ * of equals; *best takes its score. */
+static lp_id dag_unit(Dag *g, const lp_id *file, const double *idf, double average, double *best) {
+    lp_id unit = *file, *kid = NULL;
+    size_t cap = 0;
+    *best = 0;
+    double best_length = 0;
+    lp_idmap *seen = lp_idmap_new();
+    lp_vec(lp_id) stack = { 0 };
+    size_t n = dag_parts(g->rd, file, &kid, &cap);
+    for (size_t i = n; i-- > 1;) lp_push(&stack, kid[i]);      /* part 0 is the OS's record of the file */
+    while (stack.n) {
+        lp_id at = stack.v[--stack.n];
+        bool fresh;
+        lp_idmap_put(seen, &at, &fresh);
+        if (!fresh) continue;
+        DagNode x = dag_node(g, &at, 0);
+        if (!x.keys) continue;
+        double s = unit_score(&x, idf, average);
+        if (s > *best || (s == *best && x.length < best_length)) { *best = s; best_length = x.length; unit = at; }
+        n = dag_parts(g->rd, &at, &kid, &cap);
+        for (size_t i = n; i-- > 0;) lp_push(&stack, kid[i]);
+    }
+    lp_vec_free(&stack);
+    lp_idmap_free(seen);
+    free(kid);
+    return unit;
+}
+
 void on_code_search(int c, const char *body) {
-    char query[8192] = "", path[4096] = "";
+    char query[8192] = "", under[4096] = "", source[256] = "";
     if (!api_jstr(body, "query", query, sizeof query) && !api_jstr(body, "input", query, sizeof query)) {
         api_http(c, 400, "{\"error\":\"query\"}");
         return;
     }
-    if (!query[0]) {
-        api_http(c, 400, "{\"error\":\"empty query\"}");
-        return;
-    }
+    if (!query[0]) { api_http(c, 400, "{\"error\":\"empty query\"}"); return; }
     int limit = 15;
     api_jint(body, "limit", &limit);
     api_jint(body, "top_k", &limit);
     if (limit < 1) limit = 1;
     if (limit > 64) limit = 64;
-    uint64_t t0 = api_nsec();
-    Lpm *ix = ensure_code_ix();
-    if (!ix) {
-        api_http(c, 500, "{\"error\":\"code index\"}");
-        return;
-    }
-    LpmStats st = {0};
-    lpm_stats(ix, &st);
-    if (api_jstr(body, "path", path, sizeof path) && path[0]) {
-        if (!os_exists(path)) {
-            api_http(c, 404, "{\"error\":\"code indexing path does not exist\"}");
-            return;
-        }
-        LpmUpdate update = {0};
-        if (lpm_update_path(ix, path, &update)) {
-            api_http(c, 500, "{\"error\":\"code indexing path could not be refreshed\"}");
-            return;
-        }
-    } else if (st.documents == 0 && os_exists(".")) {
-        lpm_index_path(ix, ".");
-    }
-    lpm_stats(ix, &st);
-
+    api_jstr(body, "path", under, sizeof under);
+    const char *es = getenv("LAPLACE_CODE_SOURCE");
+    if (!api_jstr(body, "source", source, sizeof source) || !source[0])
+        snprintf(source, sizeof source, "%s", es && *es ? es : "Laplace Workspace");
     char scope_s[8] = "all";
     if (api_jstr(body, "scope", scope_s, sizeof scope_s) && scope_s[0]) {
         if (strcmp(scope_s, "all") && strcmp(scope_s, "code") && strcmp(scope_s, "docs")) {
             api_http(c, 400, "{\"error\":\"scope is all, code or docs\"}");
             return;
         }
-    } else {
-        snprintf(scope_s, sizeof scope_s, "all");
+    } else snprintf(scope_s, sizeof scope_s, "all");
+    char fusion[16] = "";
+    if (!api_jstr(body, "fusion", fusion, sizeof fusion) || !fusion[0]) {
+        const char *fe = getenv("LAPLACE_CODE_FUSION");
+        snprintf(fusion, sizeof fusion, "%s", fe && *fe ? fe : "rerank");
     }
-
+    if (strcmp(fusion, "rrf") && strcmp(fusion, "rerank")) { api_http(c, 400, "{\"error\":\"fusion is rrf or rerank\"}"); return; }
     double w_rr = 1.0;
     if (!env_weight("LAPLACE_CODE_RERANK_WEIGHT", &w_rr)) {
         api_http(c, 400, "{\"error\":\"LAPLACE_CODE_RERANK_WEIGHT is a number from 0 to 1\"}");
         return;
     }
+    PGconn *pg = api_cc_db(c);
+    if (!pg) return;
+    uint64_t t0 = api_nsec();
 
     /* bridge (LAPLACE_CODE_BRIDGE): the query's words joined by what the database's wordnets attest of them */
     const char *be = getenv("LAPLACE_CODE_BRIDGE");
@@ -403,191 +420,239 @@ void on_code_search(int c, const char *body) {
     double bridge_ms = 0;
     const char *bridge_error = NULL;
     char *bridged = bridge ? bridge_query(query, binfo, sizeof binfo, &bridge_ms, &bridge_error) : NULL;
-    if (bridge_error) {
-        api_http(c, 502, bridge_error);
-        return;
-    }
-    const char *rq = bridged ? bridged : query;
+    if (bridge_error) { api_http(c, 502, bridge_error); return; }
+    Terms terms;
+    code_terms(bridged ? bridged : query, &terms);
+    free(bridged);
+    if (!terms.n) { api_http(c, 400, "{\"error\":\"the query holds no word\"}"); return; }
 
-    size_t want = (size_t)limit * 5;
-    if (strcmp(scope_s, "all")) want = 192;
-    if (want < 64) want = 64;
-    if (want > 192) want = 192;
-    LpmHit hits[192];
-    size_t nh = lpm_search(ix, rq, strlen(rq), hits, want);
-    CodeCand *cand = calloc(nh + 1, sizeof *cand);
-    if (!cand) {
-        free(bridged);
-        api_http(c, 500, "{\"error\":\"out of memory\"}");
-        return;
-    }
-    size_t nc = 0;
-    for (size_t i = 0; i < nh; i++) {
-        int is_doc = lpm_is_prose_or_data_path(hits[i].path);
-        if (!strcmp(scope_s, "code") && is_doc) continue;
-        if (!strcmp(scope_s, "docs") && !is_doc) continue;
-        CodeCand *k = &cand[nc++];
-        snprintf(k->path, sizeof k->path, "%s", hits[i].path);
-        k->line0 = hits[i].line0; k->line1 = hits[i].line1;
-        k->lexical = 1;
-        k->lex_rank = (int)nc;
-        memcpy(k->id, hits[i].id, 16);
-        k->hilbert = hits[i].hilbert;
-        k->shared = hits[i].shared;
-    }
+    Reader *rd = reader_new(pg);
+    int witnesses = 0;
+    uint64_t t_scope = api_nsec();
+    lp_idmap *scope = code_scope(pg, rd, source, &witnesses);
 
-    /* Laplace orders the candidates: 4D S^3 Frechet trajectory + Hausdorff + length-chance-adjusted IDF rerank. */
-    for (size_t i = 0; i < nc; i++) {
-        CodeCand *k = &cand[i];
-        char snip[8192] = "";
-        read_lines_snippet(k->path, k->line0, k->line1, snip, sizeof snip);
-        k->snippet = strdup(snip);
-        k->frechet = -1.0;
-        if (snip[0]) {
-            char hdr[384] = "", hhdr[384] = "";
-            if (k->line0 > 8 && !lpm_is_prose_or_data_path(k->path)) {
-                read_lines_snippet(k->path, 1, 8, hdr, sizeof hdr);
-            }
-            const char *dot = strrchr(k->path, '.');
-            if (dot && !strcmp(dot, ".c") && strlen(k->path) < 4090) {
-                char hpath[4096];
-                snprintf(hpath, sizeof hpath, "%s", k->path);
-                char *hdot = strrchr(hpath, '.');
-                if (hdot) {
-                    hdot[1] = 'h'; hdot[2] = 0;
-                    read_lines_snippet(hpath, 1, 5, hhdr, sizeof hhdr);
-                }
-            }
-            char full_snip[10240];
-            const char *rel = tail_path_segments(k->path, 3);
-            int sn = snprintf(full_snip, sizeof full_snip, "%s\n%s%s%s", rel, hdr, hhdr, snip);
-            if (sn < 0) sn = 0;
-            if ((size_t)sn >= sizeof full_snip) sn = (int)(sizeof full_snip - 1);
-            k->rerank = lpm_rerank(ix, rq, strlen(rq), full_snip, (size_t)sn, &k->shared, &k->frechet);
-            k->rerank *= basename_stem_boost(k->path, rq);
-            if (!strcmp(scope_s, "all")) {
-                if (lpm_is_prose_or_data_path(k->path)) k->rerank *= 0.35;
-                else if (lpm_is_test_path(k->path)) k->rerank *= 0.25;
-                else if (dot && (!strcasecmp(dot, ".h") || !strcasecmp(dot, ".hpp"))) k->rerank *= 0.85;
-            }
-            if (k->rerank > 1.0) k->rerank = 1.0;
-        } else {
-            k->rerank = 0.0;
+    /* how common each term is: the paths that hold it directly, read from the container index at once; a term with
+     * more than LAPLACE_CODE_HUB of a kind is a hub */
+    uint64_t t_terms = api_nsec();
+    long cap = env_long("LAPLACE_CODE_HUB", 4096), budget = env_long("LAPLACE_CODE_SEED", 6000);
+    long most = env_long("LAPLACE_CODE_NODES", 400000);
+    double holders[64] = { 0 }, idf[64] = { 0 }, total = 0;
+    uint64_t hubs = 0;
+    {
+        int *hub = calloc((size_t)terms.n * 2, sizeof *hub), nh = 0;
+        Hold *h = holds_capped(pg, terms.id, terms.n, (int)cap, 0, 3, hub, &nh);
+        for (int j = 0; j < nh; j++) if (h[j].src >= 0 && h[j].src < terms.n) holders[h[j].src]++;
+        holds_free(h, nh);
+        for (int b = 0; b < terms.n; b++) if (hub[2 * b] || hub[2 * b + 1]) { hubs |= 1ull << b; holders[b] = (double)cap + 1; }
+        free(hub);
+    }
+    /* a term's weight: its inverse frequency among 64 times the hub cap of paths; a hub's is read below, from the files */
+    double universe = 64.0 * ((double)cap + 1);
+    for (int b = 0; b < terms.n; b++) if (holders[b] > 0) idf[b] = term_idf(holders[b], universe);
+
+    /* the seeds: the rarest terms, while their holders together stay within LAPLACE_CODE_SEED (at least the rarest one),
+     * walked up the container index to the files that hold them (held_up) */
+    int order[64], nseed = 0;
+    for (int b = 0; b < terms.n; b++) order[b] = b;
+    for (int i = 1; i < terms.n; i++)
+        for (int j = i; j > 0 && holders[order[j]] < holders[order[j - 1]]; j--) { int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
+    lp_id seeds[64];
+    int seed_term[64];
+    double spent = 0;
+    for (int i = 0; i < terms.n; i++) {
+        int b = order[i];
+        if (holders[b] <= 0) continue;
+        if (nseed && (spent + holders[b] > (double)budget || (hubs >> b & 1))) break;
+        seeds[nseed] = terms.id[b];
+        seed_term[nseed++] = b;
+        spent += holders[b];
+    }
+    uint64_t t_walk = api_nsec();
+    HeldUp u = { 0 };
+    if (nseed) held_up(pg, seeds, nseed, HELD_CONTENT, (hubs >> seed_term[0] & 1) ? -1 : (int)cap, (size_t)(most > 0 ? most : 400000), &u);
+    lp_vec(CodeHit) hits = { 0 };
+    for (size_t i = 0; i < u.n; i++) {
+        if (!u.node[i].file || !u.node[i].keys) continue;
+        if (scope && lp_idmap_find(scope, &u.node[i].id) < 0) continue;
+        CodeHit h = { .file = u.node[i].id, .prior = 1.0 };
+        for (int s = 0; s < nseed; s++) if (u.node[i].keys >> s & 1) h.seed += idf[seed_term[s]];
+        lp_push(&hits, h);
+    }
+    size_t reached = hits.n;
+    qsort(hits.v, hits.n, sizeof *hits.v, seed_cmp);
+
+    /* the leading candidates, read down by ID (their paths, the reader's arena): which of all the terms each holds */
+    uint64_t t_read = api_nsec();
+    size_t want = (size_t)limit * 3;
+    long lead_n = env_long("LAPLACE_CODE_CANDIDATES", 64);
+    if (want < (size_t)lead_n) want = (size_t)lead_n;
+    if (want > hits.n) want = hits.n;
+    lp_vec(lp_id) lead = { 0 };
+    for (size_t i = 0; i < want; i++) lp_push(&lead, hits.v[i].file);
+    reader_prefetch(rd, lead.v, lead.n, 0);
+    lp_vec_free(&lead);
+    Dag g = { rd, lp_idmap_new(), lp_idmap_sized(sizeof(DagNode)) };
+    for (int b = 0; b < terms.n; b++) lp_idmap_put(g.terms, &terms.id[b], NULL);
+    size_t kept = 0;
+    for (size_t i = 0; i < want; i++) {
+        CodeHit h = hits.v[i];
+        h.path = api_cw_file_name(rd, &h.file);
+        int doc = is_prose_or_data_path(h.path);
+        if ((under[0] && !strstr(h.path, under)) || (!strcmp(scope_s, "code") && doc) || (!strcmp(scope_s, "docs") && !doc)) {
+            free(h.path);
+            continue;
         }
+        if (!strcmp(scope_s, "all")) {
+            const char *dot = strrchr(h.path, '.');
+            if (doc) h.prior = 0.35;
+            else if (is_test_path(h.path)) h.prior = 0.25;
+            else if (dot && (!strcasecmp(dot, ".h") || !strcasecmp(dot, ".hpp"))) h.prior = 0.85;
+        }
+        h.keys = dag_node(&g, &h.file, 0).keys;
+        h.shared = popcount64(h.keys);
+        hits.v[kept++] = h;
     }
-
-    char fusion[16] = "";
-    if (!api_jstr(body, "fusion", fusion, sizeof fusion) || !fusion[0]) {
-        const char *fe = getenv("LAPLACE_CODE_FUSION");
-        snprintf(fusion, sizeof fusion, "%s", fe && *fe ? fe : "rerank");
+    hits.n = kept;
+    /* a hub's weight is its inverse frequency among the files read, at most a hub's among the paths */
+    for (int b = 0; b < terms.n; b++) {
+        if (!(hubs >> b & 1)) continue;
+        double df = 0;
+        for (size_t i = 0; i < hits.n; i++) df += (double)(hits.v[i].keys >> b & 1);
+        idf[b] = term_idf(df, (double)hits.n);
+        if (idf[b] > term_idf((double)cap + 1, universe)) idf[b] = term_idf((double)cap + 1, universe);
     }
-    int by_rerank = !strcmp(fusion, "rerank");
-    if (strcmp(fusion, "rrf") && !by_rerank) {
-        for (size_t i = 0; i < nc; i++) free(cand[i].snippet);
-        free(cand); free(bridged);
-        api_http(c, 400, "{\"error\":\"fusion is rrf or rerank\"}");
-        return;
+    for (int b = 0; b < terms.n; b++) total += idf[b];
+    double average = (double)env_long("LAPLACE_CODE_UNIT_BYTES", 2048);
+    for (size_t i = 0; i < hits.n; i++) {
+        CodeHit *h = &hits.v[i];
+        h->unit = dag_unit(&g, &h->file, idf, average, &h->score);
+        /* what the OS's record of the file holds (its name, its folders) adds a quarter of its weight */
+        lp_id *kid = NULL;
+        size_t kcap = 0;
+        if (dag_parts(rd, &h->file, &kid, &kcap)) {
+            uint64_t named = dag_node(&g, &kid[0], 0).keys;
+            for (int b = 0; b < terms.n; b++) if (named >> b & 1) h->score += 0.25 * idf[b];
+        }
+        free(kid);
     }
-    const double K = 60.0;
-    CodeCand **byr = malloc(sizeof *byr * (nc + 1));
-    for (size_t i = 0; i < nc; i++) byr[i] = &cand[i];
-    qsort(byr, nc, sizeof *byr, cand_rerank_cmp);
-    for (size_t i = 0; i < nc; i++) {
-        CodeCand *k = byr[i];
-        k->rr_rank = (int)i + 1;
-        k->fused = w_rr / (K + k->rr_rank) + (k->lex_rank ? 0.5 / (K + k->lex_rank) : 0.0);
-    }
-    free(byr);
-    qsort(cand, nc, sizeof *cand, by_rerank ? cand_rerank_cmp_v : cand_cmp);
+    qsort(hits.v, hits.n, sizeof *hits.v, hit_cmp);
     int explain = api_jbool(body, "explain", 0);
-    size_t shown = explain ? nc : nc < (size_t)limit ? nc : (size_t)limit;
+    size_t shown = explain ? hits.n : hits.n < (size_t)limit ? hits.n : (size_t)limit;
+
+    /* each shown file's unit, its lines in the file's recorded text, and its text */
+    uint64_t t_units = api_nsec();
+    lp_vec(lp_id) units = { 0 };
+    for (size_t i = 0; i < shown; i++) {
+        CodeHit *h = &hits.v[i];
+        h->rank = (int)i + 1;
+        lp_push(&units, h->unit);
+        size_t tn = 0;
+        char *text = fo_text(pg, rd, &h->file, &tn);
+        int whole = !memcmp(h->unit.b, h->file.b, 16);
+        char *unit = whole ? strdup("") : reader_text(rd, &h->unit, (size_t)1 << 20);
+        const char *at = unit[0] ? strstr(text, unit) : NULL;
+        size_t start = at ? (size_t)(at - text) : 0, length = at ? strlen(unit) : tn;
+        h->line0 = lines_to(text, start);
+        h->line1 = lines_to(text, start + length) - (length && text[start + length - 1] == '\n');
+        /* the snippet: the unit's first 60 lines */
+        size_t end = start, nl = 0;
+        while (end < start + length && nl < 60) { if (text[end] == '\n') nl++; end++; }
+        if (end - start > 8192) { end = start + 8192; while (end > start && ((uint8_t)text[end] & 0xc0) == 0x80) end--; }
+        h->snippet = malloc(end - start + 1);
+        memcpy(h->snippet, text + start, end - start);
+        h->snippet[end - start] = 0;
+        free(unit);
+        free(text);
+    }
+    lp_idmap_free(g.terms);
+    lp_idmap_free(g.memo);
+    if (units.n) {
+        uint8_t *param = malloc(20 + 20 * units.n);
+        size_t pl = ids_param(pg, param, units.v, (uint32_t)units.n);
+        const char *pv[1] = { (const char *)param };
+        int plen[1] = { (int)pl }, pf[1] = { 1 };
+        PGresult *r = db_exec_params(pg, "SELECT ordinal, hilbert FROM @extschema@.laplace_entities($1::@extschema@.blake3[])", 1, NULL, pv, plen, pf, 1);
+        if (PQresultStatus(r) == PGRES_TUPLES_OK)
+            for (int row = 0; row < PQntuples(r); row++) {
+                size_t i = (size_t)lp_be(PQgetvalue(r, row, 0), 8) - 1;
+                if (i < shown) hits.v[i].hilbert = (int64_t)lp_be(PQgetvalue(r, row, 1), 8);
+            }
+        PQclear(r);
+        free(param);
+    }
+    lp_vec_free(&units);
+
     double ms = (double)(api_nsec() - t0) / 1e6;
     char *out = NULL;
     size_t un = 0, ucap = 0;
     api_buf_fmt(&out, &un, &ucap,
-            "{\"docs\":%llu,\"entities\":%llu,\"ms\":%.3f,\"model\":\"laplace-frechet4d\","
-            "\"fusion\":\"%s\",\"scope\":\"%s\",\"weights\":{\"rerank\":%g}",
-            (unsigned long long)st.documents, (unsigned long long)st.entities, ms,
-            by_rerank ? "rerank" : "rrf", scope_s, w_rr);
-    if (bridge) api_buf_fmt(&out, &un, &ucap, ",\"bridge\":{\"words\":%s,\"ms\":%.3f}", binfo, bridge_ms);
-    free(bridged);
-    api_buf_fmt(&out, &un, &ucap, ",\"candidates\":{\"lexical\":%zu,\"reranked\":%zu},\"hits\":[", nh, nc);
+            "{\"docs\":%zu,\"entities\":%zu,\"ms\":%.3f,\"model\":\"laplace-containment\",\"fusion\":\"%s\",\"scope\":\"%s\","
+            "\"source\":\"", scope ? lp_idmap_count(scope) : 0, u.n, ms, fusion, scope_s);
+    api_cw_str(&out, &un, &ucap, source);
+    api_buf_fmt(&out, &un, &ucap, "\",\"witnesses\":%d,\"weights\":{\"rerank\":%g},\"levels\":%d,\"cut\":%s,"
+            "\"phases_ms\":{\"scope\":%.1f,\"terms\":%.1f,\"walk\":%.1f,\"read\":%.1f,\"units\":%.1f},\"terms\":[",
+            witnesses, w_rr, u.levels, u.cut ? "true" : "false", (double)(t_terms - t_scope) / 1e6,
+            (double)(t_walk - t_terms) / 1e6, (double)(t_read - t_walk) / 1e6, (double)(t_units - t_read) / 1e6,
+            (double)(api_nsec() - t_units) / 1e6);
+    for (int b = 0; b < terms.n; b++) {
+        char id[33];
+        int seed = 0;
+        for (int s = 0; s < nseed; s++) if (seed_term[s] == b) seed = 1;
+        api_hex_id(&terms.id[b], id);
+        api_buf_fmt(&out, &un, &ucap, "%s{\"text\":\"", b ? "," : "");
+        api_cw_str(&out, &un, &ucap, terms.text[b]);
+        api_buf_fmt(&out, &un, &ucap, "\",\"id\":\"%s\",\"holders\":%.0f,\"idf\":%.6f,\"hub\":%s,\"seed\":%s}", id, holders[b],
+                idf[b], hubs >> b & 1 ? "true" : "false", seed ? "true" : "false");
+    }
+    if (bridge) api_buf_fmt(&out, &un, &ucap, "],\"bridge\":{\"words\":%s,\"ms\":%.3f}", binfo, bridge_ms);
+    else api_buf_add(&out, &un, &ucap, "]", 1);
+    api_buf_fmt(&out, &un, &ucap, ",\"candidates\":{\"lexical\":%zu,\"reranked\":%zu},\"hits\":[", reached, hits.n);
     for (size_t i = 0; i < shown; i++) {
-        CodeCand *k = &cand[i];
-        char id[33], pe[8192], se[24576];
-        static const char H[] = "0123456789abcdef";
-        for (int b = 0; b < 16; b++) {
-            id[b * 2] = H[k->id[b] >> 4];
-            id[b * 2 + 1] = H[k->id[b] & 15];
-        }
-        id[32] = 0;
-        api_json_esc(k->path, pe, sizeof pe);
-        api_json_esc(k->snippet ? k->snippet : "", se, sizeof se);
+        CodeHit *h = &hits.v[i];
+        char id[33];
+        api_hex_id(&h->unit, id);
+        double score = total > 0 ? h->score * h->prior / (total * 2.2 / 1.3) : 0;
+        api_buf_fmt(&out, &un, &ucap, "%s{\"rank\":%zu,\"path\":\"", i ? "," : "", i + 1);
+        api_cw_str(&out, &un, &ucap, h->path);
         api_buf_fmt(&out, &un, &ucap,
-                "%s{\"rank\":%zu,\"path\":\"%s\",\"line0\":%u,\"line1\":%u,\"source\":\"laplace\","
-                "\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%u,\"frechet\":%.6f,\"rerank\":%.6f,"
-                "\"fused\":%.6f,\"ranks\":{\"rerank\":%d,\"lexical\":%d},\"snippet\":\"%s\"}",
-                i ? "," : "", i + 1, pe, k->line0, k->line1, id, (unsigned long long)k->hilbert, k->shared,
-                k->frechet, k->rerank, k->fused, k->rr_rank, k->lex_rank, se);
+                "\",\"line0\":%zu,\"line1\":%zu,\"source\":\"laplace\",\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%d,"
+                "\"frechet\":-1,\"rerank\":%.6f,\"fused\":%.6f,\"ranks\":{\"rerank\":%d,\"lexical\":%d},\"snippet\":\"",
+                h->line0, h->line1, id, (unsigned long long)h->hilbert, h->shared, score, h->score, h->rank, h->rank);
+        api_cw_str(&out, &un, &ucap, h->snippet ? h->snippet : "");
+        api_buf_add(&out, &un, &ucap, "\"}", 2);
     }
     api_buf_add(&out, &un, &ucap, "]}", 2);
-    for (size_t i = 0; i < nc; i++) free(cand[i].snippet);
-    free(cand);
+    for (size_t i = 0; i < hits.n; i++) { free(hits.v[i].path); free(hits.v[i].snippet); }
+    lp_vec_free(&hits);
+    held_up_free(&u);
+    reader_free(rd);
     api_http(c, 200, out ? out : "{\"hits\":[]}");
     free(out);
 }
+
+/* reindex: the code is the database's, so bringing it up to date is ingesting its source again (LAPLACE_CODE_INGEST,
+ * default workspace-code, whose recipe supersedes what changed), or one file or directory given as path. */
 void on_reindex(int c, const char *body) {
     char path[4096] = "";
     api_jstr(body, "path", path, sizeof path);
-    uint64_t t0 = api_nsec();
-    Lpm *ix = ensure_code_ix();
-    if (!ix) {
-        api_http(c, 500, "{\"error\":\"code index\"}");
-        return;
-    }
-    LpmUpdate u = {0};
-    int rebuilt = 0;
+    const char *src = getenv("LAPLACE_CODE_INGEST");
     if (path[0]) {
-        if (!os_exists(path)) {
-            api_http(c, 400, "{\"error\":\"path does not exist\"}");
-            return;
-        }
-        lpm_update_path(CODE_IX, path, &u);
-        const char *rec = getenv("LAPLACE_CODE_RECORDS");
-        if (rec && *rec && (u.changed || u.added || u.removed) && lpm_save(CODE_IX, rec)) {
-            api_http(c, 500, "{\"error\":\"records not saved\"}");
-            return;
-        }
-    } else if (code_refresh(&u, &rebuilt)) {
-        api_http(c, 500, "{\"error\":\"code index refresh\"}");
-        return;
+        if (!(path[0] == '/' || (path[0] && path[1] == ':'))) { api_http(c, 400, "{\"error\":\"path is absolute\"}"); return; }
+        if (!os_exists(path)) { api_http(c, 400, "{\"error\":\"path does not exist\"}"); return; }
     }
-    LpmStats st = {0};
-    lpm_stats(CODE_IX, &st);
-    double ms = (double)(api_nsec() - t0) / 1e6;
-    char out[512];
-    snprintf(out, sizeof out,
-             "{\"status\":\"indexed\",\"unchanged\":%llu,\"changed\":%llu,\"added\":%llu,\"removed\":%llu,"
-             "\"rebuilt\":%s,\"files\":%llu,\"docs\":%llu,\"stale\":%llu,\"entities\":%llu,\"ms\":%.3f}",
-             (unsigned long long)u.unchanged, (unsigned long long)u.changed, (unsigned long long)u.added,
-             (unsigned long long)u.removed, rebuilt ? "true" : "false", (unsigned long long)st.files,
-             (unsigned long long)st.documents, (unsigned long long)st.stale, (unsigned long long)st.entities, ms);
-    api_http(c, 200, out);
+    char *av[] = { (char *)ENGINE, "ingest", path[0] ? path : (char *)(src && *src ? src : "workspace-code"), NULL };
+    api_on_engine(c, av);
 }
 
-typedef struct {
-    uint32_t index;
-    uint32_t shared;
-    double frechet;
-    double relevance_score;
-} RerankItem;
-
+/* ---- rerank: documents scored against a query by the inverse frequency, over the database's containment, of the
+ * query's terms each holds (the terms as code_search reads them), as a share of all the query's terms. A term's
+ * frequency is how many paths hold it directly; LAPLACE_CODE_HUB and more are alike. */
+typedef struct { uint32_t index, shared; double score; size_t bytes; } RerankItem;
 static int cmp_rerank_item(const void *a, const void *b) {
-    const RerankItem *ra = (const RerankItem *)a;
-    const RerankItem *rb = (const RerankItem *)b;
-    if (ra->relevance_score > rb->relevance_score) return -1;
-    if (ra->relevance_score < rb->relevance_score) return 1;
-    return (ra->index > rb->index) - (ra->index < rb->index);
+    const RerankItem *x = a, *y = b;
+    if (x->score != y->score) return x->score < y->score ? 1 : -1;
+    if (x->bytes != y->bytes) return x->bytes < y->bytes ? -1 : 1;
+    return (x->index > y->index) - (x->index < y->index);
 }
 
 void on_rerank(int c, const char *body) {
@@ -598,40 +663,49 @@ void on_rerank(int c, const char *body) {
     }
     char *docs[256];
     size_t nd = api_parse_str_array(body, "documents", docs, 256);
-    if (!nd) {
-        api_http(c, 400, "{\"error\":\"documents\"}");
-        return;
-    }
+    if (!nd) { api_http(c, 400, "{\"error\":\"documents\"}"); return; }
     int top_n = (int)nd;
     if (api_jint(body, "top_n", &top_n) && (top_n < 1 || (size_t)top_n > nd)) top_n = (int)nd;
+    PGconn *pg = api_cc_db(c);
+    if (!pg) { for (size_t i = 0; i < nd; i++) free(docs[i]); return; }
     uint64_t t0 = api_nsec();
-    Lpm *ix = ensure_code_ix();
-    if (!ix) {
-        for (size_t i = 0; i < nd; i++) free(docs[i]);
-        api_http(c, 500, "{\"error\":\"tier0\"}");
-        return;
+    Terms q;
+    code_terms(query, &q);
+    long cap = env_long("LAPLACE_CODE_HUB", 4096);
+    double df[64] = { 0 }, idf[64] = { 0 }, total = 0;
+    int *hub = calloc((size_t)(q.n ? q.n : 1) * 2, sizeof *hub), nh = 0;
+    Hold *h = q.n ? holds_capped(pg, q.id, q.n, (int)cap, 0, 3, hub, &nh) : NULL;
+    for (int j = 0; j < nh; j++) if (h[j].src >= 0 && h[j].src < q.n) df[h[j].src]++;
+    holds_free(h, nh);
+    for (int b = 0; b < q.n; b++) {
+        if (hub[2 * b] || hub[2 * b + 1]) df[b] = (double)cap + 1;
+        idf[b] = term_idf(df[b], (double)cap + 1);
+        total += idf[b];
     }
-    RerankItem items[256];
-    size_t qlen = strlen(query);
+    free(hub);
+    RerankItem *items = calloc(nd, sizeof *items);
+    Terms *d = malloc(sizeof *d);
     for (size_t i = 0; i < nd; i++) {
-        items[i].index = (uint32_t)i;
-        items[i].shared = 0;
-        items[i].frechet = -1.0;
-        items[i].relevance_score = lpm_rerank(ix, query, qlen, docs[i], strlen(docs[i]), &items[i].shared, &items[i].frechet);
+        code_terms(docs[i], d);
+        items[i] = (RerankItem){ (uint32_t)i, 0, 0, strlen(docs[i]) };
+        for (int b = 0; b < q.n; b++)
+            for (int k = 0; k < d->n; k++)
+                if (!memcmp(q.id[b].b, d->id[k].b, 16)) { items[i].shared++; items[i].score += idf[b]; break; }
+        if (total > 0) items[i].score /= total;
         free(docs[i]);
     }
-    qsort(items, nd, sizeof(RerankItem), cmp_rerank_item);
-    size_t nh = (size_t)top_n < nd ? (size_t)top_n : nd;
+    free(d);
+    qsort(items, nd, sizeof *items, cmp_rerank_item);
+    size_t shown = (size_t)top_n < nd ? (size_t)top_n : nd;
     double ms = (double)(api_nsec() - t0) / 1e6;
     char *out = NULL;
     size_t un = 0, ucap = 0;
-    api_buf_fmt(&out, &un, &ucap, "{\"model\":\"laplace-frechet4d\",\"ms\":%.3f,\"results\":[", ms);
-    for (size_t i = 0; i < nh; i++) {
-        api_buf_fmt(&out, &un, &ucap,
-                "%s{\"index\":%u,\"relevance_score\":%.6f,\"shared\":%u,\"frechet\":%.6f}",
-                i ? "," : "", items[i].index, items[i].relevance_score, items[i].shared, items[i].frechet);
-    }
+    api_buf_fmt(&out, &un, &ucap, "{\"model\":\"laplace-containment\",\"ms\":%.3f,\"results\":[", ms);
+    for (size_t i = 0; i < shown; i++)
+        api_buf_fmt(&out, &un, &ucap, "%s{\"index\":%u,\"relevance_score\":%.6f,\"shared\":%u,\"frechet\":-1}",
+                i ? "," : "", items[i].index, items[i].score, items[i].shared);
     api_buf_add(&out, &un, &ucap, "]}", 2);
+    free(items);
     api_http(c, 200, out ? out : "{\"results\":[]}");
     free(out);
 }

@@ -67,8 +67,7 @@ try:
         application='mcp_read_scope_'+uuid.uuid4().hex[:12]
         token=secrets.token_hex(32)
         server_env=dict(env,LAPLACE_CONNINFO=connection+' application_name='+application,
-                        LAPLACE_MCP_TOKEN=token,LAPLACE_CODE_STORE=str(root/'code-store'),
-                        LAPLACE_CODE_ROOTS=str(root/'code'),LAPLACE_CODE_SEMANTIC='')
+                        LAPLACE_MCP_TOKEN=token)
         with socket.socket() as reservation:
             reservation.bind(('127.0.0.1',0));listen=reservation.getsockname()[1]
         log=resources.enter_context((root/'server.log').open('w+',encoding='utf-8'))

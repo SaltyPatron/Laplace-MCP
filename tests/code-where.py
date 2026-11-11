@@ -218,6 +218,29 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         if r['files'] or r['hits']:
             fail(f'an absent name: {r}')
 
+        # code_search: from the database alone (the fixture bytes are gone), over the source's witness's files; the
+        # answer is the unit of the file's content that holds the query's terms, at its recorded lines
+        cs = call('code_search', {'query': 'delay growing by a factor each attempt', 'limit': 3})
+        if cs['model'] != 'laplace-containment' or cs['witnesses'] != 1 or cs['docs'] != len(src) or not cs['hits']:
+            fail(f'code_search: {cs}')
+        top = cs['hits'][0]
+        if not top['path'].endswith('/proj/retry.c') or not (2 <= top['line0'] <= top['line1'] <= 7) or 'factor' not in top['snippet']:
+            fail(f'code_search: top hit {top}')
+        if [h['rerank'] for h in cs['hits']] != sorted((h['rerank'] for h in cs['hits']), reverse=True):
+            fail(f'code_search: order {cs["hits"]}')
+        cs = call('code_search', {'query': 'lonely_backoff', 'scope': 'code'})
+        if [Path(h['path']).name for h in cs['hits']][:1] != ['alone.py']:
+            fail(f'code_search lonely_backoff: {cs["hits"]}')
+        if call('code_search', {'query': 'jitter', 'path': 'nowhere'})['hits']:
+            fail('code_search: a path filter that holds nothing')
+        if call('code_search', {'query': 'jitter', 'source': 'No Such Witness'})['witnesses'] != 0:
+            fail('code_search: an absent witness')
+
+        # rerank: the query's terms each document holds, by their weight in the database's containment
+        rr = call('rerank', {'query': 'backoff delay factor', 'documents': ['nothing in common here', 'the backoff delay grows by a factor', 'a delay']})
+        if [x['index'] for x in rr['results']] != [1, 2, 0] or rr['results'][2]['relevance_score'] != 0:
+            fail(f'rerank: {rr}')
+
         s = call('sources', {})
         if s['database'] != name or len(s['sources']) != 1 or s['sources'][0]['name'] != 'Laplace Workspace':
             fail(f'sources: {s}')

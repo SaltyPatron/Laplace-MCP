@@ -156,14 +156,11 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         foreach (var (property, variable) in new[] { ("data", "LAPLACE_DATA"), ("src", "LAPLACE_SRC"), ("models", "LAPLACE_MODELS") })
             if (config.TryGetProperty(property, out var located) && located.GetString() is { Length: > 0 } path)
                 start.Environment[variable] = path;
-        start.Environment["LAPLACE_CODE_ROOTS"] = config.TryGetProperty("code_roots", out var roots)
-            ? string.Join(Path.PathSeparator, roots.EnumerateArray().Select(root => root.GetString())) : "";
         if (config.TryGetProperty("work", out var work))
         {
             var directory = work.GetString() ?? throw new NativeUnavailableException("Native work storage is not configured.");
             Directory.CreateDirectory(directory);
             start.Environment["LAPLACE_WORK"] = directory;
-            start.Environment["LAPLACE_CODE_RECORDS"] = Path.Combine(directory, "workspace.lpm");
         }
         var threads = config.TryGetProperty("threads", out var selectedThreads) ? Math.Clamp(selectedThreads.GetInt32(), 1, 8) : 2;
         start.Environment["OMP_NUM_THREADS"] = threads.ToString(System.Globalization.CultureInfo.InvariantCulture);
