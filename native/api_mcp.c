@@ -310,6 +310,8 @@ void api_dispatch(int c, const char *method, const char *path, const char *body)
     else if (!strcmp(path, "/v1/degrees")) on_degrees(c, body);
     else if (!strcmp(path, "/v1/pull")) on_pull(c, body);
     else if (!strcmp(path, "/v1/turn")) on_turn(c, body);
+    else if (!strcmp(path, "/v1/chess_position")) on_chess_position(c, body);
+    else if (!strcmp(path, "/v1/chess_game_openings")) on_chess_game_openings(c, body);
     else api_http(c, 404, "{\"error\":\"not found\"}");
 }
 

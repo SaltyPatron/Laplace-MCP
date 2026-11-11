@@ -140,6 +140,33 @@ app.MapGet("/api/schema", async (NativeRuntime native, CancellationToken ct) =>
         operations
     });
 });
+// Chess reads. Position IDs are the Engine's (chess_rules.c, linked into the native reader); this host only forwards.
+// A native {error} is the request's fault: a FEN that is no position, a game that does not replay.
+static IResult NativeAnswer(JsonElement answer) =>
+    answer.ValueKind == JsonValueKind.Object && answer.TryGetProperty("error", out _) ? Results.BadRequest(answer) : Results.Json(answer);
+app.MapGet("/api/chess/position", async (string? fen, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(fen) || fen.Length > 128) return Results.BadRequest(new { error = "fen: a FEN, up to 128 characters" });
+    return NativeAnswer(await native.Read("/v1/chess_position", new { fen = fen.Trim() }, ct));
+});
+app.MapPost("/api/chess/game-openings", async (JsonElement body, NativeRuntime native, CancellationToken ct) =>
+{
+    if (body.ValueKind != JsonValueKind.Object) return Results.BadRequest(new { error = "a JSON object: { pgn } or { line } or { pgns: [...] }" });
+    if (body.TryGetProperty("pgns", out var pgns))
+    {
+        if (pgns.ValueKind != JsonValueKind.Array || pgns.GetArrayLength() > 512 || pgns.EnumerateArray().Any(p => p.ValueKind != JsonValueKind.String || p.GetString()!.Length > 65536))
+            return Results.BadRequest(new { error = "pgns: up to 512 PGN strings" });
+        return NativeAnswer(await native.Read("/v1/chess_game_openings", new { pgns = pgns.EnumerateArray().Select(p => p.GetString()).ToArray() }, ct));
+    }
+    if (body.TryGetProperty("pgn", out var pgn))
+    {
+        if (pgn.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(pgn.GetString()) || pgn.GetString()!.Length > 65536) return Results.BadRequest(new { error = "pgn: a PGN string" });
+        return NativeAnswer(await native.Read("/v1/chess_game_openings", new { pgn = pgn.GetString() }, ct));
+    }
+    if (body.TryGetProperty("line", out var line) && line.ValueKind == JsonValueKind.String && IsId(line.GetString()!))
+        return NativeAnswer(await native.Read("/v1/chess_game_openings", new { line = line.GetString()!.ToLowerInvariant() }, ct));
+    return Results.BadRequest(new { error = "{ pgn } or { line } or { pgns: [...] }" });
+});
 // Explicit read operations only. No shell, arbitrary path, ingestion or write proxy.
 app.MapPost("/api/operations/{operation}", async (string operation, JsonElement body, NativeRuntime native, CancellationToken ct) =>
 {
