@@ -149,6 +149,12 @@ app.MapGet("/api/chess/position", async (string? fen, NativeRuntime native, Canc
     if (string.IsNullOrWhiteSpace(fen) || fen.Length > 128) return Results.BadRequest(new { error = "fen: a FEN, up to 128 characters" });
     return NativeAnswer(await native.Read("/v1/chess_position", new { fen = fen.Trim() }, ct));
 });
+// The tablebase's verdicts of a position and of each legal move's position (Engine recipes/syzygy), best move first.
+app.MapGet("/api/chess/tablebase", async (string? fen, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(fen) || fen.Length > 128) return Results.BadRequest(new { error = "fen: a FEN, up to 128 characters" });
+    return NativeAnswer(await native.Read("/v1/chess_tablebase", new { fen = fen.Trim() }, ct));
+});
 app.MapPost("/api/chess/game-openings", async (JsonElement body, NativeRuntime native, CancellationToken ct) =>
 {
     if (body.ValueKind != JsonValueKind.Object) return Results.BadRequest(new { error = "a JSON object: { pgn } or { line } or { pgns: [...] }" });
