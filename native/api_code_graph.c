@@ -49,9 +49,9 @@ void on_code_callers(int c, const char *body) {
     PGconn *pg = api_cc_db(c);
     if (!pg) return;
     uint64_t t0 = api_nsec();
-    CwDag d = { 0 };
-    int levels = 0, cut = 0;
-    cw_walk(pg,&trunk.id, &d, 400000, &levels, &cut);
+    HeldUp d;
+    held_up(pg, &trunk.id, 1, HELD_CONTENT, -1, 400000, &d);
+    int cut = d.cut;
     Reader *rd = reader_new(pg);
     char *out = NULL, *top = NULL;
     size_t on = 0, ocap = 0, tn = 0, tcap = 0, files = 0;
@@ -59,13 +59,13 @@ void on_code_callers(int c, const char *body) {
     api_cw_str(&out, &on, &ocap, name);
     api_buf_fmt(&out, &on, &ocap, "\",\"database\":\"%s\",\"callers\":[", PQdb(pg));
     int shown = 0, ntop = 0;
-    for (size_t i = 0; i < d.nn && shown < limit; i++) {
-        if (!d.n[i].file) continue;
-        char *path = api_cw_file_name(rd, &d.n[i].id);
+    for (size_t i = 0; i < d.n && shown < limit; i++) {
+        if (!d.node[i].file) continue;
+        char *path = api_cw_file_name(rd, &d.node[i].id);
         if (under[0] && !strstr(path, under)) { free(path); continue; }
         FoDecl *dl = NULL;
         char *text = NULL;
-        size_t tl = 0, nd = fo_outline(pg, rd, &d.n[i].id, &dl, &text, &tl);
+        size_t tl = 0, nd = fo_outline(pg, rd, &d.node[i].id, &dl, &text, &tl);
         CcLines *by = calloc(nd + 1, sizeof *by), alone = {0};
         const char *nm = text;
         while ((nm = cc_word(text, nm, text + tl, name))) {
@@ -76,7 +76,7 @@ void on_code_callers(int c, const char *body) {
             nm += strlen(name);
         }
         char fh[33];
-        api_hex_id(&d.n[i].id, fh);
+        api_hex_id(&d.node[i].id, fh);
         int any = 0;
         for (size_t q = 0; q < nd && shown < limit; q++) {
             if (!by[q].n) continue;
@@ -111,8 +111,7 @@ void on_code_callers(int c, const char *body) {
     api_buf_fmt(&out, &on, &ocap, "],\"files\":%zu,\"shown\":%d,\"cut\":%s,\"ms\":%.3f}", files, shown, cut ? "true" : "false", (double)(api_nsec() - t0) / 1e6);
     free(top);
     reader_free(rd);
-    lp_idmap_free(d.m);
-    free(d.n);
+    held_up_free(&d);
     api_http(c, 200, out ? out : "{\"error\":\"memory\"}");
     free(out);
 }
@@ -140,9 +139,9 @@ void on_code_callees(int c, const char *body) {
     PGconn *pg = api_cc_db(c);
     if (!pg) return;
     uint64_t t0 = api_nsec();
-    CwDag d = { 0 };
-    int levels = 0, cut = 0;
-    cw_walk(pg,&trunk.id, &d, 400000, &levels, &cut);
+    HeldUp d;
+    held_up(pg, &trunk.id, 1, HELD_CONTENT, -1, 400000, &d);
+    int cut = d.cut;
     Reader *rd = reader_new(pg);
     /* the definitions: each its file, its outline entry and its code; the names each calls, by candidate index */
     typedef struct { size_t node; char *path, *kind; size_t line; long line1; lp_vec(size_t) calls; } CeDef;
@@ -150,13 +149,13 @@ void on_code_callees(int c, const char *body) {
     size_t ndef = 0;
     lp_idmap *cand = lp_idmap_new();
     lp_vec(CeCand) cs = { 0 };
-    for (size_t i = 0; i < d.nn && ndef < 16; i++) {
-        if (!d.n[i].file) continue;
-        char *path = api_cw_file_name(rd, &d.n[i].id);
+    for (size_t i = 0; i < d.n && ndef < 16; i++) {
+        if (!d.node[i].file) continue;
+        char *path = api_cw_file_name(rd, &d.node[i].id);
         if (under[0] && !strstr(path, under)) { free(path); continue; }
         FoDecl *dl = NULL;
         char *text = NULL, *whole = NULL;
-        size_t tl = 0, nd = fo_outline(pg, rd, &d.n[i].id, &dl, &text, &tl);
+        size_t tl = 0, nd = fo_outline(pg, rd, &d.node[i].id, &dl, &text, &tl);
         whole = text; text = NULL;
         for (size_t q = 0; q < nd && ndef < 16; q++) {
             if (strcmp(dl[q].name, name) || dl[q].start == SIZE_MAX) continue;
@@ -197,26 +196,50 @@ void on_code_callees(int c, const char *body) {
         free(whole);
         free(path);
     }
-    /* Resolve all candidate names together through the real containment tree.
-     * A file may sit above any number of content/record block levels. */
+    /* Resolve all candidate names together: a name is declared where a code recipe said the claim
+     * [declaration, "declared identifier", name], declaration = [kind, source]. The claims that hold each name are read
+     * from the container index at once (holders of each name that also hold the relation); each such claim is walked up to the files that say it, 64 claims a walk. */
     size_t ncand = lp_idmap_count(cand);
-    if (ncand) {
-        CwDag holders = {0}; int candidate_levels=0,candidate_cut=0;
-        cw_walk_many(pg,lp_idmap_keys(cand),ncand,&holders,400000,&candidate_levels,&candidate_cut);
-        cut |= candidate_cut;
-        for (size_t i=0;i<holders.nn;i++) {
-            if (!holders.n[i].file) continue;
-            FoDecl *declarations=NULL; char *text=NULL; size_t length=0;
-            size_t count=fo_outline(pg,rd,&holders.n[i].id,&declarations,&text,&length);
-            for (size_t k=0;k<count;k++) {
-                lp_ref identifier, constituents[256]; size_t nconstituents=0;
-                if (!api_name_entity(declarations[k].name,&identifier,constituents,256,&nconstituents)) continue;
-                int64_t candidate=lp_idmap_find(cand,&identifier.id);
-                if (candidate>=0) ce_file(&cs.v[candidate],declarations[k].kind,&holders.n[i].id);
-            }
-            fo_free(declarations,count); free(text);
+    lp_id declared;
+    if (ncand && lp_text_id(TX, "declared identifier", strlen("declared identifier"), &declared)) {
+        int nh = 0;
+        Hold *h = holds_both(pg, lp_idmap_keys(cand), (int)ncand, &declared, &nh);
+        lp_vec(lp_id) claims = { 0 }, decls = { 0 };
+        lp_vec(size_t) owner = { 0 };
+        lp_vec(lp_vertex) vx = { 0 };
+        for (int j = 0; j < nh; j++) {
+            size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
+            if (nv != 3 || h[j].src < 0) continue;
+            lp_vec_reserve(&vx, nv);
+            lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
+            if (memcmp(vx.v[1].id.b, declared.b, 16) || memcmp(vx.v[2].id.b, lp_idmap_keys(cand)[h[j].src].b, 16)) continue;
+            lp_push(&claims, h[j].entity);
+            lp_push(&decls, vx.v[0].id);
+            lp_push(&owner, (size_t)h[j].src);
         }
-        lp_idmap_free(holders.m); free(holders.n);
+        holds_free(h, nh);
+        lp_vec_free(&vx);
+        reader_prefetch(rd, decls.v, decls.n, 128);
+        for (size_t at = 0; at < claims.n; at += 64) {
+            size_t count = claims.n - at < 64 ? claims.n - at : 64;
+            HeldUp up;
+            held_up(pg, claims.v + at, (int)count, HELD_CONTENT, -1, 400000, &up);
+            cut |= up.cut;
+            for (size_t i = 0; i < up.n; i++) {
+                if (!up.node[i].file) continue;
+                for (size_t b = 0; b < count; b++) {
+                    if (!(up.node[i].keys >> b & 1)) continue;
+                    lp_id two[2];
+                    char *kind = reader_parts(rd, &decls.v[at + b], two, 2) == 2 ? reader_text(rd, &two[0], 120) : strdup("");
+                    ce_file(&cs.v[owner.v[at + b]], kind, &up.node[i].id);
+                    free(kind);
+                }
+            }
+            held_up_free(&up);
+        }
+        lp_vec_free(&claims);
+        lp_vec_free(&decls);
+        lp_vec_free(&owner);
     }
     char *out = NULL;
     size_t on = 0, ocap = 0;
@@ -226,7 +249,7 @@ void on_code_callees(int c, const char *body) {
     for (size_t f = 0; f < ndef; f++) {
         CeDef *df = &defs[f];
         char fh[33];
-        api_hex_id(&d.n[df->node].id, fh);
+        api_hex_id(&d.node[df->node].id, fh);
         api_buf_fmt(&out, &on, &ocap, "%s{\"path\":\"", f ? "," : "");
         api_cw_str(&out, &on, &ocap, df->path);
         api_buf_fmt(&out, &on, &ocap, "\",\"file\":\"%s\",\"kind\":\"", fh);
@@ -270,8 +293,7 @@ void on_code_callees(int c, const char *body) {
     lp_vec_free(&cs);
     lp_idmap_free(cand);
     reader_free(rd);
-    lp_idmap_free(d.m);
-    free(d.n);
+    held_up_free(&d);
     api_http(c, 200, out ? out : "{\"error\":\"memory\"}");
     free(out);
 }

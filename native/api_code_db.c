@@ -5,18 +5,6 @@
  * A file is a trunk [metadata, content]; a recipe with a grammar records its content as the syntax tree, so the nodes
  * above a name are its enclosing expressions, statements and declarations, and above them the file. Nothing is read
  * from a working tree: the path is the file's own pathname record, the text and lines are the recorded content. */
-static size_t cw_node(CwDag *d, const lp_id *id, int *fresh) {
-    bool f;
-    size_t i = lp_idmap_put(d->m, id, &f);
-    if (f) {
-        if (d->nn == d->cn) { d->cn = d->cn ? d->cn * 2 : 1024; CwNode *g = realloc(d->n, d->cn * sizeof *d->n); if (!g) abort(); d->n = g; }
-        memset(&d->n[d->nn], 0, sizeof d->n[d->nn]);
-        d->n[d->nn].id = *id;
-        d->nn++;
-    }
-    if (fresh) *fresh = f;
-    return i;
-}
 /* A file's path from the OS's record in its metadata tree: [pathname, its folders], or [filename, NAME]. */
 char *api_cw_file_name(Reader *rd, const lp_id *file) {
     lp_id at = *file, kid[64];
@@ -47,57 +35,6 @@ char *api_cw_file_name(Reader *rd, const lp_id *file) {
         at = kid[0];
     }
     return strdup("");
-}
-
-/* Up from one name through every path that holds it, to the files: a holder whose first vertex is metadata, reached
- * through its content, is a file and the walk stops there. A name held only as metadata (a file called so) is not an
- * occurrence. A code recipe states [declaration, "declared identifier", name],
- * with declaration = [kind, complete source bytes]. A record of one claim is
- * that claim, said as a record (LP_SAID_RECORD) where it stands, so a holder of the name said so one level up is a claim
- * too, as the engine's walk up counts it (walk_up): a file that declares one thing defines it. The front is bounded, so a
- * name as common as a keyword answers what it reached and says so. */
-int cw_walk_many(PGconn *pg,const lp_id *names, size_t count, CwDag *d, size_t max_nodes, int *levels, int *cut) {
-    d->m = lp_idmap_new();
-    lp_idmap *front = lp_idmap_new();
-    for (size_t i=0;i<count;i++) { cw_node(d,&names[i],NULL); lp_idmap_put(front,&names[i],NULL); }
-    lp_vec(lp_vertex) vx = { 0 };
-    int level = 0, files = 0;
-    *cut = 0;
-    while (lp_idmap_count(front) && level < 128) {
-        int nh = 0;
-        Hold *h = holds_any(pg,lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
-        lp_idmap *next = lp_idmap_new();
-        for (int j = 0; j < nh && !*cut; j++) {
-            size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
-            if (!nv) continue;
-            lp_vec_reserve(&vx, nv);
-            lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
-            int is_file = vx.v[0].said == LP_SAID_METADATA;
-            for (size_t v = 0; v < nv; v++) {
-                if (vx.v[v].said == LP_SAID_METADATA) continue;
-                if (lp_idmap_find(front, &vx.v[v].id) < 0) continue;
-                ptrdiff_t ci = lp_idmap_find(d->m, &vx.v[v].id);
-                if (ci < 0) continue;
-                if (d->nn >= max_nodes) { *cut = 1; break; }
-                int fresh = 0;
-                size_t pi = cw_node(d, &h[j].entity, &fresh);
-                if (fresh && is_file) { d->n[pi].file = 1; files++; }
-                else if (fresh) lp_idmap_put(next, &h[j].entity, NULL);
-            }
-        }
-        holds_free(h, nh);
-        lp_idmap_free(front);
-        front = next;
-        level++;
-        if (*cut) break;
-    }
-    lp_vec_free(&vx);
-    lp_idmap_free(front);
-    *levels = level;
-    return files;
-}
-int cw_walk(PGconn *pg,const lp_id *name, CwDag *d, size_t max_nodes, int *levels, int *cut) {
-    return cw_walk_many(pg,name,1,d,max_nodes,levels,cut);
 }
 
 size_t cw_lines(const char *text, size_t upto) {
@@ -136,53 +73,119 @@ static int fo_hex(const char *s, lp_id *id) {
     }
     return 1;
 }
-/* One entity's vertices, as laplace_paths gives its path. */
-static size_t fo_vertices(PGconn *pg, const lp_id *id, lp_vertex **out, size_t *cap) {
-    char h[33], arr[40];
-    api_hex_id(id, h);
-    snprintf(arr, sizeof arr, "{%s}", h);
-    const char *v[1] = { arr };
-    PGresult *r = db_exec_params(pg, "SELECT path::text FROM @extschema@.laplace_paths($1::@extschema@.blake3[])", 1, NULL, v, NULL, NULL, 0);
-    size_t n = 0;
-    if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0) {
-        const char *hx = PQgetvalue(r, 0, 0);
-        size_t hl = strlen(hx) / 2;
-        uint8_t *b = malloc(hl + 1);
-        for (size_t i = 0; i < hl; i++) { unsigned x; sscanf(hx + i * 2, "%2x", &x); b[i] = (uint8_t)x; }
-        n = lp_path_vertices(b, hl, NULL, 0);
-        lp_reserve((void **)out, cap, n, sizeof **out);
-        lp_path_vertices(b, hl, *out, n);
-        free(b);
-    }
-    PQclear(r);
-    return n;
+/* What a file says, read a level at a time: the vertices of the file and of every record and holds node below it, each
+ * level one paths_of read for all of its nodes, never a statement a node. Text leaves are not descended. */
+typedef struct { lp_idmap *at; lp_vec(lp_vertex) v; lp_vec(size_t) first, count; } FoTree;
+static int fo_role(uint32_t said) { return said == LP_SAID_CLAIM || said == LP_SAID_RECORD || said == LP_SAID_HOLDS; }
+static const lp_vertex *fo_tree_get(const FoTree *t, const lp_id *id, size_t *n) {
+    int64_t i = lp_idmap_find(t->at, id);
+    if (i < 0) { *n = 0; return NULL; }
+    *n = t->count.v[i];
+    return t->v.v + t->first.v[i];
 }
+static void fo_tree(PGconn *pg, const lp_id *file, FoTree *t) {
+    memset(t, 0, sizeof *t);
+    t->at = lp_idmap_new();
+    lp_idmap *front = lp_idmap_new();
+    lp_idmap_put(front, file, NULL);
+    lp_vec(lp_vertex) vx = { 0 };
+    while (lp_idmap_count(front)) {
+        int nh = 0;
+        Hold *h = paths_of(pg, lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
+        lp_idmap *next = lp_idmap_new();
+        for (int j = 0; j < nh; j++) {
+            bool fresh;
+            lp_idmap_put(t->at, &h[j].entity, &fresh);
+            if (!fresh) continue;
+            size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
+            lp_vec_reserve(&vx, nv);
+            lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
+            lp_push(&t->first, t->v.n);
+            lp_push(&t->count, nv);
+            for (size_t k = 0; k < nv; k++) {
+                lp_push(&t->v, vx.v[k]);
+                if ((vx.v[k].said == LP_SAID_RECORD || vx.v[k].said == LP_SAID_HOLDS) && lp_idmap_find(t->at, &vx.v[k].id) < 0)
+                    lp_idmap_put(next, &vx.v[k].id, NULL);
+            }
+        }
+        holds_free(h, nh);
+        lp_idmap_free(front);
+        front = next;
+    }
+    lp_idmap_free(front);
+    lp_vec_free(&vx);
+}
+static void fo_tree_free(FoTree *t) { lp_idmap_free(t->at); lp_vec_free(&t->v); lp_vec_free(&t->first); lp_vec_free(&t->count); }
 int fo_word(char c) { return isalnum((unsigned char)c) || c == '_' || (unsigned char)c >= 0x80; }
 typedef struct { lp_id *v; size_t n, cap; } FoClaims;
 /* Content trunks may contain arbitrarily nested blocks of records. Follow
  * their explicit roles, preserving source order; never descend text leaves. */
-static void fo_collect_claims(PGconn *pg, const lp_vertex *roots, size_t count, FoClaims *claims) {
+static void fo_collect_claims(const FoTree *tree, const lp_vertex *roots, size_t count, FoClaims *claims) {
     typedef struct { lp_id id; uint32_t role; } Pending;
     lp_vec(Pending) pending = {0};
-    lp_vertex *vertices=NULL; size_t capacity=0;
     for (size_t i=count; i-- > 0;) {
         Pending next = {roots[i].id, roots[i].said};
-        if (next.role==LP_SAID_CLAIM || next.role==LP_SAID_RECORD || next.role==LP_SAID_HOLDS) lp_push(&pending,next);
+        if (fo_role(next.role)) lp_push(&pending,next);
     }
     while (pending.n) {
         Pending current = pending.v[--pending.n];
         if (current.role==LP_SAID_CLAIM) { lp_push(claims,current.id); continue; }
-        size_t n=fo_vertices(pg,&current.id,&vertices,&capacity), marked=0;
+        size_t n, marked=0;
+        const lp_vertex *vertices=fo_tree_get(tree,&current.id,&n);
         for (size_t i=n; i-- > 0;) {
             Pending next = {vertices[i].id,vertices[i].said};
-            if (next.role!=LP_SAID_CLAIM && next.role!=LP_SAID_RECORD && next.role!=LP_SAID_HOLDS) continue;
+            if (!fo_role(next.role)) continue;
             marked++;
             for (uint32_t run=vertices[i].run ? vertices[i].run : 1; run; run--) lp_push(&pending,next);
         }
         if (!marked && current.role==LP_SAID_RECORD) lp_push(claims,current.id);
     }
-    free(vertices);
     lp_vec_free(&pending);
+}
+/* A file's recorded text: every part but the OS's record and what is said of it (a claim, a record that is one claim);
+ * a record of claims is content, its claims read as nothing. Its parts are read together. */
+static char *fo_tree_text(const FoTree *tree, Reader *rd, const lp_id *file, size_t *tnp) {
+    size_t nv;
+    const lp_vertex *fv = fo_tree_get(tree, file, &nv);
+    lp_vec(lp_id) parts = { 0 };
+    lp_vec(uint32_t) runs = { 0 };
+    for (size_t v = 0; v < nv; v++) {
+        uint32_t sd = fv[v].said;
+        if (sd == LP_SAID_METADATA || sd == LP_SAID_CLAIM) continue;
+        if (sd == LP_SAID_RECORD) {
+            size_t nr;
+            const lp_vertex *rv = fo_tree_get(tree, &fv[v].id, &nr);
+            int has = 0;
+            for (size_t k = 0; k < nr; k++) if (rv[k].said == LP_SAID_CLAIM) has = 1;
+            if (!has) continue;                 /* a record that is one claim says it; a record of claims is content */
+        }
+        lp_push(&parts, fv[v].id);
+        lp_push(&runs, fv[v].run ? fv[v].run : 1);
+    }
+    reader_prefetch(rd, parts.v, parts.n, 0);
+    size_t tn = 0, tcap = 1 << 16;
+    char *text = malloc(tcap);
+    text[0] = 0;
+    for (size_t v = 0; v < parts.n; v++)
+        for (uint32_t k = 0; k < runs.v[v]; k++) {
+            char *t = reader_text(rd, &parts.v[v], (size_t)8 << 20);
+            size_t l = strlen(t);
+            if (tn + l + 1 > tcap) { while (tn + l + 1 > tcap) tcap *= 2; text = realloc(text, tcap); }
+            memcpy(text + tn, t, l + 1);
+            tn += l;
+            free(t);
+        }
+    lp_vec_free(&parts);
+    lp_vec_free(&runs);
+    *tnp = tn;
+    return text;
+}
+char *fo_text(PGconn *pg, Reader *rd, const lp_id *file, size_t *tnp) {
+    FoTree tree;
+    fo_tree(pg, file, &tree);
+    char *text = fo_tree_text(&tree, rd, file, tnp);
+    fo_tree_free(&tree);
+    return text;
 }
 /* One file's outline: its recorded text (every part but the OS's record and what is said of the file) and the claims
  * [kind, name] said of it, in the file's order, each at the first line at or after the one before it where its name
@@ -204,32 +207,14 @@ void fo_free(FoDecl *d, size_t n) {
     free(d);
 }
 size_t fo_outline(PGconn *pg, Reader *rd, const lp_id *file, FoDecl **declp, char **textp, size_t *tnp) {
-    lp_vertex *fv=NULL, *rv=NULL; size_t fcap=0, rcap=0;
-    size_t nv = fo_vertices(pg, file, &fv, &fcap);
-    /* the recorded text: every part but the OS's record and what is said of the file */
-    size_t tn = 0, tcap = 1 << 16;
-    char *text = malloc(tcap);
-    text[0] = 0;
+    FoTree tree;
+    fo_tree(pg, file, &tree);
+    size_t tn = 0, nv;
+    char *text = fo_tree_text(&tree, rd, file, &tn);
+    const lp_vertex *fv = fo_tree_get(&tree, file, &nv);
     FoClaims claims = { 0 };
-    fo_collect_claims(pg, fv, nv, &claims);
-    for (size_t v = 0; v < nv; v++) {
-        uint32_t sd = fv[v].said;
-        if (sd == LP_SAID_METADATA) continue;
-        if (sd == LP_SAID_RECORD || sd == LP_SAID_CLAIM) {
-            size_t nr = sd == LP_SAID_RECORD ? fo_vertices(pg, &fv[v].id, &rv, &rcap) : 0;
-            int has = 0;
-            for (size_t k = 0; k < nr; k++) if (rv[k].said == LP_SAID_CLAIM) has = 1;
-            if (!has || sd == LP_SAID_CLAIM) continue;
-        }
-        for (uint32_t k = 0; k < (fv[v].run ? fv[v].run : 1); k++) {
-            char *t = reader_text(rd, &fv[v].id, (size_t)8 << 20);
-            size_t l = strlen(t);
-            if (tn + l + 1 > tcap) { while (tn + l + 1 > tcap) tcap *= 2; text = realloc(text, tcap); }
-            memcpy(text + tn, t, l + 1);
-            tn += l;
-            free(t);
-        }
-    }
+    fo_collect_claims(&tree, fv, nv, &claims);
+    fo_tree_free(&tree);
     FoDecl *dl = NULL;
     size_t nd = 0, at = 0, line = 1;
     for (size_t k = 0; k < claims.n; k++) {
@@ -250,7 +235,6 @@ size_t fo_outline(PGconn *pg, Reader *rd, const lp_id *file, FoDecl **declp, cha
         if (found) { at = found - 1; line = fl; }
     }
     lp_vec_free(&claims);
-    free(fv); free(rv);
     *declp = dl;
     *textp = text;
     *tnp = tn;
@@ -293,37 +277,18 @@ void on_file_outline(int c, const char *body) {
         lp_ref trunk, parts[256];
         size_t np = 0;
         if (!*base || !api_name_entity(base, &trunk, parts, 256, &np)) { reader_free(rd); api_http(c, 400, "{\"error\":\"path\"}"); return; }
-        lp_idmap *seen = lp_idmap_new(), *front = lp_idmap_new();
-        lp_idmap_put(front, &trunk.id, NULL);
-        lp_vec(lp_vertex) vx = { 0 };
-        for (int level = 0; level < 10 && lp_idmap_count(front) && lp_idmap_count(seen) < 20000; level++) {
-            int nh = 0;
-            Hold *h = holds_any(pg,lp_idmap_keys(front), (int)lp_idmap_count(front), &nh);
-            lp_idmap *next = lp_idmap_new();
-            for (int j = 0; j < nh; j++) {
-                size_t nv = lp_path_vertices(h[j].path, (size_t)h[j].path_len, NULL, 0);
-                if (!nv) continue;
-                lp_vec_reserve(&vx, nv);
-                lp_path_vertices(h[j].path, (size_t)h[j].path_len, vx.v, nv);
-                bool fresh;
-                lp_idmap_put(seen, &h[j].entity, &fresh);
-                if (!fresh) continue;
-                /* a trunk whose first vertex is the OS's record, reached through that record: a file */
-                if (vx.v[0].said == LP_SAID_METADATA && lp_idmap_find(front, &vx.v[0].id) >= 0) {
-                    char *path = api_cw_file_name(rd, &h[j].entity);
-                    size_t pl = strlen(path), wl = strlen(want);
-                    if (pl >= wl && !strcmp(path + pl - wl, want) && (pl == wl || want[0] == '/' || path[pl - wl - 1] == '/'))
-                        lp_push(&files, h[j].entity);
-                    free(path);
-                } else if (vx.v[0].said != LP_SAID_METADATA) lp_idmap_put(next, &h[j].entity, NULL);
-            }
-            holds_free(h, nh);
-            lp_idmap_free(front);
-            front = next;
+        /* up from the file's name through the OS's record of it, to the trunks whose first vertex is that record */
+        HeldUp up;
+        held_up(pg, &trunk.id, 1, HELD_NAME, -1, 20000, &up);
+        for (size_t i = 0; i < up.n; i++) {
+            if (!up.node[i].file) continue;
+            char *path = api_cw_file_name(rd, &up.node[i].id);
+            size_t pl = strlen(path), wl = strlen(want);
+            if (pl >= wl && !strcmp(path + pl - wl, want) && (pl == wl || want[0] == '/' || path[pl - wl - 1] == '/'))
+                lp_push(&files, up.node[i].id);
+            free(path);
         }
-        lp_vec_free(&vx);
-        lp_idmap_free(front);
-        lp_idmap_free(seen);
+        held_up_free(&up);
     }
     char *out = NULL;
     size_t on = 0, ocap = 0;
@@ -392,17 +357,19 @@ void on_code_where(int c, const char *body) {
     lp_ref trunk, parts[256]; size_t np=0;
     if (!api_name_entity(name,&trunk,parts,256,&np)) { api_http(c,500,"{\"error\":\"tier0\"}"); return; }
     PGconn *pg=api_cc_db(c); if(!pg) return;
-    uint64_t t0=api_nsec(); CwDag d={0}; int levels=0,cut=0;
-    int nfiles=cw_walk(pg,&trunk.id,&d,400000,&levels,&cut);
+    uint64_t t0=api_nsec(); HeldUp d;
+    held_up(pg,&trunk.id,1,HELD_CONTENT,-1,400000,&d);
+    size_t nfiles=0; for(size_t i=0;i<d.n;i++) nfiles+=d.node[i].file;
+    double walk_ms=(double)(api_nsec()-t0)/1e6;
     Reader *rd=reader_new(pg);
     typedef struct { CwFile rank; FoDecl *declarations; size_t count,length; char *text; } Found;
-    Found *found=calloc((size_t)nfiles+1,sizeof *found); size_t nf=0;
-    for(size_t i=0;i<d.nn;i++){
-        if(!d.n[i].file) continue;
-        char *path=api_cw_file_name(rd,&d.n[i].id);
+    Found *found=calloc(nfiles+1,sizeof *found); size_t nf=0;
+    for(size_t i=0;i<d.n;i++){
+        if(!d.node[i].file) continue;
+        char *path=api_cw_file_name(rd,&d.node[i].id);
         if(under[0]&&!strstr(path,under)){ free(path); continue; }
         Found f={0}; f.rank.file=i; f.rank.path=path;
-        f.count=fo_outline(pg,rd,&d.n[i].id,&f.declarations,&f.text,&f.length);
+        f.count=fo_outline(pg,rd,&d.node[i].id,&f.declarations,&f.text,&f.length);
         for(size_t k=0;k<f.count;k++) if(!strcmp(f.declarations[k].name,name)) f.rank.defines=1;
         const char *at=f.text;
         while((at=strstr(at,name))){ f.rank.occ++; at+=strlen(name); }
@@ -415,10 +382,10 @@ void on_code_where(int c, const char *body) {
     char *out=NULL; size_t on=0,ocap=0;
     api_buf_fmt(&out,&on,&ocap,"{\"query\":\""); api_cw_str(&out,&on,&ocap,name);
     api_buf_fmt(&out,&on,&ocap,"\",\"id\":\"%s\",\"database\":\"%s\",\"levels\":%d,\"nodes\":%zu,\"files\":%zu,\"cut\":%s,\"hits\":[",
-            idh,PQdb(pg),levels,d.nn,nf,cut?"true":"false");
+            idh,PQdb(pg),d.levels,d.n,nf,d.cut?"true":"false");
     size_t shown=0;
     for(size_t f=0;f<nf&&shown<(size_t)limit;f++){
-        Found *file=&found[f]; char fh[33]; api_hex_id(&d.n[file->rank.file].id,fh);
+        Found *file=&found[f]; char fh[33]; api_hex_id(&d.node[file->rank.file].id,fh);
         api_buf_fmt(&out,&on,&ocap,"%s{\"path\":\"",shown?",":""); api_cw_str(&out,&on,&ocap,file->rank.path);
         api_buf_fmt(&out,&on,&ocap,"\",\"file\":\"%s\",\"defines\":[",fh);
         int nk=0;
@@ -449,8 +416,8 @@ void on_code_where(int c, const char *body) {
         }
         api_buf_add(&out,&on,&ocap,"]}",2);shown++;
     }
-    api_buf_fmt(&out,&on,&ocap,"],\"shown\":%zu,\"ms\":%.3f}",shown,(double)(api_nsec()-t0)/1e6);
+    api_buf_fmt(&out,&on,&ocap,"],\"shown\":%zu,\"walk_ms\":%.3f,\"ms\":%.3f}",shown,walk_ms,(double)(api_nsec()-t0)/1e6);
     for(size_t f=0;f<nf;f++){fo_free(found[f].declarations,found[f].count);free(found[f].text);free(found[f].rank.path);}
-    free(found);reader_free(rd);lp_idmap_free(d.m);free(d.n);
+    free(found);reader_free(rd);held_up_free(&d);
     api_http(c,200,out?out:"{\"error\":\"memory\"}");free(out);
 }
