@@ -259,6 +259,13 @@ void on_chess_tablebase(int c, const char *body){
     if (!TX || !lp_text_id(TX, "win/draw/loss", 13, &rel_wdl) || !lp_text_id(TX, "distance to zeroing", 19, &rel_dtz)) { api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
     for (int i = 0; i < 5; i++) lp_text_id(TX, TB_WDL[i], strlen(TB_WDL[i]), &word[i]);
     PGconn *pg = api_db(); if (!pg) { db_unavailable(c); return; }
+    /* The position first: one a table does not cover has no verdict, and its moves are not read. */
+    int one = 0, hub1[2] = { 0 }; Hold *h1 = holds_capped(pg, keys, 1, TB_HUB, 0, 1, hub1, &one); int covered = 0;
+    for (int k = 0; k < one && !covered; k++) { lp_id part[3];
+        covered = h1[k].claim && lp_path_ids(h1[k].path, (size_t)h1[k].path_len, part, 3) == 3 && lp_id_eq(&part[0], &keys[0]) && lp_id_eq(&part[1], &rel_wdl); }
+    holds_free(h1, one);
+    if (!covered) { char hex[33]; api_hex_id(&keys[0], hex); char out[160];
+        snprintf(out, sizeof out, "{\"position\":\"%s\",\"wdl\":null,\"dtz\":null,\"moves\":[]}", hex); api_http(c, 200, out); return; }
     int nkeys = nmoves + 1, nh = 0, *hub = calloc((size_t)nkeys * 2, sizeof(int));
     Verdict *v = calloc((size_t)nkeys, sizeof(Verdict));
     Hold *h = holds_capped(pg, keys, nkeys, TB_HUB, 0, 1, hub, &nh);
