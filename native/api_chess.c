@@ -15,7 +15,7 @@
  * position, once games are recorded) is a hub: its own names are read, the routes through it are not. */
 #define _GNU_SOURCE
 #include "api_internal.h"
-#include "lpm_internal.h"
+#include "os.h"
 #include "chess_rules.h"
 
 #define LINES_CAP 20000
@@ -165,9 +165,30 @@ void on_chess_position(int c, const char *body){
 
 /* A game's positions, P0 first: its PGN (or bare movetext) read by the Engine's chess with the engine's own grammars,
  * or a recorded line's positions from its path. 0: it does not replay, or the ID is no recorded line. */
+/* A tree-sitter grammar the engine compiled, by name, from LAPLACE_GRAMMARS (else the directory this build was
+ * configured with); loaded once. NULL: no such grammar there. */
+static const void *chess_grammar(const char *name) {
+    static char names[8][32];
+    static const void *langs[8];
+    static int nlang;
+    for (int i = 0; i < nlang; i++) if (!strcmp(names[i], name)) return langs[i];
+    char so[512], sym[96];
+    const char *dir = getenv("LAPLACE_GRAMMARS");
+    snprintf(so, sizeof so, "%s/libtree-sitter-%s" OS_DLL_SUFFIX, dir && *dir ? dir : LPM_GRAMMARS_DEFAULT, name);
+    if (!os_exists(so)) return NULL;
+    void *h = os_dl_open(so);
+    if (!h) return NULL;
+    snprintf(sym, sizeof sym, "tree_sitter_%s", name);
+    const void *(*fn)(void) = (const void *(*)(void))os_dl_sym(h, sym);
+    if (!fn) return NULL;
+    const void *lang = fn();
+    if (nlang < 8) { snprintf(names[nlang], sizeof names[nlang], "%s", name); langs[nlang++] = lang; }
+    return lang;
+}
+
 static size_t game_positions(PGconn *pg, const char *pgn, const lp_id *line_id, lp_id *positions, lp_id *line){
     if (pgn) {
-        const void *full = lpm_load_lang("pgn"), *moves = lpm_load_lang("pgn_moves");
+        const void *full = chess_grammar("pgn"), *moves = chess_grammar("pgn_moves");
         size_t n = full ? lp_chess_pgn_positions(full, pgn, strlen(pgn), positions, GAME_PLIES + 1, line) : 0;
         if (!n && moves) n = lp_chess_pgn_positions(moves, pgn, strlen(pgn), positions, GAME_PLIES + 1, line);
         return n;

@@ -7,7 +7,7 @@
  * The query is decomposed as everything is (Native UAX #29): its word segments, and each run of segments with no space
  * between them (an identifier such as lp_ref_compose, a dotted or hyphenated name), are its terms, each the same entity
  * wherever that content was recorded. From the terms the Engine's reader walks up the container index to the files that
- * hold them (held_up), every node carrying which terms are below it. A term held directly by more than LAPLACE_CODE_HUB
+ * hold them (held_in: laplace_held_files, one call inside PostgreSQL), each file with the terms below it. A term held directly by more than LAPLACE_CODE_HUB
  * paths of a kind is a hub and is not walked. Files are those of the source's witness (LAPLACE_CODE_SOURCE, the witness's
  * name, default "Laplace Workspace"); each scores the inverse document frequency, over those files, of the terms it
  * holds. The retrieval unit of a file is the lowest node of its content that holds every term the file holds (their
@@ -92,6 +92,7 @@ static lp_idmap *SCOPE;
 static char SCOPE_NAME[256];
 static uint8_t SCOPE_SIG[16];
 static int SCOPE_WITNESSES;
+static lp_id SCOPE_TRUNK;             /* the witness, when exactly one is named so */
 static lp_idmap *code_scope(PGconn *pg, Reader *rd, const char *name, int *witnesses) {
     PGresult *r = db_exec_params(pg, "SELECT witness FROM @extschema@.laplace_witness_trust() ORDER BY witness", 0, NULL, NULL, NULL, NULL, 1);
     if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); *witnesses = 0; return NULL; }
@@ -129,6 +130,7 @@ static lp_idmap *code_scope(PGconn *pg, Reader *rd, const char *name, int *witne
             lp_vec_reserve(&vx, nv);
             lp_path_vertices(x->path, (size_t)x->path_len, vx.v, nv);
             for (size_t k = 1; k < nv; k++) lp_idmap_put(front, &vx.v[k].id, NULL);
+            SCOPE_TRUNK = x->entity;
             matched++;
         }
         free(t);
@@ -451,7 +453,7 @@ void on_code_search(int c, const char *body) {
     for (int b = 0; b < terms.n; b++) if (holders[b] > 0) idf[b] = term_idf(holders[b], universe);
 
     /* the seeds: the rarest terms, while their holders together stay within LAPLACE_CODE_SEED (at least the rarest one),
-     * walked up the container index to the files that hold them (held_up) */
+     * walked up the container index to the files that hold them (held_in) */
     int order[64], nseed = 0;
     for (int b = 0; b < terms.n; b++) order[b] = b;
     for (int i = 1; i < terms.n; i++)
@@ -468,14 +470,19 @@ void on_code_search(int c, const char *body) {
         spent += holders[b];
     }
     uint64_t t_walk = api_nsec();
-    HeldUp u = { 0 };
-    if (nseed) held_up(pg, seeds, nseed, HELD_CONTENT, (hubs >> seed_term[0] & 1) ? -1 : (int)cap, (size_t)(most > 0 ? most : 400000), &u);
+    /* inside PostgreSQL, one call: under the witness when exactly one is named so */
+    uint64_t walk_hubs = 0;
+    int levels = 0, cut = 0;
+    size_t nfound = 0;
+    HeldFile *found = nseed ? held_in(pg, witnesses == 1 ? &SCOPE_TRUNK : NULL, seeds, nseed,
+                                      (hubs >> seed_term[0] & 1) ? -1 : cap, most > 0 ? most : 400000,
+                                      &walk_hubs, &levels, &cut, &nfound) : NULL;
     lp_vec(CodeHit) hits = { 0 };
-    for (size_t i = 0; i < u.n; i++) {
-        if (!u.node[i].file || !u.node[i].keys) continue;
-        if (scope && lp_idmap_find(scope, &u.node[i].id) < 0) continue;
-        CodeHit h = { .file = u.node[i].id, .prior = 1.0 };
-        for (int s = 0; s < nseed; s++) if (u.node[i].keys >> s & 1) h.seed += idf[seed_term[s]];
+    for (size_t i = 0; i < nfound; i++) {
+        if (!found[i].keys) continue;
+        if (scope && lp_idmap_find(scope, &found[i].file) < 0) continue;
+        CodeHit h = { .file = found[i].file, .prior = 1.0 };
+        for (int s = 0; s < nseed; s++) if (found[i].keys >> s & 1) h.seed += idf[seed_term[s]];
         lp_push(&hits, h);
     }
     size_t reached = hits.n;
@@ -587,11 +594,11 @@ void on_code_search(int c, const char *body) {
     size_t un = 0, ucap = 0;
     api_buf_fmt(&out, &un, &ucap,
             "{\"docs\":%zu,\"entities\":%zu,\"ms\":%.3f,\"model\":\"laplace-containment\",\"fusion\":\"%s\",\"scope\":\"%s\","
-            "\"source\":\"", scope ? lp_idmap_count(scope) : 0, u.n, ms, fusion, scope_s);
+            "\"source\":\"", scope ? lp_idmap_count(scope) : 0, nfound, ms, fusion, scope_s);
     api_cw_str(&out, &un, &ucap, source);
     api_buf_fmt(&out, &un, &ucap, "\",\"witnesses\":%d,\"weights\":{\"rerank\":%g},\"levels\":%d,\"cut\":%s,"
             "\"phases_ms\":{\"scope\":%.1f,\"terms\":%.1f,\"walk\":%.1f,\"read\":%.1f,\"units\":%.1f},\"terms\":[",
-            witnesses, w_rr, u.levels, u.cut ? "true" : "false", (double)(t_terms - t_scope) / 1e6,
+            witnesses, w_rr, levels, cut ? "true" : "false", (double)(t_terms - t_scope) / 1e6,
             (double)(t_walk - t_terms) / 1e6, (double)(t_read - t_walk) / 1e6, (double)(t_units - t_read) / 1e6,
             (double)(api_nsec() - t_units) / 1e6);
     for (int b = 0; b < terms.n; b++) {
@@ -624,7 +631,7 @@ void on_code_search(int c, const char *body) {
     api_buf_add(&out, &un, &ucap, "]}", 2);
     for (size_t i = 0; i < hits.n; i++) { free(hits.v[i].path); free(hits.v[i].snippet); }
     lp_vec_free(&hits);
-    held_up_free(&u);
+    free(found);
     reader_free(rd);
     api_http(c, 200, out ? out : "{\"hits\":[]}");
     free(out);
