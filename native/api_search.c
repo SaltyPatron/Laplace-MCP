@@ -294,87 +294,11 @@ static int hit_cmp(const void *a, const void *b) {
     if (x->shared != y->shared) return y->shared - x->shared;
     return memcmp(x->file.b, y->file.b, 16);
 }
-static int seed_cmp(const void *a, const void *b) {
-    const CodeHit *x = a, *y = b;
-    if (x->seed != y->seed) return x->seed < y->seed ? 1 : -1;
-    return memcmp(x->file.b, y->file.b, 16);
-}
 static int popcount64(uint64_t x) { int n = 0; while (x) { x &= x - 1; n++; } return n; }
 static size_t lines_to(const char *text, size_t upto) {
     size_t l = 1;
     for (size_t i = 0; i < upto && text[i]; i++) if (text[i] == '\n') l++;
     return l;
-}
-
-/* A node's constituents as the reader holds them (what a record says, its claims, is not among them). */
-static size_t dag_parts(Reader *rd, const lp_id *id, lp_id **buf, size_t *cap) {
-    if (!*cap) { *cap = 64; *buf = malloc(sizeof **buf * *cap); }
-    for (;;) {
-        size_t n = reader_parts(rd, id, *buf, *cap);
-        if (n < *cap) return n;
-        *cap *= 4;
-        *buf = realloc(*buf, sizeof **buf * *cap);
-    }
-}
-/* Which terms a node holds, at any depth, and how many codepoints it spans, by its constituents as the reader read them
- * (runs written out); memo holds each node's once. */
-typedef struct { uint64_t keys; double length; } DagNode;
-typedef struct { Reader *rd; lp_idmap *terms, *memo; } Dag;
-static DagNode dag_node(Dag *g, const lp_id *id, int depth) {
-    DagNode *seen = lp_idmap_lookup(g->memo, id);
-    if (seen) return *seen;
-    DagNode x = { 0, 1 };
-    int64_t t = lp_idmap_find(g->terms, id);
-    if (t >= 0) x.keys |= 1ull << t;
-    if (depth < 512 && lp_tier0_codepoint(T0, id) < 0) {
-        lp_id *kid = NULL;
-        size_t cap = 0, n = dag_parts(g->rd, id, &kid, &cap);
-        if (n) x.length = 0;
-        for (size_t i = 0; i < n; i++) {
-            DagNode k = dag_node(g, &kid[i], depth + 1);
-            x.keys |= k.keys;
-            x.length += k.length;
-        }
-        free(kid);
-    }
-    bool fresh;
-    *(DagNode *)lp_idmap_get(g->memo, id, &fresh) = x;
-    return x;
-}
-/* A unit's score: the weight of the terms it holds, each once, normalized by its length as BM25 does a document's
- * (k1 1.2, b 0.75, against LAPLACE_CODE_UNIT_BYTES, default 2048). */
-static double unit_score(const DagNode *x, const double *idf, double average) {
-    double w = 0;
-    for (int b = 0; b < 64; b++) if (x->keys >> b & 1) w += idf[b];
-    return w * 2.2 / (1.0 + 1.2 * (0.25 + 0.75 * x->length / average));
-}
-/* The unit of a file: of the nodes of its content (not the OS's record of it), the one that scores most, the smallest
- * of equals; *best takes its score. */
-static lp_id dag_unit(Dag *g, const lp_id *file, const double *idf, double average, double *best) {
-    lp_id unit = *file, *kid = NULL;
-    size_t cap = 0;
-    *best = 0;
-    double best_length = 0;
-    lp_idmap *seen = lp_idmap_new();
-    lp_vec(lp_id) stack = { 0 };
-    size_t n = dag_parts(g->rd, file, &kid, &cap);
-    for (size_t i = n; i-- > 1;) lp_push(&stack, kid[i]);      /* part 0 is the OS's record of the file */
-    while (stack.n) {
-        lp_id at = stack.v[--stack.n];
-        bool fresh;
-        lp_idmap_put(seen, &at, &fresh);
-        if (!fresh) continue;
-        DagNode x = dag_node(g, &at, 0);
-        if (!x.keys) continue;
-        double s = unit_score(&x, idf, average);
-        if (s > *best || (s == *best && x.length < best_length)) { *best = s; best_length = x.length; unit = at; }
-        n = dag_parts(g->rd, &at, &kid, &cap);
-        for (size_t i = n; i-- > 0;) lp_push(&stack, kid[i]);
-    }
-    lp_vec_free(&stack);
-    lp_idmap_free(seen);
-    free(kid);
-    return unit;
 }
 
 void on_code_search(int c, const char *body) {
@@ -436,7 +360,7 @@ void on_code_search(int c, const char *body) {
     /* how common each term is: the paths that hold it directly, read from the container index at once; a term with
      * more than LAPLACE_CODE_HUB of a kind is a hub */
     uint64_t t_terms = api_nsec();
-    long cap = env_long("LAPLACE_CODE_HUB", 4096), budget = env_long("LAPLACE_CODE_SEED", 6000);
+    long cap = env_long("LAPLACE_CODE_HUB", 4096);
     long most = env_long("LAPLACE_CODE_NODES", 400000);
     double holders[64] = { 0 }, idf[64] = { 0 }, total = 0;
     uint64_t hubs = 0;
@@ -448,58 +372,56 @@ void on_code_search(int c, const char *body) {
         for (int b = 0; b < terms.n; b++) if (hub[2 * b] || hub[2 * b + 1]) { hubs |= 1ull << b; holders[b] = (double)cap + 1; }
         free(hub);
     }
-    /* a term's weight: its inverse frequency among 64 times the hub cap of paths; a hub's is read below, from the files */
+    /* a term's weight: its inverse frequency among 64 times the hub cap of paths. Hubs are not walked. */
     double universe = 64.0 * ((double)cap + 1);
-    for (int b = 0; b < terms.n; b++) if (holders[b] > 0) idf[b] = term_idf(holders[b], universe);
+    for (int b = 0; b < terms.n; b++) if (holders[b] > 0 && !(hubs >> b & 1)) { idf[b] = term_idf(holders[b], universe); total += idf[b]; }
 
-    /* the seeds: the rarest terms, while their holders together stay within LAPLACE_CODE_SEED (at least the rarest one),
-     * walked up the container index to the files that hold them (held_in) */
-    int order[64], nseed = 0;
-    for (int b = 0; b < terms.n; b++) order[b] = b;
-    for (int i = 1; i < terms.n; i++)
-        for (int j = i; j > 0 && holders[order[j]] < holders[order[j - 1]]; j--) { int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
-    lp_id seeds[64];
-    int seed_term[64];
-    double spent = 0;
-    for (int i = 0; i < terms.n; i++) {
-        int b = order[i];
-        if (holders[b] <= 0) continue;
-        if (nseed && (spent + holders[b] > (double)budget || (hubs >> b & 1))) break;
-        seeds[nseed] = terms.id[b];
-        seed_term[nseed++] = b;
-        spent += holders[b];
-    }
+    /* every term that is held and no hub, walked up the container index to the source's files in one call inside
+     * PostgreSQL (held_in), each file with its unit, the unit's length and each term's occurrences below it */
+    lp_id walked[64];
+    int walked_term[64], nwalked = 0;
+    for (int b = 0; b < terms.n; b++)
+        if (holders[b] > 0 && !(hubs >> b & 1)) { walked[nwalked] = terms.id[b]; walked_term[nwalked++] = b; }
     uint64_t t_walk = api_nsec();
-    /* inside PostgreSQL, one call: under the witness when exactly one is named so */
     uint64_t walk_hubs = 0;
     int levels = 0, cut = 0;
     size_t nfound = 0;
-    HeldFile *found = nseed ? held_in(pg, witnesses == 1 ? &SCOPE_TRUNK : NULL, seeds, nseed,
-                                      (hubs >> seed_term[0] & 1) ? -1 : cap, most > 0 ? most : 400000,
-                                      &walk_hubs, &levels, &cut, &nfound) : NULL;
+    HeldFile *found = nwalked ? held_in(pg, witnesses == 1 ? &SCOPE_TRUNK : NULL, walked, nwalked, -1,
+                                        most > 0 ? most : 400000, &walk_hubs, &levels, &cut, &nfound) : NULL;
+
+    /* each file scores its unit by BM25 (k1 1.2, b 0.75) over the terms' occurrences; the unit's size is its tier (a
+     * whole file's path is only its record and its content), against the mean of the units' */
+    uint64_t t_rank = api_nsec();
+    double mean = 0;
+    size_t counted = 0;
+    for (size_t i = 0; i < nfound; i++) if (!scope || lp_idmap_find(scope, &found[i].file) >= 0) { mean += (double)found[i].tier; counted++; }
+    mean = counted && mean > 0 ? mean / (double)counted : 1;
     lp_vec(CodeHit) hits = { 0 };
     for (size_t i = 0; i < nfound; i++) {
-        if (!found[i].keys) continue;
-        if (scope && lp_idmap_find(scope, &found[i].file) < 0) continue;
-        CodeHit h = { .file = found[i].file, .prior = 1.0 };
-        for (int s = 0; s < nseed; s++) if (found[i].keys >> s & 1) h.seed += idf[seed_term[s]];
+        const HeldFile *f = &found[i];
+        if (!f->keys || (scope && lp_idmap_find(scope, &f->file) < 0)) continue;
+        CodeHit h = { .file = f->file, .unit = f->unit, .prior = 1.0 };
+        double norm = 1.2 * (0.25 + 0.75 * (double)f->tier / mean);
+        for (int w = 0; w < nwalked && w < 64; w++) {
+            if (!(f->keys >> w & 1)) continue;
+            double tf = f->count[w] ? (double)f->count[w] : 1;
+            h.score += idf[walked_term[w]] * tf * 2.2 / (tf + norm);
+            h.keys |= 1ull << walked_term[w];
+        }
+        h.shared = popcount64(h.keys);
         lp_push(&hits, h);
     }
     size_t reached = hits.n;
-    qsort(hits.v, hits.n, sizeof *hits.v, seed_cmp);
+    qsort(hits.v, hits.n, sizeof *hits.v, hit_cmp);
 
-    /* the leading candidates, read down by ID (their paths, the reader's arena): which of all the terms each holds */
-    uint64_t t_read = api_nsec();
+    /* the leading files' paths: the scope and path filters and, over all scopes, prose and tests weigh less */
     size_t want = (size_t)limit * 3;
-    long lead_n = env_long("LAPLACE_CODE_CANDIDATES", 64);
-    if (want < (size_t)lead_n) want = (size_t)lead_n;
+    if (want < 32) want = 32;
     if (want > hits.n) want = hits.n;
     lp_vec(lp_id) lead = { 0 };
     for (size_t i = 0; i < want; i++) lp_push(&lead, hits.v[i].file);
-    reader_prefetch(rd, lead.v, lead.n, 0);
+    reader_prefetch(rd, lead.v, lead.n, 1024);
     lp_vec_free(&lead);
-    Dag g = { rd, lp_idmap_new(), lp_idmap_sized(sizeof(DagNode)) };
-    for (int b = 0; b < terms.n; b++) lp_idmap_put(g.terms, &terms.id[b], NULL);
     size_t kept = 0;
     for (size_t i = 0; i < want; i++) {
         CodeHit h = hits.v[i];
@@ -515,38 +437,14 @@ void on_code_search(int c, const char *body) {
             else if (is_test_path(h.path)) h.prior = 0.25;
             else if (dot && (!strcasecmp(dot, ".h") || !strcasecmp(dot, ".hpp"))) h.prior = 0.85;
         }
-        h.keys = dag_node(&g, &h.file, 0).keys;
-        h.shared = popcount64(h.keys);
         hits.v[kept++] = h;
     }
     hits.n = kept;
-    /* a hub's weight is its inverse frequency among the files read, at most a hub's among the paths */
-    for (int b = 0; b < terms.n; b++) {
-        if (!(hubs >> b & 1)) continue;
-        double df = 0;
-        for (size_t i = 0; i < hits.n; i++) df += (double)(hits.v[i].keys >> b & 1);
-        idf[b] = term_idf(df, (double)hits.n);
-        if (idf[b] > term_idf((double)cap + 1, universe)) idf[b] = term_idf((double)cap + 1, universe);
-    }
-    for (int b = 0; b < terms.n; b++) total += idf[b];
-    double average = (double)env_long("LAPLACE_CODE_UNIT_BYTES", 2048);
-    for (size_t i = 0; i < hits.n; i++) {
-        CodeHit *h = &hits.v[i];
-        h->unit = dag_unit(&g, &h->file, idf, average, &h->score);
-        /* what the OS's record of the file holds (its name, its folders) adds a quarter of its weight */
-        lp_id *kid = NULL;
-        size_t kcap = 0;
-        if (dag_parts(rd, &h->file, &kid, &kcap)) {
-            uint64_t named = dag_node(&g, &kid[0], 0).keys;
-            for (int b = 0; b < terms.n; b++) if (named >> b & 1) h->score += 0.25 * idf[b];
-        }
-        free(kid);
-    }
     qsort(hits.v, hits.n, sizeof *hits.v, hit_cmp);
     int explain = api_jbool(body, "explain", 0);
     size_t shown = explain ? hits.n : hits.n < (size_t)limit ? hits.n : (size_t)limit;
 
-    /* each shown file's unit, its lines in the file's recorded text, and its text */
+    /* text only for what is returned: each shown unit's lines in its file's recorded text, and its first 60 lines */
     uint64_t t_units = api_nsec();
     lp_vec(lp_id) units = { 0 };
     for (size_t i = 0; i < shown; i++) {
@@ -561,7 +459,6 @@ void on_code_search(int c, const char *body) {
         size_t start = at ? (size_t)(at - text) : 0, length = at ? strlen(unit) : tn;
         h->line0 = lines_to(text, start);
         h->line1 = lines_to(text, start + length) - (length && text[start + length - 1] == '\n');
-        /* the snippet: the unit's first 60 lines */
         size_t end = start, nl = 0;
         while (end < start + length && nl < 60) { if (text[end] == '\n') nl++; end++; }
         if (end - start > 8192) { end = start + 8192; while (end > start && ((uint8_t)text[end] & 0xc0) == 0x80) end--; }
@@ -571,8 +468,6 @@ void on_code_search(int c, const char *body) {
         free(unit);
         free(text);
     }
-    lp_idmap_free(g.terms);
-    lp_idmap_free(g.memo);
     if (units.n) {
         uint8_t *param = malloc(20 + 20 * units.n);
         size_t pl = ids_param(pg, param, units.v, (uint32_t)units.n);
@@ -597,18 +492,18 @@ void on_code_search(int c, const char *body) {
             "\"source\":\"", scope ? lp_idmap_count(scope) : 0, nfound, ms, fusion, scope_s);
     api_cw_str(&out, &un, &ucap, source);
     api_buf_fmt(&out, &un, &ucap, "\",\"witnesses\":%d,\"weights\":{\"rerank\":%g},\"levels\":%d,\"cut\":%s,"
-            "\"phases_ms\":{\"scope\":%.1f,\"terms\":%.1f,\"walk\":%.1f,\"read\":%.1f,\"units\":%.1f},\"terms\":[",
+            "\"phases_ms\":{\"scope\":%.1f,\"terms\":%.1f,\"walk\":%.1f,\"rank\":%.1f,\"text\":%.1f},\"terms\":[",
             witnesses, w_rr, levels, cut ? "true" : "false", (double)(t_terms - t_scope) / 1e6,
-            (double)(t_walk - t_terms) / 1e6, (double)(t_read - t_walk) / 1e6, (double)(t_units - t_read) / 1e6,
+            (double)(t_walk - t_terms) / 1e6, (double)(t_rank - t_walk) / 1e6, (double)(t_units - t_rank) / 1e6,
             (double)(api_nsec() - t_units) / 1e6);
     for (int b = 0; b < terms.n; b++) {
         char id[33];
         int seed = 0;
-        for (int s = 0; s < nseed; s++) if (seed_term[s] == b) seed = 1;
+        for (int w = 0; w < nwalked; w++) if (walked_term[w] == b) seed = 1;
         api_hex_id(&terms.id[b], id);
         api_buf_fmt(&out, &un, &ucap, "%s{\"text\":\"", b ? "," : "");
         api_cw_str(&out, &un, &ucap, terms.text[b]);
-        api_buf_fmt(&out, &un, &ucap, "\",\"id\":\"%s\",\"holders\":%.0f,\"idf\":%.6f,\"hub\":%s,\"seed\":%s}", id, holders[b],
+        api_buf_fmt(&out, &un, &ucap, "\",\"id\":\"%s\",\"holders\":%.0f,\"idf\":%.6f,\"hub\":%s,\"walked\":%s}", id, holders[b],
                 idf[b], hubs >> b & 1 ? "true" : "false", seed ? "true" : "false");
     }
     if (bridge) api_buf_fmt(&out, &un, &ucap, "],\"bridge\":{\"words\":%s,\"ms\":%.3f}", binfo, bridge_ms);
