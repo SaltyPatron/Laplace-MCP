@@ -313,6 +313,10 @@ void api_dispatch(int c, const char *method, const char *path, const char *body)
     else if (!strcmp(path, "/v1/chess_position")) on_chess_position(c, body);
     else if (!strcmp(path, "/v1/chess_game_openings")) on_chess_game_openings(c, body);
     else if (!strcmp(path, "/v1/chess_tablebase")) on_chess_tablebase(c, body);
+    else if (!strcmp(path, "/v1/chess_players")) on_chess_players(c, body);
+    else if (!strcmp(path, "/v1/chess_player")) on_chess_player(c, body);
+    else if (!strcmp(path, "/v1/chess_games")) on_chess_games(c, body);
+    else if (!strcmp(path, "/v1/chess_game")) on_chess_game(c, body);
     else api_http(c, 404, "{\"error\":\"not found\"}");
 }
 

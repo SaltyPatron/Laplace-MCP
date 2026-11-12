@@ -173,6 +173,28 @@ app.MapPost("/api/chess/game-openings", async (JsonElement body, NativeRuntime n
         return NativeAnswer(await native.Read("/v1/chess_game_openings", new { line = line.GetString()!.ToLowerInvariant() }, ct));
     return Results.BadRequest(new { error = "{ pgn } or { line } or { pgns: [...] }" });
 });
+// Recorded games (Engine src/chess.c): a player is a name as a White or Black tag writes it; a game is its record.
+static int Page(int? value, int fallback, int max) => Math.Clamp(value ?? fallback, 0, max);
+app.MapGet("/api/chess/players", async (string? search, int? limit, int? offset, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(search) || search.Length > 200) return Results.BadRequest(new { error = "search: a name, or a word of one, up to 200 characters" });
+    return NativeAnswer(await native.Read("/v1/chess_players", new { search = search.Trim(), limit = Math.Max(1, Page(limit, 25, 200)), offset = Page(offset, 0, 1 << 30) }, ct));
+});
+app.MapGet("/api/chess/player", async (string? name, int? limit, int? offset, int? opponents, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(name) || name.Length > 400) return Results.BadRequest(new { error = "name: as a White or Black tag writes it, up to 400 characters" });
+    return NativeAnswer(await native.Read("/v1/chess_player", new { name, limit = Math.Max(1, Page(limit, 25, 200)), offset = Page(offset, 0, 1 << 30), opponents = Page(opponents, 25, 200) }, ct));
+});
+app.MapGet("/api/chess/games", async (string? witness, int? limit, int? offset, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(witness) || witness.Length > 200) return Results.BadRequest(new { error = "witness: a source's witness, as its recipe names it" });
+    return NativeAnswer(await native.Read("/v1/chess_games", new { witness = witness.Trim(), limit = Math.Max(1, Page(limit, 25, 200)), offset = Page(offset, 0, 1 << 30) }, ct));
+});
+app.MapGet("/api/chess/game", async (string? id, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(id) || !IsId(id)) return Results.BadRequest(new { error = "id: a record's 32-digit ID" });
+    return NativeAnswer(await native.Read("/v1/chess_game", new { id = id.ToLowerInvariant() }, ct));
+});
 // Explicit read operations only. No shell, arbitrary path, ingestion or write proxy.
 app.MapPost("/api/operations/{operation}", async (string operation, JsonElement body, NativeRuntime native, CancellationToken ct) =>
 {
