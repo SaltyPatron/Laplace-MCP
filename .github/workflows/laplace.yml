@@ -75,6 +75,7 @@ jobs:
           python3 Laplace-MCP/tests/rerank-length.py "$L"
           TMPDIR=${RUNNER_TEMP:?} LAPLACE_RECIPES=$GITHUB_WORKSPACE/Laplace-Engine/recipes python3 Laplace-MCP/tests/code-where.py "$L" "$E"
           LAPLACE_WORK=${RUNNER_TEMP:?} python3 Laplace-MCP/tests/read-snapshot.py "$L" "$E"
+          LAPLACE_WORK=${RUNNER_TEMP:?} python3 Laplace-MCP/tests/chess-games.py "$L" "$E"
       - name: Stop the private PostgreSQL instance
         if: always()
         run: python3 Laplace-Engine/tools/ci/postgres.py stop "$RUNNER_TEMP/mcp-pg"

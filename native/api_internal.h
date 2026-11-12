@@ -132,6 +132,10 @@ void on_provenance(int c, const char *body);
 void on_chess_position(int c, const char *body);
 void on_chess_game_openings(int c, const char *body);
 void on_chess_tablebase(int c, const char *body);
+void on_chess_players(int c, const char *body);
+void on_chess_player(int c, const char *body);
+void on_chess_games(int c, const char *body);
+void on_chess_game(int c, const char *body);
 
 void api_capture_begin(int stdio_mode);
 const char *api_capture_end(int stdio_mode, int *code_out);
