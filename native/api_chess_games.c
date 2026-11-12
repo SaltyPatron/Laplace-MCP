@@ -405,8 +405,9 @@ void on_chess_games(int c, const char *body){
       reader_free(names); }
     PQclear(q);
     Load L = { 0 }; L.rd = reader_new(pg);
-    /* Down each trunk to its records, a level a round trip: a vertex said HOLDS is a part with records below it (a file,
-     * a block of a file's content), one said RECORD is a record as its file holds it, [record, its claims...], or the
+    /* Down each trunk to its records, a level a round trip: a trunk's parts after its name are its files' trunks and a
+     * file's trunk is [metadata, content]; below, a vertex said HOLDS is a part with records under it (a block of a
+     * file's content), and one said RECORD is a record as its file holds it, [record, its claims...], or the
      * record itself where it claims nothing. A record's place is the order the walk reaches it in: its file's order. */
     { typedef lp_vec(lp_id) Ids; Ids level = { 0 }, held = { 0 }; lp_idmap *seen = lp_idmap_new();
       for (size_t i = 0; i < trunks.n; i++) { bool fresh; lp_idmap_put(seen, &trunks.v[i], &fresh); if (fresh) lp_push(&level, trunks.v[i]); }
@@ -414,7 +415,7 @@ void on_chess_games(int c, const char *body){
           Paths lp; paths_read(pg, level.v, level.n, &lp); Ids next = { 0 };
           for (size_t i = 0; i < level.n; i++) { const Verts *v = path_at(&lp, &level.v[i]); if (!v) continue;
               for (size_t k = 0; k < v->n && held.n < GAMES_MAX; k++) {
-                  if (v->said[k] != LP_SAID_RECORD && v->said[k] != LP_SAID_HOLDS) continue;
+                  if (v->said[k] != LP_SAID_RECORD && v->said[k] != LP_SAID_HOLDS && !(v->said[k] == 0 && depth < 2 && k > 0)) continue;
                   bool fresh; lp_idmap_put(seen, &v->id[k], &fresh); if (!fresh) continue;
                   if (v->said[k] == LP_SAID_RECORD) lp_push(&held, v->id[k]); else lp_push(&next, v->id[k]); } }
           paths_free(&lp); lp_vec_free(&level); level = next; }

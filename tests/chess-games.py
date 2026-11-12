@@ -138,6 +138,7 @@ try:
 
         # a witness's games: every record under its trunks, newest first
         played = request('/v1/chess_games', {'witness': 'Laplace'})
+        if not played.get('total'): raise AssertionError((played, sql(name, "WITH RECURSIVE t(e, d) AS (SELECT DISTINCT witness, 0 FROM attestation UNION ALL SELECT x.id, t.d + 1 FROM t JOIN physicality p ON p.entity = t.e CROSS JOIN LATERAL unnest(laplace_vertex_ids(p.path)) x(id) WHERE t.d < 4) SELECT t.d, count(*), string_agg(DISTINCT left(p.mask::text, 8), ',') FROM t LEFT JOIN physicality p ON p.entity = t.e GROUP BY 1 ORDER BY 1")))
         assert played['total'] == 3 and [g['date'] for g in played['games']] == ['2026.01.04', '2026.01.03', '2026.01.02'], played
         assert played['games'][0]['movetext'] == '1. d4 d5 0-1', played
         assert {g['id'] for g in played['games']} >= {g['id'] for g in rows}, played
