@@ -382,22 +382,26 @@ void on_chess_player(int c, const char *body){
 }
 
 /* POST /v1/chess_games {witness, limit, offset}: {witness, total, offset, games: [...]}, the records attested by every
- * trunk the witness names (a source's witness line: "Laplace" for the games Laplace plays, recipes/laplace-chess), newest
+ * witness whose trunk begins with a record of that name (a source's witness line: "Laplace" for the games Laplace plays, recipes/laplace-chess), newest
  * first, each {id, line, white, black, result, date, event, eco, movetext}. */
 void on_chess_games(int c, const char *body){
     char witness[256]; int limit = 25, offset = 0; api_jint(body, "limit", &limit); api_jint(body, "offset", &offset);
     limit = clamp(limit, 1, PAGE_MAX); offset = clamp(offset, 0, 1 << 30);
     if (!api_jstr(body, "witness", witness, sizeof witness) || !*witness) { api_http(c, 200, "{\"error\":\"witness: a source's witness, as its recipe names it\"}"); return; }
     if (!tag_ids()) { api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
-    lp_id wid; if (!lp_text_id(TX, witness, strlen(witness), &wid)) { api_http(c, 200, "{\"error\":\"witness: no text\"}"); return; }
     PGconn *pg = api_db(); if (!pg) { unavailable(c); return; }
-    Args a = { 0 }; arg_ids(&a, &wid, 1);
-    PGresult *q = ask_try(pg, "SELECT p.entity FROM @extschema@.physicality p"
-        " WHERE p.path OPERATOR(@extschema@.^@) ($1::@extschema@.blake3[])[1]"
-        " AND p.mask OPERATOR(@extschema@.?) @extschema@.laplace_bank_bit('kind','file')"
-        " AND EXISTS (SELECT FROM @extschema@.attestation w WHERE w.witness OPERATOR(@extschema@.=) p.entity)", &a);
+    /* the witnesses whose trunk begins with a record of that name: a source's trunk is [its record, its files...] */
+    Args a = { 0 };
+    PGresult *q = ask_try(pg, "SELECT witness FROM @extschema@.laplace_witness_trust()", &a);
     if (!q) { args_free(&a); unavailable(c); return; }
-    lp_vec(lp_id) trunks = { 0 }; for (int r = 0; r < PQntuples(q); r++) lp_push(&trunks, *col_id(q, r, 0)); PQclear(q);
+    lp_vec(lp_id) trunks = { 0 };
+    { Reader *names = reader_new(pg);
+      for (int r = 0; r < PQntuples(q); r++) { lp_id first[2]; const lp_id *w = col_id(q, r, 0);
+          char *nm = reader_parts(names, w, first, 2) ? reader_text(names, &first[0], 256) : NULL;
+          if (nm && !strcmp(nm, witness)) lp_push(&trunks, *w);
+          free(nm); }
+      reader_free(names); }
+    PQclear(q);
     Load L = { 0 }; L.rd = reader_new(pg);
     if (trunks.n) {
         args_reset(&a); arg_ids(&a, trunks.v, trunks.n);
