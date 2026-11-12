@@ -73,7 +73,9 @@ try:
         (games / 'fixture.pgn').write_text(GAMES, encoding='utf-8', newline='\n')
         env = dict(os.environ, LAPLACE_DATA=str(root / 'data'), LAPLACE_WORK=str(root / 'work'), LAPLACE_RECIPES=str(recipes),
                    LAPLACE_ENGINE=str(engine), LAPLACE_INGEST_ONE='1', OMP_NUM_THREADS='2')
-        result = subprocess.run([str(engine), 'ingest', '-r', str(recipes), '-d', connection, '-j', '2', '-s', 'laplace-chess', str(games / 'fixture.pgn')],
+        # A game Laplace played is stated by the runtime witness Laplace at AppDerived (Engine: laplace witness), as the
+        # application records it when the game ends; a sample of a source's files (ingest -s SOURCE FILE) publishes no witness.
+        result = subprocess.run([str(engine), 'witness', '-r', str(recipes), '-d', connection, '-j', '2', '--as', 'Laplace', '--class', 'AppDerived', str(games / 'fixture.pgn')],
                                 env=env, capture_output=True, text=True, encoding='utf-8', timeout=300)
         if result.returncode: raise RuntimeError(result.stdout + result.stderr)
 
@@ -134,9 +136,9 @@ try:
         assert laplace['peak_rating'] == 2700 and laplace['opponents_total'] == 2, laplace
         assert [(o['name'], o['games'], o['score']) for o in laplace['opponents']] == [('Carlsen, Magnus', 2, 0.5)], laplace
 
-        # a witness's games: every record its trunks attest, newest first
+        # a witness's games: every record under its trunks, newest first
         played = request('/v1/chess_games', {'witness': 'Laplace'})
-        if not played.get('total'): raise AssertionError((played, request('/v1/sources', {}), sql(name, 'SELECT count(*), count(DISTINCT witness) FROM attestation'), sql(name, "SELECT encode(blake3_send(a.witness),'hex'), count(*), count(*) FILTER (WHERE p.mask ? laplace_bank_bit('kind','claim')) FROM attestation a LEFT JOIN physicality p ON p.entity = a.claim GROUP BY 1")))
+        if not played.get('total'): raise AssertionError((played, sql(name, "WITH RECURSIVE t(e, d) AS (SELECT DISTINCT witness, 0 FROM attestation UNION ALL SELECT x.id, t.d + 1 FROM t JOIN physicality p ON p.entity = t.e CROSS JOIN LATERAL unnest(laplace_vertex_ids(p.path)) x(id) WHERE t.d < 4) SELECT t.d, count(*), string_agg(DISTINCT left(p.mask::text, 8), ',') FROM t LEFT JOIN physicality p ON p.entity = t.e GROUP BY 1 ORDER BY 1")))
         assert played['total'] == 3 and [g['date'] for g in played['games']] == ['2026.01.04', '2026.01.03', '2026.01.02'], played
         assert played['games'][0]['movetext'] == '1. d4 d5 0-1', played
         assert {g['id'] for g in played['games']} >= {g['id'] for g in rows}, played

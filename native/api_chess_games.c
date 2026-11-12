@@ -11,7 +11,7 @@
  * Every read is a containment walk, a level a round trip over every ID at once:
  *   players  the name searched, and the texts that hold it (a word of a name), up to the [White|Black, name] pairs
  *   player   the name's two pairs, up to the tag lists that hold them, up to the records that hold those
- *   games    the witness trunks whose path starts with the witness's name, and the records they attest
+ *   games    the witnesses whose trunk begins with the name asked, and down each trunk the records its files hold
  *   game     one record
  * and then, for the records reached, their tag lists, their pairs and the pairs' texts (games_load), and for the page
  * shown, their lines (movetext). */
@@ -25,6 +25,7 @@
 #define NAME_CAP 4096             /* the holders read of one such text, its tag pairs among them */
 #define PAGE_MAX 200
 #define PLIES_MAX 2048
+#define WALK_DEPTH 12              /* the levels from a witness's trunk down to its records */
 
 typedef struct { lp_id name, value; uint8_t has_value; } TagPair;
 typedef struct {
@@ -381,9 +382,10 @@ void on_chess_player(int c, const char *body){
     free(idx); load_free(&L); lp_vec_free(&tags); lp_vec_free(&side); lp_vec_free(&rivals); lp_vec_free(&elos); lp_idmap_free(rival_at);
 }
 
-/* POST /v1/chess_games {witness, limit, offset}: {witness, total, offset, games: [...]}, the records attested by every
- * witness whose trunk begins with a record of that name (a source's witness line: "Laplace" for the games Laplace plays, recipes/laplace-chess), newest
- * first, each {id, line, white, black, result, date, event, eco, movetext}. */
+/* POST /v1/chess_games {witness, limit, offset}: {witness, total, offset, games: [...]}, the records under every witness
+ * whose trunk begins with that name (a source's witness, or a witness named at run time: "Laplace" for the games
+ * Laplace plays, laplace witness --as Laplace), newest first, each {id, line, white, black, result, date, event, eco,
+ * movetext}. */
 void on_chess_games(int c, const char *body){
     char witness[256]; int limit = 25, offset = 0; api_jint(body, "limit", &limit); api_jint(body, "offset", &offset);
     limit = clamp(limit, 1, PAGE_MAX); offset = clamp(offset, 0, 1 << 30);
@@ -403,24 +405,26 @@ void on_chess_games(int c, const char *body){
       reader_free(names); }
     PQclear(q);
     Load L = { 0 }; L.rd = reader_new(pg);
-    if (trunks.n) {
-        args_reset(&a); arg_ids(&a, trunks.v, trunks.n);
-        q = ask_try(pg, "SELECT a.claim, max(a.\"position\")::int8 FROM @extschema@.attestation a"
-            " JOIN @extschema@.physicality p ON p.entity OPERATOR(@extschema@.=) a.claim"
-            " WHERE a.witness OPERATOR(@extschema@.=) ANY($1::@extschema@.blake3[])"
-            " AND NOT (p.mask OPERATOR(@extschema@.?) @extschema@.laplace_bank_bit('kind','claim'))"
-            " GROUP BY a.claim LIMIT 50000", &a);
-        if (!q) { args_free(&a); load_free(&L); lp_vec_free(&trunks); unavailable(c); return; }
-        lp_vec(lp_id) held = { 0 }; lp_vec(int64_t) at = { 0 };
-        for (int r = 0; r < PQntuples(q); r++) { lp_push(&held, *col_id(q, r, 0)); lp_push(&at, col_int(q, r, 1)); }
-        PQclear(q);
-        /* each attested unit is [record, its claims...] (said RECORD under the file), or the record itself where it claims nothing */
-        Paths hp; paths_read(pg, held.v, held.n, &hp);
-        for (size_t i = 0; i < held.n; i++) { const Verts *v = path_at(&hp, &held.v[i]); int claims = 0;
-            if (v) for (size_t k = 1; k < v->n; k++) claims |= v->said[k] == LP_SAID_CLAIM;
-            Game *g = game_add(&L, claims ? &v->id[0] : &held.v[i]); g->order = at.v[i]; }
-        paths_free(&hp); lp_vec_free(&held); lp_vec_free(&at);
-    }
+    /* Down each trunk to its records, a level a round trip: a trunk's parts after its name are its files' trunks and a
+     * file's trunk is [metadata, content]; below, a vertex said HOLDS is a part with records under it (a block of a
+     * file's content), and one said RECORD is a record as its file holds it, [record, its claims...], or the
+     * record itself where it claims nothing. A record's place is the order the walk reaches it in: its file's order. */
+    { typedef lp_vec(lp_id) Ids; Ids level = { 0 }, held = { 0 }; lp_idmap *seen = lp_idmap_new();
+      for (size_t i = 0; i < trunks.n; i++) { bool fresh; lp_idmap_put(seen, &trunks.v[i], &fresh); if (fresh) lp_push(&level, trunks.v[i]); }
+      for (int depth = 0; depth < WALK_DEPTH && level.n && held.n < GAMES_MAX; depth++) {
+          Paths lp; paths_read(pg, level.v, level.n, &lp); Ids next = { 0 };
+          for (size_t i = 0; i < level.n; i++) { const Verts *v = path_at(&lp, &level.v[i]); if (!v) continue;
+              for (size_t k = 0; k < v->n && held.n < GAMES_MAX; k++) {
+                  if (v->said[k] != LP_SAID_RECORD && v->said[k] != LP_SAID_HOLDS && !(v->said[k] == 0 && depth < 2 && k > 0)) continue;
+                  bool fresh; lp_idmap_put(seen, &v->id[k], &fresh); if (!fresh) continue;
+                  if (v->said[k] == LP_SAID_RECORD) lp_push(&held, v->id[k]); else lp_push(&next, v->id[k]); } }
+          paths_free(&lp); lp_vec_free(&level); level = next; }
+      lp_vec_free(&level); lp_idmap_free(seen);
+      Paths hp; paths_read(pg, held.v, held.n, &hp);
+      for (size_t i = 0; i < held.n; i++) { const Verts *v = path_at(&hp, &held.v[i]); int claims = 0;
+          if (v) for (size_t k = 1; k < v->n; k++) claims |= v->said[k] == LP_SAID_CLAIM;
+          Game *g = game_add(&L, claims ? &v->id[0] : &held.v[i]); g->order = (int64_t)i; }
+      paths_free(&hp); lp_vec_free(&held); }
     args_free(&a); games_load(pg, &L);
     size_t *idx = ordered(&L); char *o = NULL; size_t on = 0, oc = 0;
     api_buf_fmt(&o, &on, &oc, "{\"witness\":"); emit_str(&o, &on, &oc, witness);
