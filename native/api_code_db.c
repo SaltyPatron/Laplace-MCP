@@ -5,33 +5,39 @@
  * A file is a trunk [metadata, content]; a recipe with a grammar records its content as the syntax tree, so the nodes
  * above a name are its enclosing expressions, statements and declarations, and above them the file. Nothing is read
  * from a working tree: the path is the file's own pathname record, the text and lines are the recorded content. */
-/* A file's path from the OS's record in its metadata tree: [pathname, its folders], or [filename, NAME]. */
+/* A file's path from the OS's record in its metadata tree: [pathname, its segments] and [filename, NAME], NAME the
+ * last segment. A path of one segment is that segment (a one-child composition is its child), so a pathname that is
+ * the filename is one segment and is not read apart into the name's own parts. */
 char *api_cw_file_name(Reader *rd, const lp_id *file) {
     lp_id at = *file, kid[64];
     for (int depth = 0; depth < 8; depth++) {
         size_t n = reader_parts(rd, &at, kid, 64);
         if (!n) break;
+        lp_id pathname, filename;
+        int has_path = 0, has_name = 0;
         for (size_t i = 0; i < n && i < 64; i++) {
             lp_id two[4];
             size_t m = reader_parts(rd, &kid[i], two, 4);
             if (m != 2) continue;
             char *k = reader_text(rd, &two[0], 32);
-            int path = !strcmp(k, "pathname"), name = !strcmp(k, "filename");
+            if (!has_path && !strcmp(k, "pathname")) { pathname = two[1]; has_path = 1; }
+            else if (!has_name && !strcmp(k, "filename")) { filename = two[1]; has_name = 1; }
             free(k);
-            if (name) return reader_text(rd, &two[1], 300);
-            if (path) {
-                lp_id seg[128];
-                size_t ns = reader_parts(rd, &two[1], seg, 128);
-                char *o = calloc(1, 4096);
-                size_t ol = 0;
-                for (size_t z = 0; z < ns && z < 128 && ol < 4000; z++) {
-                    char *t = reader_text(rd, &seg[z], 300);
-                    ol += (size_t)snprintf(o + ol, 4096 - ol, "/%s", t);
-                    free(t);
-                }
-                return o;
-            }
         }
+        if (has_path) {
+            lp_id seg[128];
+            size_t ns = has_name && !memcmp(&pathname, &filename, sizeof pathname) ? 0 : reader_parts(rd, &pathname, seg, 128);
+            if (!ns) { seg[0] = pathname; ns = 1; }
+            char *o = calloc(1, 4096);
+            size_t ol = 0;
+            for (size_t z = 0; z < ns && z < 128 && ol < 4000; z++) {
+                char *t = reader_text(rd, &seg[z], 300);
+                ol += (size_t)snprintf(o + ol, 4096 - ol, "/%s", t);
+                free(t);
+            }
+            return o;
+        }
+        if (has_name) return reader_text(rd, &filename, 300);
         at = kid[0];
     }
     return strdup("");
