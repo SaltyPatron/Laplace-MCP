@@ -136,6 +136,7 @@ try:
 
         # a witness's games: every record its trunks attest, newest first
         played = request('/v1/chess_games', {'witness': 'Laplace'})
+        if not played.get('total'): raise AssertionError((played, request('/v1/sources', {}), sql(name, 'SELECT count(*), count(DISTINCT witness) FROM attestation'), sql(name, "SELECT encode(blake3_send(a.witness),'hex'), count(*), count(*) FILTER (WHERE p.mask ? laplace_bank_bit('kind','claim')) FROM attestation a LEFT JOIN physicality p ON p.entity = a.claim GROUP BY 1")))
         assert played['total'] == 3 and [g['date'] for g in played['games']] == ['2026.01.04', '2026.01.03', '2026.01.02'], played
         assert played['games'][0]['movetext'] == '1. d4 d5 0-1', played
         assert {g['id'] for g in played['games']} >= {g['id'] for g in rows}, played
