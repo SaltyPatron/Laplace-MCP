@@ -1,4 +1,4 @@
-/* Chess reads: the openings a position is named by, and the openings a game passes through.
+/* Chess reads: the openings a position is named by, the openings a game passes through, and a position's tablebase read.
  *
  * A position's ID is the Engine's (chess_rules.c in laplace_engine_reader: a FEN, or a game's PGN parsed by the
  * engine's own pgn grammar and replayed); nothing here knows a chess rule. An opening book row names the position its
@@ -16,7 +16,7 @@
 #define _GNU_SOURCE
 #include "api_internal.h"
 #include "lpm_internal.h"
-#include "chess_rules.h"
+#include "chess_tablebase.h"
 
 #define LINES_CAP 20000
 #define GAME_PLIES 1024
@@ -211,83 +211,63 @@ void on_chess_game_openings(int c, const char *body){
     book_free(&b); free(positions); api_http(c, 200, o ? o : "{\"error\":\"memory\"}"); free(o);
 }
 
-/* ---- the tablebase: what a position's recorded verdicts are, and its moves' (recipes/syzygy in the Engine)
+/* ---- the tablebase: a position's verdict, its moves and its best-play line, read from the Syzygy tables
  *
- * A Syzygy table's every position is [P, "win/draw/loss", verdict] and, where it is no draw, [P, "distance to zeroing",
- * plies], attested by the tablebase's witness; a position a game stands in is the same P, so the read is the claims that
- * hold P. The tables give no moves: the Engine's chess gives the legal moves and the position each makes
- * (lp_chess_successors), and every one of those positions' verdicts is read in the same batch, one containment probe
- * for the position and all its successors. A move is as good for the side making it as its position is bad for the side
- * to move there: the moves are ordered so, the best first; among wins the one that reaches a zeroing move soonest (a
- * capture or pawn move that keeps the win is that move), among losses the latest, as Fathom ranks a root's moves. */
-#define TB_MOVES 256
-#define TB_HUB 4096                         /* a position held by more claims is none of a tablebase's (the start position) */
-typedef struct { int wdl, has_wdl, has_dtz; lp_id dtz; } Verdict;
+ * A verdict is a deterministic read of the tables, never a record: the Engine's probe (chess_tablebase.c, in
+ * laplace_engine_reader, the one implementation `laplace tablebase` runs) gives the position's win/draw/loss and
+ * distance to zeroing, every legal move ranked by what it leaves (Fathom's root rule, best first) and the best-play line
+ * to its end, each move with the ID of its [P, M, P'] transition, the claim a game that plays it records and the
+ * claim the syzygy source records of its lines. The tables are those under $LAPLACE_SYZYGY, else
+ * $LAPLACE_DATA/Games/Chess/syzygy, mapped as probes need them (a bounded cache). What the database holds of the
+ * position is read beside it, in one containment probe: the claims that hold the position and the line's positions,
+ * and of those the moves' and the line's transitions with their standings (recorded: null where none is recorded). */
+#define TB_HUB 4096                         /* a position held by more claims is read as a hub: its transitions' standings are not */
+#define TB_LINE 1024
 static const char *const TB_WDL[5] = { "loss", "blessed loss", "draw", "cursed win", "win" };
-static int verdict_dtz(Reader *rd, const Verdict *v, int *out){
-    if (!v->has_dtz) return 0; char *t = reader_text(rd, &v->dtz, 32); if (!t) return 0;
-    char *end; long n = strtol(t, &end, 10); int ok = end != t && !*end; free(t); if (ok) *out = (int)n; return ok;
+static void emit_recorded(char **o, size_t *on, size_t *oc, lp_idmap *stood, const Hold *h, const lp_id *claim){
+    int64_t at = stood ? lp_idmap_find(stood, claim) : -1;
+    if (at < 0) { api_buf_fmt(o, on, oc, ",\"recorded\":null"); return; }
+    const Hold *x = &h[*(int *)lp_idmap_at(stood, (size_t)at)];
+    if (x->stood) api_buf_fmt(o, on, oc, ",\"recorded\":{\"rating\":%.3f,\"deviation\":%.3f,\"matches\":%lld}", x->r.rating, x->r.deviation, (long long)x->matches);
+    else api_buf_fmt(o, on, oc, ",\"recorded\":{\"rating\":null,\"deviation\":null,\"matches\":0}");
 }
-static void emit_verdict(char **o, size_t *on, size_t *oc, Reader *rd, const Verdict *v){
-    int dtz;
-    if (v->has_wdl) api_buf_fmt(o, on, oc, "\"wdl\":\"%s\"", TB_WDL[v->wdl]); else api_buf_fmt(o, on, oc, "\"wdl\":null");
-    if (verdict_dtz(rd, v, &dtz)) api_buf_fmt(o, on, oc, ",\"dtz\":%d", dtz);
-    else api_buf_fmt(o, on, oc, ",\"dtz\":%s", v->has_wdl && v->wdl == 2 ? "0" : "null");     /* a draw has no zeroing to reach */
-}
-/* How good a move is for its mover: its position's verdict for the other side, negated; unknown last. */
-typedef struct { int index, known, wdl, dtz, after; } Ranked;        /* dtz: the mover's, through the move; after: its position's own, unsigned */
-static int ranked_order(const void *a, const void *b){
-    const Ranked *x = a, *y = b;
-    if (x->known != y->known) return y->known - x->known;
-    if (!x->known) return x->index - y->index;
-    int gx = 2 - x->wdl, gy = 2 - y->wdl;                                       /* the mover's result: 4 a win .. 0 a loss */
-    if (gx != gy) return gy - gx;
-    if (gx > 2 && x->dtz != y->dtz) return x->dtz - y->dtz;                     /* a win: zeroing soonest */
-    if (gx < 2 && x->dtz != y->dtz) return y->dtz - x->dtz;                     /* a loss: latest */
-    if (gx > 2 && x->after != y->after) return x->after - y->after;             /* then the position that zeroes again soonest */
-    if (gx < 2 && x->after != y->after) return y->after - x->after;
-    return x->index - y->index;
-}
-/* GET /v1/chess_tablebase {fen}: {position, wdl, dtz, moves: [{san, position, wdl, dtz}]}, the moves best first. */
+/* /v1/chess_tablebase {fen}: {position, tables, covered, wdl, dtz, moves: [{san, uci, position, claim, wdl, dtz,
+ * value, zeroing, mate, recorded}], line: {id, result, plies: [{san, uci, position, claim, recorded}]} | null, claims,
+ * database}. wdl and dtz are the side to move's (a move's: the mover's, of the position it makes; value the mover's
+ * distance to zeroing through it); null where the tables do not cover the position (more pieces than they hold,
+ * castling rights). claims: how many recorded claims hold the position (-1 its holders are more than a hub's). */
 void on_chess_tablebase(int c, const char *body){
-    char fen[256]; lp_id keys[TB_MOVES + 1]; LpChessSuccessor next[TB_MOVES];
-    if (!api_jstr(body, "fen", fen, sizeof fen)) { api_http(c, 200, "{\"error\":\"fen: no position\"}"); return; }
-    int nmoves = lp_chess_successors(fen, strlen(fen), &keys[0], next, TB_MOVES);
-    if (nmoves < 0) { api_http(c, 200, "{\"error\":\"fen: no position\"}"); return; }
-    for (int i = 0; i < nmoves; i++) keys[i + 1] = next[i].position;
-    lp_id rel_wdl, rel_dtz, word[5];
-    if (!TX || !lp_text_id(TX, "win/draw/loss", 13, &rel_wdl) || !lp_text_id(TX, "distance to zeroing", 19, &rel_dtz)) { api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
-    for (int i = 0; i < 5; i++) lp_text_id(TX, TB_WDL[i], strlen(TB_WDL[i]), &word[i]);
-    PGconn *pg = api_db(); if (!pg) { db_unavailable(c); return; }
-    /* The position first: one a table does not cover has no verdict, and its moves are not read. */
-    int one = 0, hub1[2] = { 0 }; Hold *h1 = holds_capped(pg, keys, 1, TB_HUB, 0, 1, hub1, &one); int covered = 0;
-    for (int k = 0; k < one && !covered; k++) { lp_id part[3];
-        covered = h1[k].claim && lp_path_ids(h1[k].path, (size_t)h1[k].path_len, part, 3) == 3 && lp_id_eq(&part[0], &keys[0]) && lp_id_eq(&part[1], &rel_wdl); }
-    holds_free(h1, one);
-    if (!covered) { char hex[33]; api_hex_id(&keys[0], hex); char out[160];
-        snprintf(out, sizeof out, "{\"position\":\"%s\",\"wdl\":null,\"dtz\":null,\"moves\":[]}", hex); api_http(c, 200, out); return; }
-    int nkeys = nmoves + 1, nh = 0, *hub = calloc((size_t)nkeys * 2, sizeof(int));
-    Verdict *v = calloc((size_t)nkeys, sizeof(Verdict));
-    Hold *h = holds_capped(pg, keys, nkeys, TB_HUB, 0, 1, hub, &nh);
-    lp_vec(lp_id) texts = { 0 };
-    for (int k = 0; k < nh; k++) {
-        int key = h[k].src; lp_id part[3];
-        if (key < 0 || key >= nkeys || !h[k].claim || lp_path_ids(h[k].path, (size_t)h[k].path_len, part, 3) != 3 || !lp_id_eq(&part[0], &keys[key])) continue;
-        if (lp_id_eq(&part[1], &rel_wdl)) { for (int w = 0; w < 5; w++) if (lp_id_eq(&part[2], &word[w])) { v[key].wdl = w; v[key].has_wdl = 1; } }
-        else if (lp_id_eq(&part[1], &rel_dtz)) { v[key].dtz = part[2]; v[key].has_dtz = 1; lp_push(&texts, part[2]); }
-    }
-    holds_free(h, nh); free(hub);
-    Reader *rd = reader_new(pg); if (texts.n) reader_prefetch(rd, texts.v, texts.n, 32); lp_vec_free(&texts);
-    Ranked *r = calloc((size_t)(nmoves ? nmoves : 1), sizeof(Ranked));
-    for (int i = 0; i < nmoves; i++) { const Verdict *x = &v[i + 1]; r[i].index = i; r[i].known = x->has_wdl; r[i].wdl = x->wdl - 2; r[i].dtz = 0;
-        /* the mover's distance to zeroing through this move (Fathom's root rule): a move that zeroes is 1 itself, any
-         * other one more than the distance its position has */
-        if (x->has_wdl) { int d = 0; if (verdict_dtz(rd, x, &d)) r[i].after = abs(d); r[i].dtz = next[i].zeroing ? 1 : r[i].after + 1; } }
-    qsort(r, (size_t)nmoves, sizeof(Ranked), ranked_order);
-    char hex[33]; api_hex_id(&keys[0], hex); char *o = NULL; size_t on = 0, oc = 0;
-    api_buf_fmt(&o, &on, &oc, "{\"position\":\"%s\",", hex); emit_verdict(&o, &on, &oc, rd, &v[0]); api_buf_fmt(&o, &on, &oc, ",\"moves\":[");
-    for (int i = 0; i < nmoves; i++) { int m = r[i].index; api_hex_id(&next[m].position, hex);
-        api_buf_fmt(&o, &on, &oc, "%s{\"san\":\"%s\",\"position\":\"%s\",", i ? "," : "", next[m].san, hex); emit_verdict(&o, &on, &oc, rd, &v[m + 1]); api_buf_fmt(&o, &on, &oc, "}"); }
-    api_buf_fmt(&o, &on, &oc, "]}");
-    reader_free(rd); free(r); free(v); api_http(c, 200, o ? o : "{\"error\":\"memory\"}"); free(o);
+    char fen[256]; if (!api_jstr(body, "fen", fen, sizeof fen)) { api_http(c, 200, "{\"error\":\"fen: no position\"}"); return; }
+    LpTablebase *tb = lp_tablebase_shared();
+    LpTbProbe *p = malloc(sizeof *p); int covered = lp_tablebase_probe_fen(tb, fen, strlen(fen), p);
+    if (covered < 0) { free(p); api_http(c, 200, "{\"error\":\"fen: no position\"}"); return; }
+    LpTbPly *ply = malloc(sizeof(LpTbPly) * TB_LINE); lp_id line_id; char result[8] = ""; int plies = covered ? lp_tablebase_line_fen(tb, fen, strlen(fen), ply, TB_LINE, &line_id, result) : -1;
+    /* what the database holds: the claims holding the position and the line's positions before each ply */
+    PGconn *pg = api_db(); int nkeys = 1 + (plies > 0 ? plies : 0), nh = 0, *hub = calloc((size_t)nkeys * 2, sizeof(int)); Hold *h = NULL; lp_idmap *stood = NULL; long claims = 0;
+    if (pg) {
+        lp_id *keys = malloc(sizeof(lp_id) * (size_t)nkeys); keys[0] = p->position;
+        for (int i = 1; i < nkeys; i++) keys[i] = ply[i - 1].position;                      /* the position after ply i - 1: the one ply i is made from */
+        h = holds_capped(pg, keys, nkeys, TB_HUB, 1, 1, hub, &nh); stood = lp_idmap_sized(sizeof(int));
+        for (int k = 0; k < nh; k++) { if (!h[k].claim) continue; if (h[k].src == 0) claims++; *(int *)lp_idmap_get(stood, &h[k].entity, NULL) = k; }
+        if (hub[0]) claims = -1;
+        free(keys); }
+    char hex[33]; char *o = NULL; size_t on = 0, oc = 0; api_hex_id(&p->position, hex);
+    api_buf_fmt(&o, &on, &oc, "{\"position\":\"%s\",\"tables\":%s,\"covered\":%s,", hex, tb ? "true" : "false", covered ? "true" : "false");
+    if (covered) api_buf_fmt(&o, &on, &oc, "\"wdl\":\"%s\",\"dtz\":%d", TB_WDL[p->wdl + 2], p->dtz); else api_buf_fmt(&o, &on, &oc, "\"wdl\":null,\"dtz\":null");
+    api_buf_fmt(&o, &on, &oc, ",\"moves\":[");
+    for (int i = 0; i < p->nmoves; i++) { const LpTbMove *m = &p->move[i]; char ph[33], ch[33]; api_hex_id(&m->position, ph); api_hex_id(&m->claim, ch);
+        api_buf_fmt(&o, &on, &oc, "%s{\"san\":\"%s\",\"uci\":\"%s\",\"position\":\"%s\",\"claim\":\"%s\",", i ? "," : "", m->san, m->uci, ph, ch);
+        if (covered) api_buf_fmt(&o, &on, &oc, "\"wdl\":\"%s\",\"dtz\":%d,\"value\":%d,\"zeroing\":%s,\"mate\":%s", TB_WDL[m->wdl + 2], m->dtz, m->value, m->zeroing ? "true" : "false", m->mate ? "true" : "false");
+        else api_buf_fmt(&o, &on, &oc, "\"wdl\":null,\"dtz\":null,\"value\":null,\"zeroing\":null,\"mate\":null");
+        emit_recorded(&o, &on, &oc, stood, h, &m->claim); api_buf_fmt(&o, &on, &oc, "}"); }
+    api_buf_fmt(&o, &on, &oc, "],\"line\":");
+    if (plies > 0) { api_hex_id(&line_id, hex); api_buf_fmt(&o, &on, &oc, "{\"id\":\"%s\",\"result\":\"%s\",\"plies\":[", hex, result);
+        for (int i = 0; i < plies; i++) { char ph[33], ch[33]; api_hex_id(&ply[i].position, ph); api_hex_id(&ply[i].claim, ch);
+            api_buf_fmt(&o, &on, &oc, "%s{\"san\":\"%s\",\"uci\":\"%s\",\"position\":\"%s\",\"claim\":\"%s\"", i ? "," : "", ply[i].san, ply[i].uci, ph, ch);
+            emit_recorded(&o, &on, &oc, stood, h, &ply[i].claim); api_buf_fmt(&o, &on, &oc, "}"); }
+        api_buf_fmt(&o, &on, &oc, "]}"); }
+    else api_buf_fmt(&o, &on, &oc, "null");
+    if (pg) api_buf_fmt(&o, &on, &oc, ",\"claims\":%ld,\"database\":true}", claims); else api_buf_fmt(&o, &on, &oc, ",\"claims\":null,\"database\":false}");
+    if (h) holds_free(h, nh); if (stood) lp_idmap_free(stood); free(hub); free(ply); free(p);
+    api_http(c, 200, o ? o : "{\"error\":\"memory\"}"); free(o);
 }
