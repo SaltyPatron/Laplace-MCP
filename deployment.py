@@ -161,6 +161,8 @@ def runtime_environment(config, release):
         'LAPLACE_MCP_HOST': config['bind'], 'LAPLACE_MCP_PORT': str(config['http_port']),
         'OMP_NUM_THREADS': str(config['threads']), 'MKL_NUM_THREADS': '1',
         'LAPLACE_BATCH_MB': str(config['batch_mb']),
+        # Where the host's CI ingest runs are logged (ingest.sh: <dir>/<UTC>/<step>.log), read by ingest_status.
+        **({'LAPLACE_INGEST_RUNS': config['ingest_runs']} if config.get('ingest_runs') else {}),
     }
 
 
