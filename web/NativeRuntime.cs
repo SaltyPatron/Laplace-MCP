@@ -152,8 +152,9 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         start.Environment["LAPLACE_GRAMMARS"] = Path.Combine(release, "share", "grammars");
         start.Environment["LAPLACE_FIRMWARE"] = Path.Combine(release, "share", "firmware", "program.firmware");
         start.Environment["LAPLACE_ENGINE"] = Path.Combine(bin, "laplace.exe");
-        // Source declarations root at $LAPLACE_DATA, $LAPLACE_SRC and $LAPLACE_MODELS.
-        foreach (var (property, variable) in new[] { ("data", "LAPLACE_DATA"), ("src", "LAPLACE_SRC"), ("models", "LAPLACE_MODELS") })
+        // Source declarations root at $LAPLACE_DATA, $LAPLACE_SRC and $LAPLACE_MODELS; the endgame tables the tablebase read
+        // probes are under $LAPLACE_SYZYGY, else $LAPLACE_DATA/Games/Chess/syzygy (Laplace-Engine chess_tablebase.c).
+        foreach (var (property, variable) in new[] { ("data", "LAPLACE_DATA"), ("src", "LAPLACE_SRC"), ("models", "LAPLACE_MODELS"), ("syzygy", "LAPLACE_SYZYGY") })
             if (config.TryGetProperty(property, out var located) && located.GetString() is { Length: > 0 } path)
                 start.Environment[variable] = path;
         start.Environment["LAPLACE_CODE_ROOTS"] = config.TryGetProperty("code_roots", out var roots)

@@ -149,7 +149,8 @@ app.MapGet("/api/chess/position", async (string? fen, NativeRuntime native, Canc
     if (string.IsNullOrWhiteSpace(fen) || fen.Length > 128) return Results.BadRequest(new { error = "fen: a FEN, up to 128 characters" });
     return NativeAnswer(await native.Read("/v1/chess_position", new { fen = fen.Trim() }, ct));
 });
-// The tablebase's verdicts of a position and of each legal move's position (Engine recipes/syzygy), best move first.
+// The tablebase's read of a position: its verdict, its moves ranked best first and its best-play line, probed from the
+// Syzygy tables by the Engine (chess_tablebase.c), with the standings of the transitions the database records.
 app.MapGet("/api/chess/tablebase", async (string? fen, NativeRuntime native, CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(fen) || fen.Length > 128) return Results.BadRequest(new { error = "fen: a FEN, up to 128 characters" });
