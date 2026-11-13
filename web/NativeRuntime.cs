@@ -24,8 +24,17 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
     string imageHash = "";
     bool disposed;
 
+    // A host whose service manager already runs the reader (systemd's laplace-modular-mcp on Linux) names it here: a
+    // loopback URL, its token from the environment the service manager gives this host. Otherwise this host starts its
+    // own reader from the installation (IIS), and owns its lifetime.
+    Uri? External => configuration["NativeEndpoint"] is { Length: > 0 } endpoint
+        ? Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback
+            ? uri : throw new NativeUnavailableException("NativeEndpoint must be a loopback http URL.")
+        : null;
+
     public object? ReaderEvidence()
     {
+        if (External is { } external) return new { endpoint = external.GetLeftPart(UriPartial.Authority), managed = "service" };
         try
         {
             return process is { HasExited: false } reader ? new
@@ -106,6 +115,7 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         catch (HttpRequestException ex)
         {
             logger.LogWarning("Native reader transport failed: {Type}", ex.GetType().Name);
+            if (External is not null) throw new NativeUnavailableException("The native reader service did not answer. Retry the request.");
             Stop();
             throw new NativeUnavailableException("The native reader is reconnecting. Retry the request.");
         }
@@ -120,6 +130,14 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
 
     async Task EnsureStarted(CancellationToken cancellationToken)
     {
+        if (External is { } external)
+        {
+            if (origin is not null) return;
+            token = Environment.GetEnvironmentVariable("LAPLACE_MCP_TOKEN") is { Length: >= 32 } given
+                ? given.Trim() : throw new NativeUnavailableException("The native reader's token is not in this host's environment.");
+            origin = external;
+            return;
+        }
         if (process is { HasExited: false }) return;
         Stop();
         var configuredFile = configuration["NativeConfigFile"] ?? throw new NativeUnavailableException("Native reader installation is not configured.");
@@ -130,7 +148,8 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         var release = Value("release");
         var bin = Path.Combine(release, "bin");
         var prepared = Path.Combine(release, "share", "prepared");
-        var executable = Path.Combine(AppContext.BaseDirectory, "native", "lpm.exe");
+        var exe = OperatingSystem.IsWindows() ? ".exe" : "";
+        var executable = Path.Combine(AppContext.BaseDirectory, "native", "lpm" + exe);
         var highway = Path.Combine(AppContext.BaseDirectory, "native", "tier0.highway");
         if (!Directory.Exists(bin) || !File.Exists(executable) || !File.Exists(highway) || !File.Exists(Path.Combine(prepared, "tier0.bin")))
             throw new NativeUnavailableException("The installed native reader or perf-cache is unavailable.");
@@ -142,7 +161,8 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         var start = new ProcessStartInfo(executable) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = bin, RedirectStandardError = true, RedirectStandardOutput = true };
         start.ArgumentList.Add("serve"); start.ArgumentList.Add("127.0.0.1"); start.ArgumentList.Add(port.ToString(System.Globalization.CultureInfo.InvariantCulture));
         static string Quote(string value) => "'" + value.Replace("\\", "\\\\").Replace("'", "\\'") + "'";
-        start.Environment["LAPLACE_CONNINFO"] = $"host={Quote(Value("host"))} hostaddr=127.0.0.1 dbname={Quote(Value("database"))} user={Quote(Value("role"))} sslmode=verify-full sslrootcert={Quote(Value("certificate"))} require_auth=sspi connect_timeout=5 passfile={Quote(Path.Combine(Path.GetDirectoryName(file)!, "no-password-file"))} options='-c default_transaction_read_only=on -c statement_timeout=20000'";
+        // The installation declares how its reader reaches the database; IIS's default is Windows authentication.
+        start.Environment["LAPLACE_CONNINFO"] = config.TryGetProperty("conninfo", out var declared) && declared.GetString() is { Length: > 0 } conninfo ? conninfo : $"host={Quote(Value("host"))} hostaddr=127.0.0.1 dbname={Quote(Value("database"))} user={Quote(Value("role"))} sslmode=verify-full sslrootcert={Quote(Value("certificate"))} require_auth=sspi connect_timeout=5 passfile={Quote(Path.Combine(Path.GetDirectoryName(file)!, "no-password-file"))} options='-c default_transaction_read_only=on -c statement_timeout=20000'";
         start.Environment["LAPLACE_MCP_TOKEN"] = token;
         start.Environment["LAPLACE_TIER0"] = Path.Combine(prepared, "tier0.bin");
         start.Environment["LAPLACE_FLAGS"] = Path.Combine(prepared, "tier0.flags");
@@ -151,7 +171,7 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         start.Environment["LAPLACE_RECIPES"] = Path.Combine(release, "share", "recipes");
         start.Environment["LAPLACE_GRAMMARS"] = Path.Combine(release, "share", "grammars");
         start.Environment["LAPLACE_FIRMWARE"] = Path.Combine(release, "share", "firmware", "program.firmware");
-        start.Environment["LAPLACE_ENGINE"] = Path.Combine(bin, "laplace.exe");
+        start.Environment["LAPLACE_ENGINE"] = Path.Combine(bin, "laplace" + exe);
         // Source declarations root at $LAPLACE_DATA, $LAPLACE_SRC and $LAPLACE_MODELS; the endgame tables the tablebase read
         // probes are under $LAPLACE_SYZYGY, else $LAPLACE_DATA/Games/Chess/syzygy (Laplace-Engine chess_tablebase.c).
         foreach (var (property, variable) in new[] { ("data", "LAPLACE_DATA"), ("src", "LAPLACE_SRC"), ("models", "LAPLACE_MODELS"), ("syzygy", "LAPLACE_SYZYGY") })
@@ -172,12 +192,16 @@ sealed class NativeRuntime(IConfiguration configuration, ILogger<NativeRuntime> 
         start.Environment["PATH"] = bin + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH");
         process = Process.Start(start) ?? throw new NativeUnavailableException("The native reader did not start.");
         imageHash = Convert.ToHexStringLower(SHA256.HashData(await File.ReadAllBytesAsync(executable, cancellationToken)));
-        // IIS recycling and unexpected host termination must not orphan readers.
-        job = CreateJobObject(IntPtr.Zero, null);
-        var limits = new JobLimits { Basic = new BasicLimits { LimitFlags = 0x2000 } }; // KILL_ON_JOB_CLOSE
-        if (job.IsInvalid || !SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<JobLimits>()) || !AssignProcessToJobObject(job, process.Handle))
+        // IIS recycling and unexpected host termination must not orphan readers. Elsewhere the service manager's
+        // process group (systemd's control group) ends the reader with this host.
+        if (OperatingSystem.IsWindows())
         {
-            Stop(); throw new NativeUnavailableException("The native reader lifetime could not be attached to IIS.");
+            job = CreateJobObject(IntPtr.Zero, null);
+            var limits = new JobLimits { Basic = new BasicLimits { LimitFlags = 0x2000 } }; // KILL_ON_JOB_CLOSE
+            if (job.IsInvalid || !SetInformationJobObject(job, 9, ref limits, (uint)Marshal.SizeOf<JobLimits>()) || !AssignProcessToJobObject(job, process.Handle))
+            {
+                Stop(); throw new NativeUnavailableException("The native reader lifetime could not be attached to IIS.");
+            }
         }
         process.ErrorDataReceived += (_, e) => { if (e.Data is not null) logger.LogDebug("Native reader: {Message}", e.Data); };
         process.BeginErrorReadLine(); process.BeginOutputReadLine();
