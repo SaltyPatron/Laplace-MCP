@@ -4,6 +4,8 @@ using Microsoft.AspNetCore.StaticFiles;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<NativeRuntime>();
 var app = builder.Build();
+// IIS gives the application its /modular base; behind a reverse proxy the host declares it.
+if (builder.Configuration["PathBase"] is { Length: > 1 } pathBase) app.UsePathBase(pathBase);
 var identityPath = builder.Configuration["SharedIdentityPath"] ?? "/v1/auth";
 if (!identityPath.StartsWith('/') || identityPath.StartsWith("//") || identityPath.Contains('\\')
     || identityPath.Contains('?') || identityPath.Contains('#'))
@@ -28,7 +30,7 @@ app.MapGet("/runtime.js", (HttpContext context) =>
     context.Response.Headers.CacheControl = "no-store";
     var settings = new
     {
-        hosting = "iis",
+        hosting = builder.Configuration["Hosting"] ?? "iis",
         identityMode = "same-origin",
         identityPath,
         basePath = context.Request.PathBase.Value ?? "",
