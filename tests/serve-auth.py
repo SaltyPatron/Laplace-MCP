@@ -95,7 +95,7 @@ with tempfile.TemporaryDirectory(prefix='lpm-serve-auth-') as d:
         try:
             status, body, _ = call(p, '/health')
             assert (status, body) == (200, {'ok': True}), (status, body)
-            for path, data in (('/v1/surface', None), ('/v1/schema', None), ('/mcp', ingest), ('/v1/search', {'input': 'x'}), ('/health', {'x': 1})):
+            for path, data in (('/v1/surface', None), ('/v1/schema', None), ('/mcp', ingest), ('/v1/search', {'input': 'x'}), ('/health', {'x': 1}), ('/health/ready', None)):
                 for token, scheme in ((None, 'Bearer'), ('wrong' * 13, 'Bearer'), (TOKEN[:-1], 'Bearer'),
                                       (TOKEN + 'x', 'Bearer'), (TOKEN, 'Basic'), ('', 'Bearer')):
                     status, body, headers = call(p, path, data, token, scheme)
@@ -110,6 +110,22 @@ with tempfile.TemporaryDirectory(prefix='lpm-serve-auth-') as d:
             assert len(body['highway'])==64 and body['banks'] and body['vertex_roles'],body
             status, body, _ = call(p, '/mcp', {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}, TOKEN)
             assert status == 200 and any(t['name'] == 'ingest' for t in body['result']['tools']), (status, body)
+        finally:
+            try:
+                stop(process)
+            finally:
+                log.close()
+
+    # readiness reads the database: one that does not answer is a 503 with the reason, never ok (liveness stays 200)
+    with socket.socket() as closed:
+        closed.bind(('127.0.0.1', 0))
+        nowhere = f'host=127.0.0.1 port={closed.getsockname()[1]} dbname=absent connect_timeout=2'
+        process, p, log = serving(base_env(LAPLACE_MCP_TOKEN=TOKEN, LAPLACE_CONNINFO=nowhere))
+        try:
+            status, body, _ = call(p, '/health')
+            assert (status, body) == (200, {'ok': True}), (status, body)
+            status, body, _ = call(p, '/health/ready', token=TOKEN)
+            assert status == 503 and body.get('error') == 'database' and body.get('detail'), (status, body)
         finally:
             try:
                 stop(process)

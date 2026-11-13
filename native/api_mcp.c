@@ -32,7 +32,8 @@ static const char *SURFACE =
     "{\"method\":\"POST\",\"path\":\"/v1/degrees\",\"body\":\"{\\\"input\\\":\\\"text\\\",\\\"other\\\":\\\"text\\\"}\",\"does\":\"laplace degrees\"},"
     "{\"method\":\"GET\",\"path\":\"/v1/surface\"},"
     "{\"method\":\"GET\",\"path\":\"/v1/schema\",\"does\":\"native view descriptors, mask banks, occurrence roles and operation input schemas\"},"
-    "{\"method\":\"GET\",\"path\":\"/health\"},"
+    "{\"method\":\"GET\",\"path\":\"/health\",\"does\":\"liveness: the process answers; no token, no database read\"},"
+    "{\"method\":\"GET\",\"path\":\"/health/ready\",\"does\":\"readiness: the database answers a trivial query and holds the laplace extension; 503 with the reason when it does not\"},"
     "{\"method\":\"POST\",\"path\":\"/mcp\",\"body\":\"JSON-RPC 2.0 MCP or op: embeddings|rerank|code_search|reindex|code_where|code_callers|code_callees|sources|ingest_status|file_outline|recipe_plan|recipe_catalog|search|forward|shape|frechet|ingest|hop|text|translate|degrees|pull|turn|surface\"}"
     "],"
     "\"database_functions\":[\"laplace_containers\",\"laplace_claims\",\"laplace_claims_each\",\"laplace_text\",\"laplace_fills\",\"laplace_forward\",\"laplace_frechet4d\",\"laplace_dtw4d\",\"laplace_edr4d\",\"laplace_distance4d\",\"laplace_couple\",\"laplace_follows\",\"laplace_paths\",\"laplace_attested\",\"laplace_compose\",\"laplace_parts\"],"
@@ -271,6 +272,10 @@ void api_dispatch(int c, const char *method, const char *path, const char *body)
     }
     if (!strcmp(method, "GET") && !strcmp(path, "/health")) {
         api_http(c, 200, "{\"ok\":true}");
+        return;
+    }
+    if (!strcmp(method, "GET") && !strcmp(path, "/health/ready")) {
+        on_ready(c);
         return;
     }
     if (!strcmp(method, "GET") && !strcmp(path, "/v1/surface")) {

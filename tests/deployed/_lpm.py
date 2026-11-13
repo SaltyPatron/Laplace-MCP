@@ -63,7 +63,7 @@ def environment(fixture, **more):
     listener, credential or code index."""
     env = dict(os.environ)
     for name in ('LAPLACE_MCP_TOKEN', 'LAPLACE_MCP_TOKEN_FILE', 'LAPLACE_MCP_HOST', 'LAPLACE_MCP_PORT',
-                 'LAPLACE_CODE_ROOTS', 'LAPLACE_CODE_STORE', 'LAPLACE_CODE_RECORDS', 'LAPLACE_INGEST_LOGS',
+                 'LAPLACE_CODE_ROOTS', 'LAPLACE_CODE_STORE', 'LAPLACE_CODE_RECORDS', 'LAPLACE_INGEST_LOGS', 'LAPLACE_INGEST_RUNS',
                  'LAPLACE_INGEST_ONE', 'PGAPPNAME'):
         env.pop(name, None)
     code = fixture.scratch / 'code'

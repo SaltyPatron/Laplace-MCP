@@ -5,12 +5,15 @@
  * name, trust, how many parts its trunk holds after its record, and readings, how many witnesses begin with the same record (a
  * source read again without superseding its earlier reading has more than one). Then the database's sessions that
  * are not idle, as pg_stat_activity shows them to this role, and the engine's per-source ingest logs
- * (LAPLACE_INGEST_LOGS, else $LAPLACE_WORK/logs/ingest), newest first, each with its last line. */
+ * (LAPLACE_INGEST_LOGS, else $LAPLACE_WORK/logs/ingest), newest first, each with its last line, and the newest
+ * Laplace-Operations ingest run (LAPLACE_INGEST_RUNS, else $LAPLACE_WORK/logs/ingest-runs), its steps with their
+ * exit status. A log directory that is absent is reported as such, never as null. */
 typedef struct { char name[256]; time_t mtime; long long bytes; } IsLog;
 static int is_log_cmp(const void *a, const void *b) {
     const IsLog *x = a, *y = b;
     return x->mtime < y->mtime ? 1 : x->mtime > y->mtime ? -1 : strcmp(x->name, y->name);
 }
+static void is_logs(char **o, size_t *on, size_t *ocap, const char *dir, const char *unset, const char *want, int run);
 void on_ingest_status(int c, const char *body) {
     char want[512] = "";
     api_jstr(body, "source", want, sizeof want);
@@ -85,13 +88,64 @@ void on_ingest_status(int c, const char *body) {
         }
     PQclear(r);
     api_buf_fmt(&out, &on, &ocap, "],\"logs\":");
-    char dir[4096] = "";
-    const char *ld = getenv("LAPLACE_INGEST_LOGS"), *work = getenv("LAPLACE_WORK");
+    const char *ld = getenv("LAPLACE_INGEST_LOGS"), *lr = getenv("LAPLACE_INGEST_RUNS"), *work = getenv("LAPLACE_WORK");
+    char dir[4096] = "", runs[4096] = "";
     if (ld && *ld) snprintf(dir, sizeof dir, "%s", ld);
     else if (work && *work) snprintf(dir, sizeof dir, "%s/logs/ingest", work);
-    int listed = 0;
+    if (lr && *lr) snprintf(runs, sizeof runs, "%s", lr);
+    else if (work && *work) snprintf(runs, sizeof runs, "%s/logs/ingest-runs", work);
+    is_logs(&out, &on, &ocap, dir, "LAPLACE_INGEST_LOGS", want, 0);
+    /* Laplace-Operations ingest.sh: one directory per run, named by its UTC start (20261113T040506Z), each step's
+     * output in <step>.log and its exit status in <step>.exit once it ends. The newest run is the greatest name. */
+    api_buf_fmt(&out, &on, &ocap, ",\"ingest_run\":");
     os_list names = { 0 };
-    if (dir[0] && !os_list_dir(dir, &names)) {
+    if (!runs[0]) api_buf_fmt(&out, &on, &ocap, "{\"error\":\"no ingest run directory: neither LAPLACE_INGEST_RUNS nor LAPLACE_WORK is set\"}");
+    else if (os_list_dir(runs, &names)) {
+        api_buf_fmt(&out, &on, &ocap, "{\"error\":\"no ingest run directory at ");
+        api_cw_str(&out, &on, &ocap, runs);
+        api_buf_fmt(&out, &on, &ocap, "\"}");
+    } else {
+        const char *newest = NULL;
+        for (size_t entry = 0; entry < names.n; entry++) {
+            const char *name = names.item[entry];
+            char fp[4400];
+            if (strlen(name) != 16 || name[8] != 'T' || name[15] != 'Z' || (newest && strcmp(name, newest) <= 0)) continue;
+            snprintf(fp, sizeof fp, "%s/%s", runs, name);
+            if (os_is_dir(fp)) newest = name;
+        }
+        if (!newest) {
+            api_buf_fmt(&out, &on, &ocap, "{\"error\":\"no ingest run under ");
+            api_cw_str(&out, &on, &ocap, runs);
+            api_buf_fmt(&out, &on, &ocap, "\"}");
+        } else {
+            char run[4400];
+            snprintf(run, sizeof run, "%s/%s", runs, newest);
+            is_logs(&out, &on, &ocap, run, NULL, want, 1);
+        }
+    }
+    os_list_free(&names);
+    api_buf_fmt(&out, &on, &ocap, ",\"ms\":%.3f}", (double)(api_nsec() - t0) / 1e6);
+    api_http(c, 200, out);
+    free(out);
+}
+
+/* The *.log files of one directory, newest first (20), each with its last line; a run's steps also carry the exit
+ * status their .exit file holds, null while the step has not ended (or was cut off before it wrote one). A directory
+ * that cannot be read says so instead of being left out. */
+static void is_logs(char **o, size_t *on, size_t *ocap, const char *dir, const char *unset, const char *want, int run) {
+    os_list names = { 0 };
+    if (!dir[0]) {
+        api_buf_fmt(o, on, ocap, "{\"error\":\"no ingest log directory: neither %s nor LAPLACE_WORK is set\"}", unset);
+        return;
+    }
+    if (os_list_dir(dir, &names)) {
+        api_buf_fmt(o, on, ocap, "{\"error\":\"no ingest log directory at ");
+        api_cw_str(o, on, ocap, dir);
+        api_buf_fmt(o, on, ocap, "\"}");
+        os_list_free(&names);
+        return;
+    }
+    {
         lp_vec(IsLog) logs = { 0 };
         for (size_t entry = 0; entry < names.n; entry++) {
             const char *name = names.item[entry];
@@ -108,9 +162,9 @@ void on_ingest_status(int c, const char *body) {
             lp_push(&logs, x);
         }
         qsort(logs.v, logs.n, sizeof *logs.v, is_log_cmp);
-        api_buf_fmt(&out, &on, &ocap, "{\"dir\":\"");
-        api_cw_str(&out, &on, &ocap, dir);
-        api_buf_fmt(&out, &on, &ocap, "\",\"runs\":[");
+        api_buf_fmt(o, on, ocap, "{\"dir\":\"");
+        api_cw_str(o, on, ocap, dir);
+        api_buf_fmt(o, on, ocap, "\",\"%s\":[", run ? "steps" : "runs");
         for (size_t k = 0; k < logs.n && k < 20; k++) {
             char fp[4400], tail[4097] = "", when[32];
             snprintf(fp, sizeof fp, "%s/%s.log", dir, logs.v[k].name);
@@ -135,22 +189,61 @@ void on_ingest_status(int c, const char *body) {
             gmtime_r(&logs.v[k].mtime, &tmv);
 #endif
             strftime(when, sizeof when, "%Y-%m-%dT%H:%M:%SZ", &tmv);
-            api_buf_fmt(&out, &on, &ocap, "%s{\"source\":\"", k ? "," : "");
-            api_cw_str(&out, &on, &ocap, logs.v[k].name);
-            api_buf_fmt(&out, &on, &ocap, "\",\"modified\":\"%s\",\"bytes\":%lld,\"last\":\"", when, logs.v[k].bytes);
-            api_cw_str(&out, &on, &ocap, last);
-            api_buf_fmt(&out, &on, &ocap, "\"}");
+            api_buf_fmt(o, on, ocap, "%s{\"source\":\"", k ? "," : "");
+            api_cw_str(o, on, ocap, logs.v[k].name);
+            api_buf_fmt(o, on, ocap, "\",\"modified\":\"%s\",\"bytes\":%lld,\"last\":\"", when, logs.v[k].bytes);
+            api_cw_str(o, on, ocap, last);
+            api_buf_fmt(o, on, ocap, "\"");
+            if (run) {
+                char status[32] = "";
+                snprintf(fp, sizeof fp, "%s/%s.exit", dir, logs.v[k].name);
+                FILE *e = fopen(fp, "rb");
+                if (e) { if (!fgets(status, sizeof status, e)) status[0] = 0; fclose(e); }
+                char *end = NULL;
+                long code = strtol(status, &end, 10);
+                if (end != status) api_buf_fmt(o, on, ocap, ",\"exit\":%ld", code);
+                else api_buf_fmt(o, on, ocap, ",\"exit\":null");
+            }
+            api_buf_fmt(o, on, ocap, "}");
         }
-        api_buf_fmt(&out, &on, &ocap, "]}");
+        api_buf_fmt(o, on, ocap, "]}");
         lp_vec_free(&logs);
-        listed = 1;
     }
     os_list_free(&names);
-    if (!listed) api_buf_fmt(&out, &on, &ocap, "null");
+}
+
+/* Readiness, apart from /health's liveness: the database this process reads answers a trivial query and holds the
+ * laplace extension. 503 with the reason when it does not; authenticated like every route but /health. */
+void on_ready(int c) {
+    uint64_t t0 = api_nsec();
+    PGconn *pg = api_cc_db(c);
+    if (!pg) return;
+    PGresult *r = db_exec(pg, "SELECT current_database(), coalesce((SELECT extversion FROM pg_extension WHERE extname = 'laplace'), '')");
+    if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) != 1) {
+        char e[512], b[640];
+        api_json_esc(PQerrorMessage(pg), e, sizeof e);
+        snprintf(b, sizeof b, "{\"ok\":false,\"error\":\"query\",\"detail\":\"%s\"}", e);
+        PQclear(r);
+        api_http(c, 503, b);
+        return;
+    }
+    char *out = NULL;
+    size_t on = 0, ocap = 0;
+    int ext = *PQgetvalue(r, 0, 1) != 0;
+    api_buf_fmt(&out, &on, &ocap, "{\"ok\":%s,\"database\":\"", ext ? "true" : "false");
+    api_cw_str(&out, &on, &ocap, PQgetvalue(r, 0, 0));
+    if (ext) {
+        api_buf_fmt(&out, &on, &ocap, "\",\"laplace\":\"");
+        api_cw_str(&out, &on, &ocap, PQgetvalue(r, 0, 1));
+        api_buf_fmt(&out, &on, &ocap, "\"");
+    } else api_buf_fmt(&out, &on, &ocap, "\",\"error\":\"extension\",\"detail\":\"the database does not hold the laplace extension\"");
     api_buf_fmt(&out, &on, &ocap, ",\"ms\":%.3f}", (double)(api_nsec() - t0) / 1e6);
-    api_http(c, 200, out);
+    PQclear(r);
+    api_http(c, ext ? 200 : 503, out);
     free(out);
-}/* The sources the database holds: each witness, its name (the first part of its trunk, the record its source file
+}
+
+/* The sources the database holds: each witness, its name (the first part of its trunk, the record its source file
  * names) and its trust. */
 void on_sources(int c, const char *body) {
     (void)body;
