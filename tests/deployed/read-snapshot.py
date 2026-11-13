@@ -138,7 +138,7 @@ def main():
             assert all('position' in edge and 'ordinal' in edge for edge in graph['edges']), graph
             labels = [node['label'] for node in graph['nodes'] if node.get('trunk_kind') == 'file']
             assert all(any(label.endswith('facts.' + extension) for label in labels) for extension in ['tsv', 'xml', 'json']), graph
-            assert first['physicality'][0]['n'] == 3 and first['physicality'][0]['tier'] == 1, first
+            assert first['physicality'][0]['n'] == len(DOG) and first['physicality'][0]['tier'] == 1, first
             assert connections() == pids
 
             _lpm.ingest(fixture, sources['second'])
