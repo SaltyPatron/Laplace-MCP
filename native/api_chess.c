@@ -90,13 +90,16 @@ static int book_read(PGconn *pg, const lp_id *keys, int nkeys, int routes, const
         holds_free(h, nh); free(hub);
     }
     lp_vec_free(&wanted);
-    /* 4: each named position's own line, the shortest recorded line ending in it */
+    /* 4: each named position's own line, the shortest recorded line ending in it. A one-move line [P0, M0, P1] is the
+     * same entity as the transition claim [P0, M0, P1] Engine chess.c states for that move, so it is held as a claim and
+     * is read here all the same. The other claims of a position ([P, "opening name", name], its ECO code, a NAG) end in
+     * their value, never in the position, so the ending test below keeps only lines. */
     if (b->nnamed) {
         lp_id *positions = malloc(sizeof(lp_id) * b->nnamed); for (size_t i = 0; i < b->nnamed; i++) positions[i] = b->named[i].position;
         int nh = 0, *hub = calloc(b->nnamed * 2, sizeof(int));
         Hold *h = holds_capped(pg, positions, (int)b->nnamed, LINES_CAP, 0, 2, hub, &nh);
         for (int k = 0; k < nh; k++) {
-            if (h[k].claim || h[k].src < 0 || (size_t)h[k].src >= b->nnamed) continue;
+            if (h[k].src < 0 || (size_t)h[k].src >= b->nnamed) continue;
             Named *n = &b->named[h[k].src]; Run run = run_of(h[k].path, (size_t)h[k].path_len);
             if ((run.n & 1) && lp_id_eq(&run.id[run.n - 1], &n->position) && (!n->has_line || run.n / 2 < n->plies)) { n->line = h[k].entity; n->plies = run.n / 2; n->has_line = 1; }
             free(run.id);
