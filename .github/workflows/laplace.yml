@@ -10,9 +10,14 @@ on:
   push:
     branches: [main]
   pull_request:
+# A newer push or PR update supersedes an older run of the same ref; a manual run is never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 jobs:
   mcp:
     runs-on: [self-hosted, laplace, Laplace-MCP]
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { path: Laplace-MCP, persist-credentials: false }
@@ -75,6 +80,7 @@ jobs:
     needs: mcp
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, laplace, Laplace-MCP]
+    timeout-minutes: 10
     steps:
       - name: Deploy this exact revision through Operations
         env:
