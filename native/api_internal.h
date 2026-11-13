@@ -127,6 +127,7 @@ void on_code_callees(int c, const char *body);
 void on_ingest_status(int c, const char *body);
 void on_sources(int c, const char *body);
 void on_catalog(int c, const char *body);
+void on_ready(int c);
 void on_library(int c, const char *body);
 void on_provenance(int c, const char *body);
 void on_chess_position(int c, const char *body);

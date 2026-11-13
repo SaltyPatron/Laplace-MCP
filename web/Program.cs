@@ -37,15 +37,44 @@ app.MapGet("/runtime.js", (HttpContext context) =>
     };
     return Results.Text("window.LAPLACE_RUNTIME = " + JsonSerializer.Serialize(settings) + ";\n", "text/javascript");
 });
-app.MapGet("/health", (NativeRuntime native) => Results.Json(new
+// Healthy means a real read answered: the native reader's /health/ready queries its database. A reader that is not
+// configured, did not start, exited, or whose database refuses answers 503 with the reason (never database detail).
+app.MapGet("/health", async (NativeRuntime native, CancellationToken aborted) =>
 {
-    status = "ok",
-    service = "laplace-modular-web",
-    release = builder.Configuration["ReleaseId"] ?? "source",
-    identity = "shared-same-origin",
-    data = "native-live",
-    reader = native.ReaderEvidence()
-}));
+    var release = builder.Configuration["ReleaseId"] ?? "source";
+    using var budget = CancellationTokenSource.CreateLinkedTokenSource(aborted);
+    budget.CancelAfter(TimeSpan.FromSeconds(10));
+    try
+    {
+        await native.Read("/health/ready", null, budget.Token);
+        return Results.Json(new
+        {
+            status = "ok",
+            service = "laplace-modular-web",
+            release,
+            identity = "shared-same-origin",
+            data = "native-live",
+            reader = native.ReaderEvidence()
+        });
+    }
+    catch (Exception ex) when (ex is NativeUnavailableException or OperationCanceledException or IOException or JsonException)
+    {
+        return Results.Json(new
+        {
+            status = "unavailable",
+            service = "laplace-modular-web",
+            release,
+            data = "native-unavailable",
+            reason = ex switch
+            {
+                NativeUnavailableException => ex.Message,
+                OperationCanceledException => "The native reader did not answer its readiness read within 10 seconds.",
+                _ => "The native reader's readiness read failed."
+            },
+            reader = native.ReaderEvidence()
+        }, statusCode: 503);
+    }
+});
 
 app.MapMethods("/mcp", ["POST", "GET", "DELETE"], async (HttpContext context, NativeRuntime native) =>
 {

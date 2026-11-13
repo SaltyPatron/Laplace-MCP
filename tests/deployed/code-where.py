@@ -226,6 +226,24 @@ def main():
         just = call('ingest_status', {'source': demo}, LAPLACE_INGEST_LOGS=logs)
         if just['sources'] or [x['source'] for x in just['logs']['runs']] != [demo]:
             fail(f'ingest_status of {demo}: {just}')
+        # the newest Laplace-Operations ingest run (ingest.sh: <UTC>/<step>.log and .exit); absent directories say so
+        runs = fixture.scratch / 'ingest-runs'
+        (runs / '20260101T000000Z').mkdir(parents=True)
+        (runs / '20260101T000000Z' / f'{older}.log').write_text('old run\n')
+        newest = runs / '20260102T000000Z'
+        newest.mkdir()
+        (newest / f'{older}.log').write_text('reading\nwordnet: done\n')
+        (newest / f'{older}.exit').write_text('0\n')
+        (newest / f'{demo}.log').write_text('reading demo\n')
+        st = call('ingest_status', {}, LAPLACE_INGEST_LOGS=logs, LAPLACE_INGEST_RUNS=runs)
+        steps = {x['source']: (x['last'], x['exit']) for x in st['ingest_run'].get('steps', [])}
+        if not st['ingest_run']['dir'].endswith('20260102T000000Z') \
+                or steps != {older: ('wordnet: done', 0), demo: ('reading demo', None)}:
+            fail(f'ingest_status ingest_run: {st["ingest_run"]}')
+        st = call('ingest_status', {}, LAPLACE_INGEST_LOGS=logs / 'absent', LAPLACE_INGEST_RUNS=runs / 'absent')
+        if 'no ingest log directory' not in st['logs'].get('error', '') \
+                or 'no ingest run directory' not in st['ingest_run'].get('error', ''):
+            fail(f'ingest_status of absent log directories: {st["logs"]} {st["ingest_run"]}')
     print(f'code-where ok: {B} defined at retry.c:3 (3..7), called at use.c:3 in {W}; {J} defined in jitter.py and called '
           f'at :10 in {S}; a file of one def defines it; callers and callees; outlines and a plan; ingest status of {witness}')
     return 0
