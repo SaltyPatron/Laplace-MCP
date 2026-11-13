@@ -1,7 +1,9 @@
 # Laplace-MCP on its runner: the service built with icx as the engine is, with Laplace-Native as part of it and the
 # engine's reader from Laplace-Engine (both checked out beside it), under Laplace-Operations' floating-point contract
 # (private: the secret LAPLACE_CHECKOUT, agents.sh's), and its own checks. The runner's environment (runner/.env, from
-# agents.sh) names its build root and the machine's dependencies, tier 0 and grammars.
+# agents.sh) names its build root and the machine's dependencies, tier 0 and grammars. No check here starts a server,
+# makes a database or connects to one: the database checks (tests/deployed/) run after Laplace-Operations has deployed a
+# merge to main, against the deployed database through the deployed lpm (Laplace-Operations laplace.yml, job tests).
 name: Laplace-MCP
 on:
   workflow_dispatch:
@@ -18,8 +20,6 @@ jobs:
         with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: main, path: Laplace-Native, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: main, path: Laplace-Engine, persist-credentials: false }
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-postgres", ref: main, path: Laplace-postgres, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { repository: "${{ github.repository_owner }}/Laplace-Operations", ref: main, path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}", persist-credentials: false }
       - name: Provide the pinned Tree-sitter generator toolchain
@@ -51,12 +51,6 @@ jobs:
           cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib | tee "$RUNNER_TEMP/modular-noop.txt"
           grep -Fx 'ninja: no work to do.' "$RUNNER_TEMP/modular-noop.txt"
           echo "built against Laplace-Native $(git -C Laplace-Native rev-parse --short HEAD) and Laplace-Engine $(git -C Laplace-Engine rev-parse --short HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Start the pinned Native PostgreSQL candidate
-        run: |
-          . Laplace-Operations/laplace.env
-          . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
-          export LAPLACE_NATIVE="$GITHUB_WORKSPACE/Laplace-Native"
-          python3 Laplace-Engine/tools/ci/postgres.py start "$RUNNER_TEMP/mcp-pg" --source "$GITHUB_WORKSPACE/Laplace-postgres"
       - name: checks
         run: |
           L=$LAPLACE_BUILD/Laplace-MCP/icx-release/lpm
@@ -73,12 +67,9 @@ jobs:
           python3 Laplace-MCP/tests/code-semantic.py "$L"
           python3 Laplace-MCP/tests/code-search-eval.py "$L" --min-mrr "${LPM_EVAL_MIN_MRR:-0.45}"
           python3 Laplace-MCP/tests/rerank-length.py "$L"
-          TMPDIR=${RUNNER_TEMP:?} LAPLACE_RECIPES=$GITHUB_WORKSPACE/Laplace-Engine/recipes python3 Laplace-MCP/tests/code-where.py "$L" "$E"
-          LAPLACE_WORK=${RUNNER_TEMP:?} python3 Laplace-MCP/tests/read-snapshot.py "$L" "$E"
-          LAPLACE_WORK=${RUNNER_TEMP:?} python3 Laplace-MCP/tests/chess-games.py "$L" "$E"
-      - name: Stop the private PostgreSQL instance
-        if: always()
-        run: python3 Laplace-Engine/tools/ci/postgres.py stop "$RUNNER_TEMP/mcp-pg"
+          # The database checks run after deployment (Laplace-Operations); here they must at least compile.
+          for check in Laplace-MCP/tests/deployed/*.py; do python3 -m py_compile "$check"; done
+          bash -n Laplace-MCP/tests/deployed/run.sh
   deploy:
     needs: mcp
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
