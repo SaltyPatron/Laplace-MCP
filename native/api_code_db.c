@@ -89,11 +89,12 @@ static const lp_vertex *fo_tree_get(const FoTree *t, const lp_id *id, size_t *n)
     *n = t->count.v[i];
     return t->v.v + t->first.v[i];
 }
-static void fo_tree(PGconn *pg, const lp_id *file, FoTree *t) {
+/* The trees of several files read together: each level is one paths_of read for every file's nodes at that level. */
+static void fo_trees(PGconn *pg, const lp_id *files, size_t nfiles, FoTree *t) {
     memset(t, 0, sizeof *t);
     t->at = lp_idmap_new();
     lp_idmap *front = lp_idmap_new();
-    lp_idmap_put(front, file, NULL);
+    for (size_t f = 0; f < nfiles; f++) lp_idmap_put(front, &files[f], NULL);
     lp_vec(lp_vertex) vx = { 0 };
     while (lp_idmap_count(front)) {
         int nh = 0;
@@ -121,6 +122,7 @@ static void fo_tree(PGconn *pg, const lp_id *file, FoTree *t) {
     lp_idmap_free(front);
     lp_vec_free(&vx);
 }
+static void fo_tree(PGconn *pg, const lp_id *file, FoTree *t) { fo_trees(pg, file, 1, t); }
 static void fo_tree_free(FoTree *t) { lp_idmap_free(t->at); lp_vec_free(&t->v); lp_vec_free(&t->first); lp_vec_free(&t->count); }
 int fo_word(char c) { return isalnum((unsigned char)c) || c == '_' || (unsigned char)c >= 0x80; }
 typedef struct { lp_id *v; size_t n, cap; } FoClaims;
@@ -192,6 +194,13 @@ char *fo_text(PGconn *pg, Reader *rd, const lp_id *file, size_t *tnp) {
     char *text = fo_tree_text(&tree, rd, file, tnp);
     fo_tree_free(&tree);
     return text;
+}
+/* Several files' recorded texts from one walk of their trees: texts[i] (malloc'd) and lens[i] for files[i]. */
+void fo_texts(PGconn *pg, Reader *rd, const lp_id *files, size_t n, char **texts, size_t *lens) {
+    FoTree tree;
+    fo_trees(pg, files, n, &tree);
+    for (size_t i = 0; i < n; i++) texts[i] = fo_tree_text(&tree, rd, &files[i], &lens[i]);
+    fo_tree_free(&tree);
 }
 /* One file's outline: its recorded text (every part but the OS's record and what is said of the file) and the claims
  * [kind, name] said of it, in the file's order, each at the first line at or after the one before it where its name
