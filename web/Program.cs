@@ -4,6 +4,8 @@ using Microsoft.AspNetCore.StaticFiles;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<NativeRuntime>();
 var app = builder.Build();
+// IIS gives the application its /modular base; behind a reverse proxy the host declares it.
+if (builder.Configuration["PathBase"] is { Length: > 1 } pathBase) app.UsePathBase(pathBase);
 var identityPath = builder.Configuration["SharedIdentityPath"] ?? "/v1/auth";
 if (!identityPath.StartsWith('/') || identityPath.StartsWith("//") || identityPath.Contains('\\')
     || identityPath.Contains('?') || identityPath.Contains('#'))
@@ -28,7 +30,7 @@ app.MapGet("/runtime.js", (HttpContext context) =>
     context.Response.Headers.CacheControl = "no-store";
     var settings = new
     {
-        hosting = "iis",
+        hosting = builder.Configuration["Hosting"] ?? "iis",
         identityMode = "same-origin",
         identityPath,
         basePath = context.Request.PathBase.Value ?? "",
@@ -37,15 +39,44 @@ app.MapGet("/runtime.js", (HttpContext context) =>
     };
     return Results.Text("window.LAPLACE_RUNTIME = " + JsonSerializer.Serialize(settings) + ";\n", "text/javascript");
 });
-app.MapGet("/health", (NativeRuntime native) => Results.Json(new
+// Healthy means a real read answered: the native reader's /health/ready queries its database. A reader that is not
+// configured, did not start, exited, or whose database refuses answers 503 with the reason (never database detail).
+app.MapGet("/health", async (NativeRuntime native, CancellationToken aborted) =>
 {
-    status = "ok",
-    service = "laplace-modular-web",
-    release = builder.Configuration["ReleaseId"] ?? "source",
-    identity = "shared-same-origin",
-    data = "native-live",
-    reader = native.ReaderEvidence()
-}));
+    var release = builder.Configuration["ReleaseId"] ?? "source";
+    using var budget = CancellationTokenSource.CreateLinkedTokenSource(aborted);
+    budget.CancelAfter(TimeSpan.FromSeconds(10));
+    try
+    {
+        await native.Read("/health/ready", null, budget.Token);
+        return Results.Json(new
+        {
+            status = "ok",
+            service = "laplace-modular-web",
+            release,
+            identity = "shared-same-origin",
+            data = "native-live",
+            reader = native.ReaderEvidence()
+        });
+    }
+    catch (Exception ex) when (ex is NativeUnavailableException or OperationCanceledException or IOException or JsonException)
+    {
+        return Results.Json(new
+        {
+            status = "unavailable",
+            service = "laplace-modular-web",
+            release,
+            data = "native-unavailable",
+            reason = ex switch
+            {
+                NativeUnavailableException => ex.Message,
+                OperationCanceledException => "The native reader did not answer its readiness read within 10 seconds.",
+                _ => "The native reader's readiness read failed."
+            },
+            reader = native.ReaderEvidence()
+        }, statusCode: 503);
+    }
+});
 
 app.MapMethods("/mcp", ["POST", "GET", "DELETE"], async (HttpContext context, NativeRuntime native) =>
 {
@@ -149,7 +180,8 @@ app.MapGet("/api/chess/position", async (string? fen, NativeRuntime native, Canc
     if (string.IsNullOrWhiteSpace(fen) || fen.Length > 128) return Results.BadRequest(new { error = "fen: a FEN, up to 128 characters" });
     return NativeAnswer(await native.Read("/v1/chess_position", new { fen = fen.Trim() }, ct));
 });
-// The tablebase's verdicts of a position and of each legal move's position (Engine recipes/syzygy), best move first.
+// The tablebase's read of a position: its verdict, its moves ranked best first and its best-play line, probed from the
+// Syzygy tables by the Engine (chess_tablebase.c), with the standings of the transitions the database records.
 app.MapGet("/api/chess/tablebase", async (string? fen, NativeRuntime native, CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(fen) || fen.Length > 128) return Results.BadRequest(new { error = "fen: a FEN, up to 128 characters" });
@@ -172,6 +204,28 @@ app.MapPost("/api/chess/game-openings", async (JsonElement body, NativeRuntime n
     if (body.TryGetProperty("line", out var line) && line.ValueKind == JsonValueKind.String && IsId(line.GetString()!))
         return NativeAnswer(await native.Read("/v1/chess_game_openings", new { line = line.GetString()!.ToLowerInvariant() }, ct));
     return Results.BadRequest(new { error = "{ pgn } or { line } or { pgns: [...] }" });
+});
+// Recorded games (Engine src/chess.c): a player is a name as a White or Black tag writes it; a game is its record.
+static int Page(int? value, int fallback, int max) => Math.Clamp(value ?? fallback, 0, max);
+app.MapGet("/api/chess/players", async (string? search, int? limit, int? offset, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(search) || search.Length > 200) return Results.BadRequest(new { error = "search: a name, or a word of one, up to 200 characters" });
+    return NativeAnswer(await native.Read("/v1/chess_players", new { search = search.Trim(), limit = Math.Max(1, Page(limit, 25, 200)), offset = Page(offset, 0, 1 << 30) }, ct));
+});
+app.MapGet("/api/chess/player", async (string? name, int? limit, int? offset, int? opponents, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(name) || name.Length > 400) return Results.BadRequest(new { error = "name: as a White or Black tag writes it, up to 400 characters" });
+    return NativeAnswer(await native.Read("/v1/chess_player", new { name, limit = Math.Max(1, Page(limit, 25, 200)), offset = Page(offset, 0, 1 << 30), opponents = Page(opponents, 25, 200) }, ct));
+});
+app.MapGet("/api/chess/games", async (string? witness, int? limit, int? offset, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(witness) || witness.Length > 200) return Results.BadRequest(new { error = "witness: a source's witness, as its recipe names it" });
+    return NativeAnswer(await native.Read("/v1/chess_games", new { witness = witness.Trim(), limit = Math.Max(1, Page(limit, 25, 200)), offset = Page(offset, 0, 1 << 30) }, ct));
+});
+app.MapGet("/api/chess/game", async (string? id, NativeRuntime native, CancellationToken ct) =>
+{
+    if (string.IsNullOrWhiteSpace(id) || !IsId(id)) return Results.BadRequest(new { error = "id: a record's 32-digit ID" });
+    return NativeAnswer(await native.Read("/v1/chess_game", new { id = id.ToLowerInvariant() }, ct));
 });
 // Explicit read operations only. No shell, arbitrary path, ingestion or write proxy.
 app.MapPost("/api/operations/{operation}", async (string operation, JsonElement body, NativeRuntime native, CancellationToken ct) =>
