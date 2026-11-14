@@ -445,11 +445,17 @@ void on_code_search(int c, const char *body) {
     /* text only for what is returned: each shown unit's lines in its file's recorded text, and its first 60 lines */
     uint64_t t_units = api_nsec();
     lp_vec(lp_id) units = { 0 };
+    /* every shown file's tree read in one walk, a level at a time for all of them */
+    lp_id *shown_files = malloc(sizeof *shown_files * (shown ? shown : 1));
+    char **texts = calloc(shown ? shown : 1, sizeof *texts);
+    size_t *lens = calloc(shown ? shown : 1, sizeof *lens);
+    for (size_t i = 0; i < shown; i++) shown_files[i] = hits.v[i].file;
+    if (shown) fo_texts(pg, rd, shown_files, shown, texts, lens);
     for (size_t i = 0; i < shown; i++) {
         CodeHit *h = &hits.v[i];
         lp_push(&units, h->unit);
-        size_t tn = 0;
-        char *text = fo_text(pg, rd, &h->file, &tn);
+        size_t tn = lens[i];
+        char *text = texts[i];
         int whole = !memcmp(h->unit.b, h->file.b, 16);
         char *unit = whole ? strdup("") : reader_text(rd, &h->unit, (size_t)1 << 20);
         const char *at = unit[0] ? strstr(text, unit) : NULL;
@@ -465,6 +471,9 @@ void on_code_search(int c, const char *body) {
         free(unit);
         free(text);
     }
+    free(shown_files);
+    free(texts);
+    free(lens);
     if (units.n) {
         uint8_t *param = malloc(20 + 20 * units.n);
         size_t pl = ids_param(pg, param, units.v, (uint32_t)units.n);

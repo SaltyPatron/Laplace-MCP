@@ -83,6 +83,7 @@ int fo_word(char c);
 void fo_free(FoDecl *d, size_t n);
 size_t fo_outline(PGconn *pg, Reader *rd, const lp_id *file, FoDecl **declp, char **textp, size_t *tnp);
 char *fo_text(PGconn *pg, Reader *rd, const lp_id *file, size_t *tnp);
+void fo_texts(PGconn *pg, Reader *rd, const lp_id *files, size_t n, char **texts, size_t *lens);
 long fo_holder(const FoDecl *declarations, size_t count, size_t position);
 
 int api_name_entity(const char *text, lp_ref *trunk, lp_ref *parts, size_t cap, size_t *nparts);
