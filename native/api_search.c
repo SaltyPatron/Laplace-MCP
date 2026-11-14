@@ -18,8 +18,11 @@ static int is_prose_or_data_path(const char *path) {
     if (!path) return 0;
     if (strstr(path, "/Laplace-Wiki/") || strstr(path, "\\Laplace-Wiki\\") ||
         strstr(path, "/docs/") || strstr(path, "\\docs\\")) return 1;
-    const char *dot = strrchr(path, '.');
-    if (!dot) return 0;
+    /* a compressed file is what it holds: its extension is the one before .gz, as the Engine selects its recipe */
+    char base[1024]; snprintf(base, sizeof base, "%s", path);
+    size_t bl = strlen(base); if (bl > 3 && !strcasecmp(base + bl - 3, ".gz")) base[bl - 3] = 0;
+    const char *dot = strrchr(base, '.'), *slash = strrchr(base, '/');
+    if (!dot || (slash && dot < slash)) return 0;
     static const char *const EXT[] = { ".md", ".txt", ".rst", ".adoc", ".json", ".tsv", ".csv", ".lmf", ".ttl", ".yml",
                                        ".yaml", ".recipe", ".format", ".env", ".in", ".cmake", ".control" };
     for (size_t i = 0; i < sizeof EXT / sizeof *EXT; i++) if (!strcasecmp(dot, EXT[i])) return 1;
