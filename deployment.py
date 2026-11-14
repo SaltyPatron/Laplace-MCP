@@ -232,6 +232,24 @@ def verify_frozen_manifest(config, stage, environment):
             raise ValueError('Prepared Highway differs from the packaged frozen manifests: ' + ' versus '.join(fingerprints))
 
 
+def prepare_chess(stage, environment):
+    """The chess perf-cache beside the release's tier 0 (share/prepared/tier0.chess, where Engine and the extension's
+    laplace.chess look), written by this release's own Engine from the openings source and verified: every dense record
+    the law's composition, every position and transition replayed from the standard start. No database is involved,
+    and the same Engine, tier 0 and openings give the same bytes, so the package stays content addressed."""
+    executable = stage / 'bin/laplace'
+    environment = dict(environment, LAPLACE_TIER0=str(stage / 'share/prepared/tier0.bin'),
+                       LAPLACE_FLAGS=str(stage / 'share/prepared/tier0.flags'),
+                       LAPLACE_HIGHWAY=str(stage / 'share/prepared/tier0.highway'),
+                       LAPLACE_RECIPES=str(stage / 'share/recipes'), LAPLACE_GRAMMARS=str(stage / 'share/grammars'),
+                       LAPLACE_MANIFEST=str(stage / 'share/manifest'),
+                       LAPLACE_CONNINFO='host=127.0.0.1 port=1 connect_timeout=1 dbname=unused')
+    environment.pop('LAPLACE_CHESS', None)
+    target = stage / 'share/prepared/tier0.chess'
+    run([executable, 'chess', '-o', target, 'openings'], env=environment, capture_output=True, timeout=600)
+    run([executable, 'chess', '-o', target, '--verify'], env=environment, capture_output=True, timeout=600)
+
+
 def synchronize_sources(source, snapshot, revisions):
     """Keep one clean, detached source tree per repository under the build lock."""
     source, snapshot = Path(source), Path(snapshot)
@@ -359,6 +377,7 @@ def _package(config, output, clean_build=False):
                     if not dependency.is_relative_to(stage):
                         dependencies[fields[2]] = digest(dependency)
         verify_frozen_manifest(config, stage, environment)
+        prepare_chess(stage, environment)
         runtime_launchers(stage)
         files = {str(p.relative_to(stage)): digest(p) for p in sorted(stage.rglob('*')) if p.is_file()}
         receipt = {'schema': 'laplace.modular-package/v1', 'revisions': revisions,
@@ -394,7 +413,8 @@ def verify_package(release):
     if CONTROLLER not in receipt['files']:
         raise PackageUpgradeRequired('Modular package lacks its deployment controller; rebuild a compatible release')
     required = {'share/prepared/tier0.bin', 'share/prepared/tier0.flags', 'share/prepared/tier0.flags.layout',
-                'share/prepared/tier0.highway', 'share/manifest/banks.tsv', 'share/firmware/program.firmware',
+                'share/prepared/tier0.highway', 'share/prepared/tier0.chess', 'share/manifest/banks.tsv',
+                'share/firmware/program.firmware',
                 'libexec/laplace-client.py', 'web/Laplace.Modular.Web.dll'}
     if not required.issubset(receipt['files']) or not any(name.startswith('share/grammars/') and name.endswith('.so') for name in receipt['files']):
         raise PackageUpgradeRequired('Modular package lacks its immutable runtime resources; rebuild a compatible release')
