@@ -83,6 +83,109 @@ static void code_terms(const char *s, Terms *t) {
     lp_vec_free(&segs);
 }
 
+/* ---- the query as its own Merkle DAG: every composition the text decomposer makes of it (lp_text_decompose), each
+ * with its children, its text and whether a letter or digit is in it. The query is looked up by its IDs, top down:
+ * the highest nodes the database holds are what the query shares with it, and below a held node nothing more is
+ * asked (Query: the query is decomposed on the client and looked up by ID). */
+typedef struct { lp_id id; uint32_t first, n; char *text; int word; } QNode;
+typedef struct { lp_vec(QNode) node; lp_vec(lp_id) kid; } QDag;
+static const QNode *qdag_node(const QDag *d, const lp_id *id) {
+    for (size_t i = d->node.n; i-- > 0;) if (!memcmp(d->node.v[i].id.b, id->b, 16)) return &d->node.v[i];
+    return NULL;
+}
+static lp_ref qdag_compose(void *sink, const lp_ref *ch, uint32_t n, uint8_t tier) {
+    QDag *d = sink;
+    lp_ref r = lp_ref_compose(ch, n, tier);
+    if (qdag_node(d, &r.id)) return r;
+    QNode x = { .id = r.id, .first = (uint32_t)d->kid.n, .n = n };
+    lp_vec(char) text = { 0 };
+    for (uint32_t i = 0; i < n; i++) {
+        lp_push(&d->kid, ch[i].id);
+        const QNode *k = qdag_node(d, &ch[i].id);
+        if (k) { for (const char *c = k->text; *c; c++) lp_push(&text, *c); x.word |= k->word; continue; }
+        int64_t cp = lp_tier0_codepoint(T0, &ch[i].id);                    /* a leaf: its codepoint */
+        if (cp < 0) continue;
+        uint8_t u[4]; size_t l = lp_utf8_put((uint32_t)cp, u);
+        for (size_t j = 0; j < l; j++) lp_push(&text, (char)u[j]);
+        x.word |= cp >= 0x80 || isalnum((int)cp);
+    }
+    lp_push(&text, 0);
+    x.text = text.v;
+    lp_push(&d->node, x);
+    return r;
+}
+static void qdag_free(QDag *d) { for (size_t i = 0; i < d->node.n; i++) free(d->node.v[i].text); lp_vec_free(&d->node); lp_vec_free(&d->kid); }
+/* Which of these IDs the database holds: one round trip (laplace_entities answers the held ones by ordinal). */
+static uint8_t *held_ids(PGconn *pg, const lp_id *ids, size_t n) {
+    uint8_t *held = calloc(n ? n : 1, 1);
+    if (!n) return held;
+    uint8_t *param = malloc(20 + 20 * n);
+    size_t pl = ids_param(pg, param, ids, (uint32_t)n);
+    const char *pv[1] = { (const char *)param };
+    int plen[1] = { (int)pl }, pf[1] = { 1 };
+    PGresult *r = db_exec_params(pg, "SELECT ordinal FROM @extschema@.laplace_entities($1::@extschema@.blake3[])", 1, NULL, pv, plen, pf, 1);
+    if (PQresultStatus(r) == PGRES_TUPLES_OK)
+        for (int row = 0; row < PQntuples(r); row++) { size_t i = (size_t)lp_be(PQgetvalue(r, row, 0), 8) - 1; if (i < n) held[i] = 1; }
+    PQclear(r);
+    free(param);
+    return held;
+}
+/* The query's terms: walked from its root down, each held node that holds a letter or digit is a term and nothing
+ * under it is; a node the database does not hold is passed through to its children. The runs of segments with no
+ * space between them (an identifier written in the query) the database holds are terms too, and a word inside such a
+ * run is then the run's, not a term of its own. qinfo: how many nodes the query's DAG has and how many are held. */
+static void query_terms(PGconn *pg, const char *s, Terms *t, size_t *qnodes, size_t *qheld) {
+    memset(t, 0, sizeof *t);
+    *qnodes = *qheld = 0;
+    size_t n = strlen(s);
+    if (!TX || !n) return;
+    QDag d = { 0 };
+    lp_ref root = lp_text_decompose(TX, (const uint8_t *)s, n, qdag_compose, &d);
+    Terms runs;
+    code_terms(s, &runs);                                                     /* words and the runs of segments */
+    size_t nask = d.node.n + (size_t)runs.n;
+    lp_id *ask = malloc(sizeof *ask * (nask ? nask : 1));
+    for (size_t i = 0; i < d.node.n; i++) ask[i] = d.node.v[i].id;
+    for (int i = 0; i < runs.n; i++) ask[d.node.n + (size_t)i] = runs.id[i];
+    uint8_t *held = held_ids(pg, ask, nask);
+    *qnodes = d.node.n;
+    for (size_t i = 0; i < d.node.n; i++) *qheld += held[i];
+    /* top down from the root, breadth first, each node once */
+    lp_vec(lp_id) open = { 0 };
+    lp_idmap *seen = lp_idmap_new();
+    lp_push(&open, root.id);
+    for (size_t at = 0; at < open.n && t->n < 64; at++) {
+        lp_id id = open.v[at];
+        bool fresh;
+        lp_idmap_put(seen, &id, &fresh);
+        if (!fresh) continue;
+        const QNode *x = qdag_node(&d, &id);
+        if (!x) {                                                             /* a codepoint: a term when held and a letter or digit */
+            int64_t cp = lp_tier0_codepoint(T0, &id);
+            if (cp >= 0 && (cp >= 0x80 || isalnum((int)cp))) { char u[8] = { 0 }; lp_utf8_put((uint32_t)cp, (uint8_t *)u); term_add(t, u, 0, strlen(u)); }
+            continue;
+        }
+        if (held[x - d.node.v]) { if (x->word) term_add(t, x->text, 0, strlen(x->text)); continue; }
+        for (uint32_t k = 0; k < x->n; k++) lp_push(&open, d.kid.v[x->first + k]);
+    }
+    /* the runs held: each a term, and the words within it its own no more */
+    for (int i = 0; i < runs.n && t->n < 64; i++) {
+        if (!held[d.node.n + (size_t)i]) continue;
+        int words = 0;
+        for (int w = 0; w < t->n; w++) if (strstr(runs.text[i], t->text[w])) words++;
+        if (!words) continue;                                                 /* a run of no term held: nothing it shares */
+        Terms kept = { 0 };
+        for (int w = 0; w < t->n; w++) if (!strstr(runs.text[i], t->text[w]) || !strcmp(runs.text[i], t->text[w])) { kept.id[kept.n] = t->id[w]; memcpy(kept.text[kept.n], t->text[w], sizeof t->text[w]); kept.n++; }
+        *t = kept;
+        term_add(t, runs.text[i], 0, strlen(runs.text[i]));
+    }
+    lp_idmap_free(seen);
+    lp_vec_free(&open);
+    free(held);
+    free(ask);
+    qdag_free(&d);
+}
+
 /* Inverse document frequency of a term held by df of n documents. */
 static double term_idf(double df, double n) { return log(1.0 + (n - df + 0.5) / (df + 0.5)); }
 
@@ -348,7 +451,8 @@ void on_code_search(int c, const char *body) {
     char *bridged = bridge ? bridge_query(query, binfo, sizeof binfo, &bridge_ms, &bridge_error) : NULL;
     if (bridge_error) { api_http(c, 502, bridge_error); return; }
     Terms terms;
-    code_terms(bridged ? bridged : query, &terms);
+    size_t qnodes = 0, qheld = 0;
+    query_terms(pg, bridged ? bridged : query, &terms, &qnodes, &qheld);
     free(bridged);
     if (!terms.n) { api_http(c, 400, "{\"error\":\"the query holds no word\"}"); return; }
 
@@ -497,9 +601,9 @@ void on_code_search(int c, const char *body) {
             "{\"docs\":%zu,\"entities\":%zu,\"ms\":%.3f,\"model\":\"laplace-containment\",\"scope\":\"%s\","
             "\"source\":\"", scope ? lp_idmap_count(scope) : 0, nfound, ms, scope_s);
     api_cw_str(&out, &un, &ucap, source);
-    api_buf_fmt(&out, &un, &ucap, "\",\"witnesses\":%d,\"levels\":%d,\"cut\":%s,"
+    api_buf_fmt(&out, &un, &ucap, "\",\"query\":{\"nodes\":%zu,\"held\":%zu},\"witnesses\":%d,\"levels\":%d,\"cut\":%s,"
             "\"phases_ms\":{\"scope\":%.1f,\"terms\":%.1f,\"walk\":%.1f,\"rank\":%.1f,\"text\":%.1f},\"terms\":[",
-            witnesses, levels, cut ? "true" : "false", (double)(t_terms - t_scope) / 1e6,
+            qnodes, qheld, witnesses, levels, cut ? "true" : "false", (double)(t_terms - t_scope) / 1e6,
             (double)(t_walk - t_terms) / 1e6, (double)(t_rank - t_walk) / 1e6, (double)(t_units - t_rank) / 1e6,
             (double)(api_nsec() - t_units) / 1e6);
     for (int b = 0; b < terms.n; b++) {
