@@ -202,8 +202,16 @@ static char *bridge_query(const char *query, char *info, size_t icap, double *ms
     *error = NULL;
     const char *lang = getenv("LAPLACE_CODE_BRIDGE_LANGUAGE"), *nc = getenv("LAPLACE_CODE_BRIDGE_CONCEPTS");
     if (!lang || !*lang) lang = "en";
-    char concepts[8];
-    snprintf(concepts, sizeof concepts, "%d", nc && atoi(nc) > 0 && atoi(nc) < 100 ? atoi(nc) : 2);
+    char concepts[8] = "2", *end = NULL;
+    if (nc && *nc) {
+        long k = strtol(nc, &end, 10);
+        if (end == nc || *end || k < 1 || k > 99) {
+            *ms = 0;
+            *error = "{\"error\":\"LAPLACE_CODE_BRIDGE_CONCEPTS is a whole number from 1 to 99\"}";
+            return NULL;
+        }
+        snprintf(concepts, sizeof concepts, "%ld", k);
+    }
     size_t ql = strlen(query);
     char *out = malloc(ql + 8192), *seen = malloc(ql + 8192);
     if (!out || !seen) { free(out); free(seen); *ms = 0; *error = "{\"error\":\"vocabulary bridge allocation failed\"}"; return NULL; }
