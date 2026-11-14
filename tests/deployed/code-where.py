@@ -199,6 +199,29 @@ def main():
         if r['files'] or r['hits']:
             fail(f'an absent name: {r}')
 
+        # code_search: from the database alone, over the files of the named witness's trunk; the answer is the unit of
+        # a file's recorded content that holds the query's terms, at its recorded lines (1-based)
+        cs = call('code_search', {'query': R, 'source': witness, 'limit': 3})
+        if cs['model'] != 'laplace-containment' or cs['witnesses'] != 1 or cs['docs'] != len(SRC) or not cs['hits']:
+            fail(f'code_search {R}: {cs}')
+        top = cs['hits'][0]
+        if not top['path'].endswith(f'/{DIR}/retry.c') or not (top['line0'] <= 8 <= top['line1']) or R not in top['snippet']:
+            fail(f'code_search {R}: top hit {top}')
+        if [h['rerank'] for h in cs['hits']] != sorted((h['rerank'] for h in cs['hits']), reverse=True):
+            fail(f'code_search {R}: order {cs["hits"]}')
+        cs = call('code_search', {'query': L, 'source': witness, 'scope': 'code'})
+        if [Path(h['path']).name for h in cs['hits']][:1] != ['alone.py']:
+            fail(f'code_search {L}: {cs["hits"]}')
+        if call('code_search', {'query': J, 'source': witness, 'path': f'{DIR}/nowhere'})['hits']:
+            fail('code_search: a path filter that holds nothing')
+        if call('code_search', {'query': J, 'source': P + ' no such witness'})['witnesses'] != 0:
+            fail('code_search: an absent witness')
+
+        # rerank: the query's terms each document holds, by their weight in the database's containment
+        rr = call('rerank', {'query': f'{B} {R}', 'documents': ['nothing in common here', f'{B} and {R}', B]})
+        if [x['index'] for x in rr['results']] != [1, 2, 0] or rr['results'][2]['relevance_score'] != 0:
+            fail(f'rerank: {rr}')
+
         database = check.sql('SELECT current_database()')
         s = call('sources', {})
         named = {w['id'] for w in s['sources'] if w['name'] == witness}

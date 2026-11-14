@@ -55,7 +55,6 @@ void api_dispatch(int c, const char *method, const char *path, const char *body)
 extern const lp_tier0_record *T0;
 extern lp_text *TX;
 extern PGconn *PG;
-extern Lpm *CODE_IX;
 extern const char *ENGINE;
 
 const lp_highway *api_view_highway(void);

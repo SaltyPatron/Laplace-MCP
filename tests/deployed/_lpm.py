@@ -60,17 +60,13 @@ def lpm():
 
 def environment(fixture, **more):
     """lpm's environment for a check: the deployed database, the check's scratch, and nothing of the service's
-    listener, credential or code index."""
-    env = dict(os.environ)
+    listener, credential or code-search settings."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith('LAPLACE_CODE_')}
     for name in ('LAPLACE_MCP_TOKEN', 'LAPLACE_MCP_TOKEN_FILE', 'LAPLACE_MCP_HOST', 'LAPLACE_MCP_PORT',
-                 'LAPLACE_CODE_ROOTS', 'LAPLACE_CODE_STORE', 'LAPLACE_CODE_RECORDS', 'LAPLACE_INGEST_LOGS', 'LAPLACE_INGEST_RUNS',
-                 'LAPLACE_INGEST_ONE', 'PGAPPNAME'):
+                 'LAPLACE_INGEST_LOGS', 'LAPLACE_INGEST_RUNS', 'LAPLACE_INGEST_ONE', 'PGAPPNAME'):
         env.pop(name, None)
-    code = fixture.scratch / 'code'
-    code.mkdir(exist_ok=True)
     env.update(LAPLACE_CONNINFO=check.connection(), LAPLACE_WORK=str(fixture.work), LAPLACE_DATA=str(fixture.data),
-               LAPLACE_RECIPES=str(fixture.recipes), LAPLACE_CODE_STORE=str(fixture.scratch / 'code-store'),
-               LAPLACE_CODE_ROOTS=str(code), LAPLACE_CODE_SEMANTIC='')
+               LAPLACE_RECIPES=str(fixture.recipes))
     env.update({k: str(v) for k, v in more.items()})
     return env
 

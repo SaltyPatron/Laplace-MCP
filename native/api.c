@@ -4,7 +4,6 @@
 const lp_tier0_record *T0;
 lp_text *TX;
 PGconn *PG;
-Lpm *CODE_IX;
 const char *ENGINE = LPM_ENGINE_DEFAULT;
 static const char *CONN_DEFAULT = LPM_CONNINFO_DEFAULT;
 static const lp_highway *VIEW_HIGHWAY;
