@@ -117,36 +117,38 @@ static void emit_tag(char **o, size_t *on, size_t *oc, const Load *L, const Game
 }
 
 /* ---- a line written again: SAN, UCI and FEN of each ply, by the Engine's rules */
-typedef struct { char san[16], uci[8], fen[112]; lp_id position; int white_moved; } Ply;
-typedef struct { Ply *p; size_t n; char start[112]; int complete; } Replay;
+typedef struct { char san[16], uci[8], fen[LP_CHESS_FEN + 24]; lp_id position; int white_moved; } Ply;
+typedef struct { Ply *p; size_t n; char start[LP_CHESS_FEN + 24]; int complete; } Replay;
 static void uci_of(const Bd *b, const Mv *m, int c960, char *out){
     int to = m->to;
+    if (m->drop) { snprintf(out, 8, "%c@%c%c", "?PNBRQK"[m->drop], 'a' + (m->to & 7), '1' + (m->to >> 3)); return; }      /* a drop, as UCI writes it: P@e4 */
     if (m->castle && !c960) to = (m->to & 7) > (m->from & 7) ? (m->from & ~7) + 6 : (m->from & ~7) + 2;   /* a king's own two steps */
     char *o = out; *o++ = (char)('a' + (m->from & 7)); *o++ = (char)('1' + (m->from >> 3)); *o++ = (char)('a' + (to & 7)); *o++ = (char)('1' + (to >> 3));
     if (m->promo) *o++ = ".pnbrqk"[m->promo]; *o = 0; (void)b;
 }
 /* fen of b with its clocks: halfmove since the last capture or pawn move, the move number */
-static void fen_full(const Bd *b, int half, int full, char *out){ size_t n = lp_chess_fen_of(b, out); snprintf(out + n, 112 - n, " %d %d", half, full); }
-/* The line's positions replayed from the game's start: its FEN tag's position (Chess960 where its Variant says so), or
- * the standard one; every move the legal one whose position is the next. complete 0: a move no legal move makes. */
+static void fen_full(const Bd *b, int half, int full, char *out){ size_t n = lp_chess_fen_of(b, out); snprintf(out + n, LP_CHESS_FEN + 24 - n, " %d %d", half, full); }
+/* The line's positions replayed from the game's start under the law its Variant names (the Engine's chess firmware,
+ * lp_chess_law_named): its FEN tag's position, or the law's start; every move the legal one whose position is the
+ * next. complete 0: a variant no law names, or a move no legal move makes. */
 static void replay_line(const Verts *line, const lp_id *one, const char *fen, const char *variant, Replay *r){
-    memset(r, 0, sizeof *r); Bd b; int c960 = variant && (strstr(variant, "960") || strstr(variant, "Fischer"));
-    int half = 0, full = 1;
-    if (fen && *fen) { if (!board_fen(&b, fen, strlen(fen), c960)) return;
+    memset(r, 0, sizeof *r); Bd b; const LpChessLaw *law = lp_chess_law_named(variant, variant ? strlen(variant) : 0); if (!law) return;
+    int c960 = law->c960, half = 0, full = 1;
+    if (fen && *fen) { if (!board_law_fen(&b, fen, strlen(fen), law)) return;
         const char *s = fen; for (int f = 0; f < 4 && s; f++) { s = strchr(s, ' '); if (s) s++; }
         if (s) { half = atoi(s); s = strchr(s, ' '); if (s) full = atoi(s + 1); if (full < 1) full = 1; } }
-    else board_start(&b);
+    else board_law_start(&b, law);
     lp_id p0; id_position(&b, &p0);
     const lp_id *P0 = line ? &line->id[0] : one;
     if (!lp_id_eq(&p0, P0)) return;
     fen_full(&b, half, full, r->start);
     size_t moves = line ? (line->n - 1) / 2 : 0; r->p = calloc(moves ? moves : 1, sizeof(Ply));
     for (size_t i = 0; i < moves && i < PLIES_MAX; i++) {
-        const lp_id *next = &line->id[2 * i + 2]; Mv all[256]; int na = gen(&b, all), k = -1;
+        const lp_id *next = &line->id[2 * i + 2]; Mv all[LP_CHESS_MOVES]; int na = gen(&b, all), k = -1;
         for (int j = 0; j < na && k < 0; j++) { Bd t = b; make(&t, &all[j]); lp_id id; id_position(&t, &id); if (lp_id_eq(&id, next)) k = j; }
         if (k < 0) return;
         Ply *p = &r->p[r->n]; p->white_moved = !b.side; san_of(&b, &all[k], all, na, 1, p->san); uci_of(&b, &all[k], c960, p->uci);
-        int zero = !all[k].castle && (b.sq[all[k].to] || all[k].ep || abs(b.sq[all[k].from]) == PAWN);
+        int zero = !all[k].castle && !all[k].drop && (b.sq[all[k].to] || all[k].ep || abs(b.sq[all[k].from]) == PAWN);
         make(&b, &all[k]); half = zero ? 0 : half + 1; if (!b.side) full++;
         fen_full(&b, half, full, p->fen); p->position = *next; r->n++;
     }
