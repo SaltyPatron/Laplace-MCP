@@ -166,21 +166,22 @@ static lp_idmap *code_scope(PGconn *pg, Reader *rd, const char *name, int *witne
     return files;
 }
 
-static int env_weight(const char *name, double *w) {
+/* a positive count from the environment, dflt when it is not set; a value that is not one is refused (500), never
+ * read as the default */
+static int env_count(int c, const char *name, long dflt, long *out) {
     const char *v = getenv(name);
+    *out = dflt;
     if (!v || !*v) return 1;
     char *e = NULL;
-    double x = strtod(v, &e);
-    if (e == v || *e || !(x >= 0.0 && x <= 1.0)) return 0;
-    *w = x;
-    return 1;
-}
-static long env_long(const char *name, long dflt) {
-    const char *v = getenv(name);
-    if (!v || !*v) return dflt;
-    char *e = NULL;
     long x = strtol(v, &e, 10);
-    return e == v || *e ? dflt : x;
+    if (e == v || *e || x < 1) {
+        char msg[192];
+        snprintf(msg, sizeof msg, "{\"error\":\"%s is not a positive whole number\"}", name);
+        api_http(c, 500, msg);
+        return 0;
+    }
+    *out = x;
+    return 1;
 }
 
 static int bridge_word_ok(const char *w) {
@@ -282,7 +283,7 @@ typedef struct {
     lp_id file, unit;
     double score, prior, seed;
     uint64_t keys;
-    int shared, rank;
+    int shared;
     char *path, *snippet;
     size_t line0, line1;
     int64_t hilbert;
@@ -324,17 +325,8 @@ void on_code_search(int c, const char *body) {
             return;
         }
     } else snprintf(scope_s, sizeof scope_s, "all");
-    char fusion[16] = "";
-    if (!api_jstr(body, "fusion", fusion, sizeof fusion) || !fusion[0]) {
-        const char *fe = getenv("LAPLACE_CODE_FUSION");
-        snprintf(fusion, sizeof fusion, "%s", fe && *fe ? fe : "rerank");
-    }
-    if (strcmp(fusion, "rrf") && strcmp(fusion, "rerank")) { api_http(c, 400, "{\"error\":\"fusion is rrf or rerank\"}"); return; }
-    double w_rr = 1.0;
-    if (!env_weight("LAPLACE_CODE_RERANK_WEIGHT", &w_rr)) {
-        api_http(c, 400, "{\"error\":\"LAPLACE_CODE_RERANK_WEIGHT is a number from 0 to 1\"}");
-        return;
-    }
+    long cap, most;
+    if (!env_count(c, "LAPLACE_CODE_HUB", 4096, &cap) || !env_count(c, "LAPLACE_CODE_NODES", 400000, &most)) return;
     PGconn *pg = api_cc_db(c);
     if (!pg) return;
     uint64_t t0 = api_nsec();
@@ -360,8 +352,6 @@ void on_code_search(int c, const char *body) {
     /* how common each term is: the paths that hold it directly, read from the container index at once; a term with
      * more than LAPLACE_CODE_HUB of a kind is a hub */
     uint64_t t_terms = api_nsec();
-    long cap = env_long("LAPLACE_CODE_HUB", 4096);
-    long most = env_long("LAPLACE_CODE_NODES", 400000);
     double holders[64] = { 0 }, idf[64] = { 0 }, total = 0;
     uint64_t hubs = 0;
     {
@@ -387,7 +377,7 @@ void on_code_search(int c, const char *body) {
     int levels = 0, cut = 0;
     size_t nfound = 0;
     HeldFile *found = nwalked ? held_in(pg, witnesses == 1 ? &SCOPE_TRUNK : NULL, walked, nwalked, -1,
-                                        most > 0 ? most : 400000, &walk_hubs, &levels, &cut, &nfound) : NULL;
+                                        most, &walk_hubs, &levels, &cut, &nfound) : NULL;
 
     /* each file scores its unit by BM25 (k1 1.2, b 0.75) over the terms' occurrences; the unit's size is its tier (a
      * whole file's path is only its record and its content), against the mean of the units' */
@@ -449,7 +439,6 @@ void on_code_search(int c, const char *body) {
     lp_vec(lp_id) units = { 0 };
     for (size_t i = 0; i < shown; i++) {
         CodeHit *h = &hits.v[i];
-        h->rank = (int)i + 1;
         lp_push(&units, h->unit);
         size_t tn = 0;
         char *text = fo_text(pg, rd, &h->file, &tn);
@@ -488,12 +477,12 @@ void on_code_search(int c, const char *body) {
     char *out = NULL;
     size_t un = 0, ucap = 0;
     api_buf_fmt(&out, &un, &ucap,
-            "{\"docs\":%zu,\"entities\":%zu,\"ms\":%.3f,\"model\":\"laplace-containment\",\"fusion\":\"%s\",\"scope\":\"%s\","
-            "\"source\":\"", scope ? lp_idmap_count(scope) : 0, nfound, ms, fusion, scope_s);
+            "{\"docs\":%zu,\"entities\":%zu,\"ms\":%.3f,\"model\":\"laplace-containment\",\"scope\":\"%s\","
+            "\"source\":\"", scope ? lp_idmap_count(scope) : 0, nfound, ms, scope_s);
     api_cw_str(&out, &un, &ucap, source);
-    api_buf_fmt(&out, &un, &ucap, "\",\"witnesses\":%d,\"weights\":{\"rerank\":%g},\"levels\":%d,\"cut\":%s,"
+    api_buf_fmt(&out, &un, &ucap, "\",\"witnesses\":%d,\"levels\":%d,\"cut\":%s,"
             "\"phases_ms\":{\"scope\":%.1f,\"terms\":%.1f,\"walk\":%.1f,\"rank\":%.1f,\"text\":%.1f},\"terms\":[",
-            witnesses, w_rr, levels, cut ? "true" : "false", (double)(t_terms - t_scope) / 1e6,
+            witnesses, levels, cut ? "true" : "false", (double)(t_terms - t_scope) / 1e6,
             (double)(t_walk - t_terms) / 1e6, (double)(t_rank - t_walk) / 1e6, (double)(t_units - t_rank) / 1e6,
             (double)(api_nsec() - t_units) / 1e6);
     for (int b = 0; b < terms.n; b++) {
@@ -508,7 +497,7 @@ void on_code_search(int c, const char *body) {
     }
     if (bridge) api_buf_fmt(&out, &un, &ucap, "],\"bridge\":{\"words\":%s,\"ms\":%.3f}", binfo, bridge_ms);
     else api_buf_add(&out, &un, &ucap, "]", 1);
-    api_buf_fmt(&out, &un, &ucap, ",\"candidates\":{\"lexical\":%zu,\"reranked\":%zu},\"hits\":[", reached, hits.n);
+    api_buf_fmt(&out, &un, &ucap, ",\"candidates\":{\"reached\":%zu,\"kept\":%zu},\"hits\":[", reached, hits.n);
     for (size_t i = 0; i < shown; i++) {
         CodeHit *h = &hits.v[i];
         char id[33];
@@ -517,9 +506,9 @@ void on_code_search(int c, const char *body) {
         api_buf_fmt(&out, &un, &ucap, "%s{\"rank\":%zu,\"path\":\"", i ? "," : "", i + 1);
         api_cw_str(&out, &un, &ucap, h->path);
         api_buf_fmt(&out, &un, &ucap,
-                "\",\"line0\":%zu,\"line1\":%zu,\"source\":\"laplace\",\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%d,"
-                "\"frechet\":-1,\"rerank\":%.6f,\"fused\":%.6f,\"ranks\":{\"rerank\":%d,\"lexical\":%d},\"snippet\":\"",
-                h->line0, h->line1, id, (unsigned long long)h->hilbert, h->shared, score, h->score, h->rank, h->rank);
+                "\",\"line0\":%zu,\"line1\":%zu,\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%d,"
+                "\"rerank\":%.6f,\"bm25\":%.6f,\"snippet\":\"",
+                h->line0, h->line1, id, (unsigned long long)h->hilbert, h->shared, score, h->score);
         api_cw_str(&out, &un, &ucap, h->snippet ? h->snippet : "");
         api_buf_add(&out, &un, &ucap, "\"}", 2);
     }
@@ -567,13 +556,18 @@ void on_rerank(int c, const char *body) {
     size_t nd = api_parse_str_array(body, "documents", docs, 256);
     if (!nd) { api_http(c, 400, "{\"error\":\"documents\"}"); return; }
     int top_n = (int)nd;
-    if (api_jint(body, "top_n", &top_n) && (top_n < 1 || (size_t)top_n > nd)) top_n = (int)nd;
+    long cap;
+    if (api_jint(body, "top_n", &top_n) && (top_n < 1 || (size_t)top_n > nd)) {
+        for (size_t i = 0; i < nd; i++) free(docs[i]);
+        api_http(c, 400, "{\"error\":\"top_n is from 1 to the number of documents\"}");
+        return;
+    }
+    if (!env_count(c, "LAPLACE_CODE_HUB", 4096, &cap)) { for (size_t i = 0; i < nd; i++) free(docs[i]); return; }
     PGconn *pg = api_cc_db(c);
     if (!pg) { for (size_t i = 0; i < nd; i++) free(docs[i]); return; }
     uint64_t t0 = api_nsec();
     Terms q;
     code_terms(query, &q);
-    long cap = env_long("LAPLACE_CODE_HUB", 4096);
     double df[64] = { 0 }, idf[64] = { 0 }, total = 0;
     int *hub = calloc((size_t)(q.n ? q.n : 1) * 2, sizeof *hub), nh = 0;
     Hold *h = q.n ? holds_capped(pg, q.id, q.n, (int)cap, 0, 3, hub, &nh) : NULL;
@@ -604,7 +598,7 @@ void on_rerank(int c, const char *body) {
     size_t un = 0, ucap = 0;
     api_buf_fmt(&out, &un, &ucap, "{\"model\":\"laplace-containment\",\"ms\":%.3f,\"results\":[", ms);
     for (size_t i = 0; i < shown; i++)
-        api_buf_fmt(&out, &un, &ucap, "%s{\"index\":%u,\"relevance_score\":%.6f,\"shared\":%u,\"frechet\":-1}",
+        api_buf_fmt(&out, &un, &ucap, "%s{\"index\":%u,\"relevance_score\":%.6f,\"shared\":%u}",
                 i ? "," : "", items[i].index, items[i].score, items[i].shared);
     api_buf_add(&out, &un, &ucap, "]}", 2);
     free(items);

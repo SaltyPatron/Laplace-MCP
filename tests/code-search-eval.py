@@ -2,8 +2,9 @@
 """The code_search retrieval eval: ten questions an agent asks of the Laplace repositories, each with
 the file that answers it. Each is asked through lpm mcp, which answers from the database's ingest of the
 workspace (LAPLACE_CONNINFO; LAPLACE_CODE_SOURCE names its witness), and hit@1, @5, @10, mean reciprocal rank
-at 10, and median latency are reported. Skipped where no database is configured.
-  tests/code-search-eval.py path/to/lpm [--min-mrr X] [--fusion rerank,rrf] [--explain FILE]
+at 10, and median latency are reported, for each scope asked. Run it where the database holds the workspace-code
+ingest; it says so and stops where it does not.
+  tests/code-search-eval.py path/to/lpm [--min-mrr X] [--scope all,code] [--explain FILE]
 """
 import argparse, json, os, statistics, subprocess, sys, time
 
@@ -12,12 +13,12 @@ QUERIES = [
     ("where are source keys mapped to their ingest command", "Laplace/app/Laplace.Cli/IngestDispatchTable.cs"),
     ("walk up the container index from claims to the trunks that hold them", "Laplace-Engine/src/walk.c"),
     ("Glicko rating update of a claim's standing from a witness's series", "Laplace-Native/src/consensus.c"),
-    ("reranker score that corrects lexical overlap for document length", "Laplace-MCP/native/lpm_rerank.c"),
+    ("score documents against a query by the containment weight of the terms each holds", "Laplace-MCP/native/api_search.c"),
     ("turn a tree-sitter syntax tree into the file tree the recipe lays out", "Laplace-Engine/src/structure.c"),
     ("reconnect the lichess game stream after an empty response with capped backoff", "Laplace/app/Laplace.Chess/Service/LichessGameStream.cs"),
     ("diagnose who holds the measurement lane advisory lock", "Laplace/app/Laplace.Substrate/Crud/Npgsql/AdvisoryTxLock.cs"),
     ("decide whether a deployment drops and reseeds the database", "Laplace-Operations/seed-stamp.sh"),
-    ("discrete Frechet trajectory distance over 4D S3 coordinates for code search reranking", "Laplace-MCP/native/lpm_rerank.c"),
+    ("discrete Frechet distance between two trajectories of 4D coordinates", "Laplace-Native/src/geom4d.c"),
 ]
 
 
@@ -57,11 +58,9 @@ class McpSession:
             if line:
                 return json.loads(line)
 
-    def ask(self, query, fusion, explain=False, scope=None):
+    def ask(self, query, scope, explain=False):
         self.req_id += 1
-        args = {'query': query, 'limit': 10, 'fusion': fusion}
-        if scope:
-            args['scope'] = scope
+        args = {'query': query, 'limit': 10, 'scope': scope}
         if explain:
             args['explain'] = True
         t = time.time()
@@ -99,31 +98,28 @@ def file_rank(hits, target):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('lpm')
-    ap.add_argument('--min-mrr', type=float, default=None, help='fail when the last fusion scores below this')
-    ap.add_argument('--fusion', default='rerank', help='orders to compare')
-    ap.add_argument('--explain', help='write every candidate with its rankings here (the last fusion)')
+    ap.add_argument('--min-mrr', type=float, default=None, help='fail when the last scope scores below this')
+    ap.add_argument('--scope', default='all', help='scopes to compare (all, code, docs)')
+    ap.add_argument('--explain', help='write every candidate here (the last scope)')
     a = ap.parse_args()
     if not os.environ.get('LAPLACE_CONNINFO'):
-        print('code-search-eval: skipped: no LAPLACE_CONNINFO (a database holding the workspace) configured here')
-        return 0
-    fusions = [f for f in a.fusion.split(',') if f]
+        print('code-search-eval: LAPLACE_CONNINFO names no database (one holding the workspace-code ingest)', file=sys.stderr)
+        return 2
+    scopes = [f for f in a.scope.split(',') if f]
     table, summary, explained = [], {}, {}
     sess = McpSession(a.lpm)
     try:
-        probe, _ = sess.ask(QUERIES[0][0], fusions[0].partition('@')[0])
+        probe, _ = sess.ask(QUERIES[0][0], scopes[0])
         if not probe.get('witnesses'):
-            print('code-search-eval: skipped: the database holds no witness named ' + repr(probe.get('source')))
-            return 0
-        for f in fusions:
+            print('code-search-eval: the database holds no witness named ' + repr(probe.get('source')), file=sys.stderr)
+            return 2
+        for f in scopes:
             ranks, lat = [], []
             for q, target in QUERIES:
-                fu, _, sc = f.partition('@')
-                o, ms = sess.ask(q, fu, explain=bool(a.explain) and f == fusions[-1], scope=sc or None)
-                if a.explain and f == fusions[-1]:
+                o, ms = sess.ask(q, f, explain=bool(a.explain) and f == scopes[-1])
+                if a.explain and f == scopes[-1]:
                     explained[q] = o
-                    hits = sorted(o['hits'], key=lambda h: h['rank'])
-                else:
-                    hits = o['hits']
+                hits = o['hits']
                 ranks.append(file_rank(hits, target))
                 lat.append(ms)
             summary[f] = {'hit@1': sum(r == 1 for r in ranks), 'hit@5': sum(1 for r in ranks if r and r <= 5),
@@ -132,16 +128,16 @@ def main():
             table.append(ranks)
     finally:
         sess.close()
-    print('code-search-eval   ' + '  '.join(f'{f:>8s}' for f in fusions) + '   target')
+    print('code-search-eval   ' + '  '.join(f'{f:>8s}' for f in scopes) + '   target')
     for i, (q, target) in enumerate(QUERIES):
         print(f'  {q[:60]:60s} ' + '  '.join(f'{(str(t[i]) if t[i] else "-"):>8s}' for t in table) + '   ' + target)
-    for f in fusions:
+    for f in scopes:
         print(f'  {f:9s} ' + json.dumps(summary[f]))
     if a.explain:
         with open(a.explain, 'w', encoding='utf-8') as s:
             json.dump({'queries': QUERIES, 'answers': explained}, s)
-    if a.min_mrr is not None and summary[fusions[-1]]['mrr'] < a.min_mrr:
-        print(f'code-search-eval: {fusions[-1]} mean reciprocal rank {summary[fusions[-1]]["mrr"]} is below {a.min_mrr}', file=sys.stderr)
+    if a.min_mrr is not None and summary[scopes[-1]]['mrr'] < a.min_mrr:
+        print(f'code-search-eval: {scopes[-1]} mean reciprocal rank {summary[scopes[-1]]["mrr"]} is below {a.min_mrr}', file=sys.stderr)
         return 1
     return 0
 
