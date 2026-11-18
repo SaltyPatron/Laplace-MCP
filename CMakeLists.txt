@@ -4,31 +4,21 @@ project(LaplaceMCP VERSION 0.1.0 LANGUAGES C CXX ASM)
 # Laplace-MCP: the HTTP service in front of Laplace. Built as the engine is: against the installed Laplace-Native
 # package (find_package(LaplaceNative); CMAKE_PREFIX_PATH or LaplaceNative_DIR), under the floating-point contract it
 # carries, with laplace-math answering every libm call, so the entity this process names and the coordinate it
-# computes are the ones every other Laplace build computes. The engine's reader (read.c, pg.c) is compiled in from the
-# engine's source beside this repository (until the reader is its own package, Modular 3).
+# computes are the ones every other Laplace build computes. The engine's reader (reader.h: read.c, pg.c) is linked from
+# the installed Laplace-Engine package (find_package(LaplaceEngine); LaplaceEngine_DIR), which also names the program
+# the routes run; no Engine source is compiled here.
 set(CMAKE_C_STANDARD 17)
 find_package(LaplaceNative CONFIG REQUIRED)
 find_package(OpenMP REQUIRED)
 
-laplace_path(LAPLACE_ENGINE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../Laplace-Engine/src" "Laplace-Engine's sources: the reader this service links")
-include("${LAPLACE_ENGINE_SRC}/../cmake/EngineReader.cmake")
-laplace_define_engine_reader("${LAPLACE_ENGINE_SRC}")
+find_package(LaplaceEngine CONFIG REQUIRED)
 
 # Connections belong to the installation, never the build cache or shipped binary.
 unset(LAPLACE_CONNINFO CACHE)
 set(LAPLACE_CONNINFO "")
 laplace_path(LAPLACE_BUILD "/repos/build" "build trees")
-option(LAPLACE_BUNDLE_ENGINE "Build the Engine and MCP in one Native dependency graph" OFF)
-if(LAPLACE_BUNDLE_ENGINE)
-  set(LAPLACE_ENGINE "${CMAKE_CURRENT_BINARY_DIR}/engine/laplace${CMAKE_EXECUTABLE_SUFFIX}")
-elseif(WIN32)
-  set(_default_engine "${LAPLACE_BUILD}/Laplace-Engine/icx-release/laplace.exe")
-else()
-  set(_default_engine "${LAPLACE_BUILD}/Laplace-Engine/icx-release/laplace")
-endif()
-if(NOT LAPLACE_BUNDLE_ENGINE)
-  laplace_path(LAPLACE_ENGINE "${_default_engine}" "the engine program the routes run")
-endif()
+laplace_path(LAPLACE_ENGINE "${LaplaceEngine_PROGRAM}" "the engine program the routes run")
+option(LAPLACE_INSTALL_ENGINE "Install the Engine program from its package beside lpm: a release holds both" OFF)
 foreach(pair "LAPLACE_MCP_HOST=127.0.0.1" "LAPLACE_MCP_PORT=5188")
   string(REGEX MATCH "^[^=]+" name "${pair}")
   string(REGEX REPLACE "^[^=]+=" "" default "${pair}")
@@ -42,10 +32,6 @@ if(NOT LAPLACE_MCP_PORT MATCHES "^[0-9]+$")
   message(FATAL_ERROR "LAPLACE_MCP_PORT: '${LAPLACE_MCP_PORT}' is not a port")
 endif()
 configure_file(native/config.h.in ${CMAKE_CURRENT_BINARY_DIR}/lpm_config.h @ONLY)
-
-if(LAPLACE_BUNDLE_ENGINE AND NOT TARGET laplace_engine)
-  add_subdirectory("${LAPLACE_ENGINE_SRC}/.." engine)
-endif()
 
 # liblpm: the in-process client (check, id, text): a text's entity and constituent tree, from the Native decomposer.
 set(LPM_CORE_SOURCES native/lpm.c)
@@ -68,9 +54,9 @@ target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR
 target_compile_options(lpm_program PRIVATE ${LP_C_FLAGS} -Wno-missing-field-initializers)
 if(WIN32)
   target_sources(lpm_program PRIVATE ${LPM_CORE_SOURCES})
-  target_link_libraries(lpm_program PRIVATE laplace_engine_reader Laplace::text ts_runtime ws2_32 ${LP_SYSLIBS})
+  target_link_libraries(lpm_program PRIVATE Laplace::engine_reader Laplace::text Laplace::ts_runtime ws2_32 ${LP_SYSLIBS})
 else()
-  target_link_libraries(lpm_program PRIVATE lpm_lib laplace_engine_reader Laplace::text ts_runtime ${LP_SYSLIBS})
+  target_link_libraries(lpm_program PRIVATE lpm_lib Laplace::engine_reader Laplace::text Laplace::ts_runtime ${LP_SYSLIBS})
   set_target_properties(lpm_lib lpm_program PROPERTIES
     BUILD_RPATH "${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib"
     INSTALL_RPATH "\$ORIGIN/../lib;${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib")
@@ -82,3 +68,6 @@ add_test(NAME check COMMAND lpm_program check)
 include(GNUInstallDirs)
 install(TARGETS lpm_program RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS lpm_lib LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+if(LAPLACE_INSTALL_ENGINE)
+  install(PROGRAMS "${LaplaceEngine_PROGRAM}" DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()

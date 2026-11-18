@@ -35,16 +35,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LAPLACE_CHECKOUT }}
         run: bash Laplace-Operations/native-inputs.sh prepare "$GITHUB_WORKSPACE/Laplace-Native"
-      - name: Native package (built once per Native revision, Laplace-Operations native-package.sh)
+      - name: Native and Engine packages (each built once per revision, Laplace-Operations package.sh)
         run: |
           . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
-          prefix=$(LAPLACE_SRC=$GITHUB_WORKSPACE bash Laplace-Operations/native-package.sh "$GITHUB_WORKSPACE/Laplace-Native")
-          echo "LAPLACE_NATIVE_PACKAGE=$prefix/lib/cmake/LaplaceNative" >> "$GITHUB_ENV"
+          export LAPLACE_SRC=$GITHUB_WORKSPACE
+          native=$(bash Laplace-Operations/native-package.sh "$GITHUB_WORKSPACE/Laplace-Native")/lib/cmake/LaplaceNative
+          engine=$(bash Laplace-Operations/package.sh laplace-engine "$GITHUB_WORKSPACE/Laplace-Engine" "LaplaceNative_DIR=$native" LAPLACE_INSTALL_RECIPE_RESOURCES=OFF LAPLACE_CONNINFO=)
+          echo "LAPLACE_NATIVE_PACKAGE=$native" >> "$GITHUB_ENV"
+          echo "LAPLACE_ENGINE_PACKAGE=$engine/lib/cmake/LaplaceEngine" >> "$GITHUB_ENV"
+          echo "LAPLACE_ENGINE_PROGRAM=$engine/bin/laplace" >> "$GITHUB_ENV"
       - name: build
         run: |
           . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
           export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_OPERATIONS=$GITHUB_WORKSPACE/Laplace-Operations
-          export LAPLACE_ENGINE_SRC=$GITHUB_WORKSPACE/Laplace-Engine/src OMP_NUM_THREADS=$(nproc) MKL_NUM_THREADS=$(nproc)
+          export OMP_NUM_THREADS=$(nproc) MKL_NUM_THREADS=$(nproc)
           . Laplace-Operations/laplace.env
           prepared_grammars=$LAPLACE_GRAMMARS
           compiled_grammars="$LAPLACE_BUILD/Laplace-MCP/grammars"
@@ -52,17 +56,17 @@ jobs:
           export LAPLACE_GRAMMARS="$RUNNER_TEMP/mcp/grammars"
           python3 Laplace-Operations/installation/artifact_store.py --prepared "$prepared_grammars" --compiled "$compiled_grammars" --output "$LAPLACE_GRAMMARS"
           echo "LAPLACE_GRAMMARS=$LAPLACE_GRAMMARS" >> "$GITHUB_ENV"
-          cmake -S Laplace-MCP -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAPLACE_BUNDLE_ENGINE=ON -DLAPLACE_INSTALL_RECIPE_RESOURCES=OFF \
-            -DLAPLACE_TIER0:FILEPATH="$LAPLACE_TIER0" -DLaplaceNative_DIR:PATH="$LAPLACE_NATIVE_PACKAGE" -DLAPLACE_ENGINE_SRC:PATH="$LAPLACE_ENGINE_SRC" -DLAPLACE_OPERATIONS:PATH="$LAPLACE_OPERATIONS"
-          cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib
-          # A second build must leave every target current, including the shared Native dependency.
-          cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib | tee "$RUNNER_TEMP/modular-noop.txt"
+          cmake -S Laplace-MCP -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DLAPLACE_TIER0:FILEPATH="$LAPLACE_TIER0" -DLaplaceNative_DIR:PATH="$LAPLACE_NATIVE_PACKAGE" -DLaplaceEngine_DIR:PATH="$LAPLACE_ENGINE_PACKAGE" -DLAPLACE_OPERATIONS:PATH="$LAPLACE_OPERATIONS"
+          cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target lpm_program lpm_lib
+          # A second build must leave every target current: the packages are inputs, never rebuilt here.
+          cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target lpm_program lpm_lib | tee "$RUNNER_TEMP/modular-noop.txt"
           grep -Fx 'ninja: no work to do.' "$RUNNER_TEMP/modular-noop.txt"
           echo "built against Laplace-Native $(git -C Laplace-Native rev-parse --short HEAD) and Laplace-Engine $(git -C Laplace-Engine rev-parse --short HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: checks
         run: |
           L=$LAPLACE_BUILD/Laplace-MCP/icx-release/lpm
-          E=$LAPLACE_BUILD/Laplace-MCP/icx-release/engine/laplace
+          E=$LAPLACE_ENGINE_PROGRAM
           [ -s "$LAPLACE_TIER0" ] || { echo "Required tier 0 is missing at $LAPLACE_TIER0; install prepared inputs before verification"; exit 1; }
           "$L" check
           python3 Laplace-MCP/tests/deployment-runtime.py "$L"
