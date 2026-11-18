@@ -1,38 +1,13 @@
-/* The connection the engine's reader uses. holds_above lives in Laplace-Engine/src/read.c;
- * the service links that file and these symbols, and does not fork the laplace binary. */
+/* The service's read scope over the engine's reader (reader.h: Laplace::engine_reader). Connections themselves are the
+ * reader's (laplace_db, db_connect, db_try in its pg.c); the service only names the connection a request reads on. */
 #include "db_bridge.h"
-#include "lpm_config.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
-static char noted_conn[8192];
 static PGconn *read_master;
 
-const char *laplace_db(void) {
-    const char *v = getenv("LAPLACE_CONNINFO");
-    return v && *v ? v : LPM_CONNINFO_DEFAULT;
-}
-const char *db_noted(void) { return noted_conn; }
-
 void lpm_read_scope(PGconn *pg,const char *connection){
-    read_master=pg;snprintf(noted_conn,sizeof noted_conn,"%s",connection);
+    read_master=pg;db_note(connection);
 }
 void lpm_read_end(void){
     if(read_master && !db_read_end(read_master))PQreset(read_master);
     read_master=NULL;
-}
-
-PGconn *db_connect(const char *conninfo) {
-    if (!conninfo) conninfo = "";
-    if (conninfo != noted_conn) snprintf(noted_conn, sizeof noted_conn, "%s", conninfo);
-    PGconn *pg = PQconnectdb(conninfo);
-    if (PQstatus(pg) != CONNECTION_OK) {
-        fprintf(stderr, "Database connection failed: %s", PQerrorMessage(pg));
-        exit(1);
-    }
-    db_notices(pg);
-    return pg;
 }
