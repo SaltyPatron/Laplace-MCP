@@ -1,80 +1,10 @@
 #define _GNU_SOURCE
 #include "api_internal.h"
 
+/* The Engine run as a child: its output read back, stopped after timeout_s (0: no limit). The run is the platform
+ * layer's (os_run_captured, Laplace-Engine os.c), the one every Laplace program uses; argv[0] is ENGINE. */
 int api_engine_run(char **av, char **outp, int *code, int timeout_s) {
-#ifdef _WIN32
-    (void)timeout_s;
-    const char *tmpdir = getenv("TEMP");
-    if (!tmpdir || !*tmpdir) tmpdir = getenv("TMP");
-    if (!tmpdir || !*tmpdir) tmpdir = ".";
-    char logpath[1024];
-    snprintf(logpath, sizeof logpath, "%s/lpm-engine-%llu.log", tmpdir, (unsigned long long)api_nsec());
-    int rc = os_run_logged(av[0], av, logpath, NULL, NULL);
-    if (rc < 0) return 0;
-    *code = rc;
-    FILE *f = fopen(logpath, "rb");
-    size_t cap = 1 << 22, n = 0;
-    char *buf = malloc(cap);
-    if (f && buf) {
-        n = fread(buf, 1, cap - 1, f);
-        fclose(f);
-    }
-    remove(logpath);
-    if (!buf) return 0;
-    buf[n] = '\0';
-    *outp = buf;
-    return 1;
-#else
-    int fds[2];
-    if (pipe(fds) != 0) return 0;
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(fds[0]);
-        close(fds[1]);
-        return 0;
-    }
-    if (pid == 0) {
-        setpgid(0, 0);
-        dup2(fds[1], 1);
-        dup2(fds[1], 2);
-        close(fds[0]);
-        close(fds[1]);
-        execv(ENGINE, av);
-        _exit(127);
-    }
-    setpgid(pid, pid);
-    close(fds[1]);
-    size_t cap = 1 << 22, n = 0;
-    char *buf = malloc(cap);
-    uint64_t deadline = timeout_s > 0 ? api_nsec() + (uint64_t)timeout_s * 1000000000ull : 0;
-    int timed = 0;
-    while (n + 1 < cap) {
-        int left = -1;
-        if (timeout_s > 0) {
-            int64_t ms = ((int64_t)deadline - (int64_t)api_nsec()) / 1000000ll;
-            if (ms <= 0) { timed = 1; break; }
-            left = (int)ms;
-        }
-        struct pollfd p = { .fd = fds[0], .events = POLLIN };
-        int w = poll(&p, 1, left);
-        if (w == 0) { timed = 1; break; }
-        if (w < 0) break;
-        ssize_t r = read(fds[0], buf + n, cap - 1 - n);
-        if (r <= 0) break;
-        n += (size_t)r;
-    }
-    close(fds[0]);
-    buf[n] = '\0';
-    if (timed) {
-        kill(-pid, SIGTERM);
-        snprintf(buf + n, cap - n, "\n[stopped after %d s]\n", timeout_s);
-    }
-    int st = 0;
-    waitpid(pid, &st, 0);
-    *code = timed ? 124 : (WIFEXITED(st) ? WEXITSTATUS(st) : 128);
-    *outp = buf;
-    return 1;
-#endif
+    return os_run_captured(av, timeout_s, (size_t)1 << 22, outp, code);
 }
 
 void on_ingest(int c, const char *body) {
