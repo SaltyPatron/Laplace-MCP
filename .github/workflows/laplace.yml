@@ -71,7 +71,7 @@ jobs:
           python3 Laplace-MCP/tests/engine-output.py "$L" "$E"
           python3 Laplace-MCP/tests/serve-auth.py "$L"
           python3 Laplace-MCP/tests/json-arguments.py "$L"
-          LAPLACE_WORK=${RUNNER_TEMP:?} python3 Laplace-MCP/tests/chess-tablebase.py "$L" "$E"
+          LAPLACE_WORK=${RUNNER_TEMP:?} python3 Laplace-MCP/tests/chess-tablebase.py "$L" "$E" "${LAPLACE_DATA:-$(. /etc/laplace/machine.env && echo "$LAPLACE_DATA")}/Games/Chess/syzygy/3-4-5"
           # The database checks run after deployment (Laplace-Operations); here they must at least compile.
           for check in Laplace-MCP/tests/deployed/*.py; do python3 -m py_compile "$check"; done
           bash -n Laplace-MCP/tests/deployed/run.sh
