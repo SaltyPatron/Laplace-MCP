@@ -372,15 +372,10 @@ size_t api_parse_str_array(const char *body, const char *key, char **items, size
     return count;
 }
 
+/* An answer grows the one way every Laplace array grows (lp_reserve: doubled, and an allocation that fails ends the
+ * process rather than dropping part of an answer). lpm never replaces the allocator, so free() releases it. */
 void api_buf_add(char **b, size_t *n, size_t *cap, const char *s, size_t m) {
-    if (*n + m + 1 > *cap) {
-        size_t c = *cap ? *cap : 4096;
-        while (*n + m + 1 > c) c *= 2;
-        char *p = realloc(*b, c);
-        if (!p) return;
-        *b = p;
-        *cap = c;
-    }
+    lp_reserve((void **)b, cap, *n + m + 1, 1);
     memcpy(*b + *n, s, m);
     *n += m;
     (*b)[*n] = 0;
@@ -394,11 +389,10 @@ void api_buf_fmt(char **b, size_t *n, size_t *cap, const char *fmt, ...) {
     va_end(ap);
     if (w < 0) return;
     if ((size_t)w < sizeof tmp) { api_buf_add(b, n, cap, tmp, (size_t)w); return; }
-    char *p = malloc((size_t)w + 1);
-    if (!p) return;
+    /* Longer: formatted straight into the answer's own room. */
+    lp_reserve((void **)b, cap, *n + (size_t)w + 1, 1);
     va_start(ap, fmt);
-    vsnprintf(p, (size_t)w + 1, fmt, ap);
+    vsnprintf(*b + *n, (size_t)w + 1, fmt, ap);
     va_end(ap);
-    api_buf_add(b, n, cap, p, (size_t)w);
-    free(p);
+    *n += (size_t)w;
 }
