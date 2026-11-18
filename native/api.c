@@ -5,7 +5,6 @@ const lp_tier0_record *T0;
 lp_text *TX;
 PGconn *PG;
 const char *ENGINE = LPM_ENGINE_DEFAULT;
-static const char *CONN_DEFAULT = LPM_CONNINFO_DEFAULT;
 static const lp_highway *VIEW_HIGHWAY;
 const lp_highway *api_view_highway(void) { if (!VIEW_HIGHWAY) VIEW_HIGHWAY = lp_highway_map(NULL); return VIEW_HIGHWAY; }
 
@@ -39,13 +38,12 @@ int api_valid_id(const char *s) {
 }
 
 PGconn *api_db(void) {
-    const char *ci = getenv("LAPLACE_CONNINFO");
-    if (!ci || !*ci) ci = CONN_DEFAULT;
+    const char *ci = laplace_db();
     if(!PG || PQstatus(PG)!=CONNECTION_OK){
         if(PG){lpm_read_end();PQfinish(PG);}
-        PG=PQconnectdb(ci);db_notices(PG);
+        PG=db_try(ci);
     }
-    if (PQstatus(PG) != CONNECTION_OK) return NULL;
+    if (!PG) return NULL;
     if(!db_read_snapshot(PG) && !db_read_begin(PG,NULL))return NULL;
     lpm_read_scope(PG,ci);
     return PG;

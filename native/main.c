@@ -3,6 +3,7 @@
 #include "api.h"
 #include "lpm_config.h"
 #include "os.h"
+#include "db_bridge.h"
 
 #include "laplace/laplace.h"
 
@@ -87,6 +88,7 @@ static int cmd_serve(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    db_conninfo_default(LPM_CONNINFO_DEFAULT);         /* laplace_db(): LAPLACE_CONNINFO, else what lpm was built with */
     if (argc < 2) {
         fprintf(stderr, "usage: lpm check | id STRING | text STRING | serve [HOST [PORT]] | mcp\n");
         return 2;
