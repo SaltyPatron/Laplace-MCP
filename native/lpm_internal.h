@@ -15,7 +15,6 @@ typedef struct Ent {
     uint64_t hilbert;
     uint32_t seen;
     uint8_t tier;
-    uint8_t used;
     uint8_t *kids;
     uint32_t nkids;
 } Ent;
@@ -23,8 +22,7 @@ typedef struct Ent {
 struct Lpm {
     const lp_tier0_record *t0;
     lp_text *text;
-    Ent *slot;
-    size_t nslot, nent;
+    lp_idmap *ents;                                  /* Ent per ID */
 };
 
 Ent *lpm_ent_find(const Lpm *ix, const uint8_t id[16]);
