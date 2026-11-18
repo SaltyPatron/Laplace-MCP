@@ -34,7 +34,7 @@ void api_dispatch(int c, const char *method, const char *path, const char *body)
 #include "api.h"
 #include "lpm.h"
 #include "lpm_config.h"
-#include "engine.h"
+#include "db_bridge.h"
 #include "walk.h"
 #include "db_bridge.h"
 #include "laplace/laplace.h"

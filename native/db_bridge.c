@@ -25,19 +25,6 @@ void lpm_read_end(void){
     read_master=NULL;
 }
 
-void *xrealloc(void *p, size_t n) {
-    p = realloc(p, n ? n : 1);
-    if (!p) { perror("realloc"); exit(1); }
-    return p;
-}
-
-/* The Engine's shared reader uses these runtime allocation/time adapters. */
-double now(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
-
 PGconn *db_connect(const char *conninfo) {
     if (!conninfo) conninfo = "";
     if (conninfo != noted_conn) snprintf(noted_conn, sizeof noted_conn, "%s", conninfo);
