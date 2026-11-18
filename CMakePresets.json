@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "configurePresets": [
+    { "name": "icx-release", "displayName": "icx, release (primary)", "generator": "Ninja",
+      "binaryDir": "$penv{LAPLACE_BUILD}/Laplace-MCP/icx-release",
+      "cacheVariables": { "CMAKE_C_COMPILER": "icx", "CMAKE_CXX_COMPILER": "icpx", "CMAKE_BUILD_TYPE": "RelWithDebInfo" } }
+  ],
+  "buildPresets": [ { "name": "icx-release", "configurePreset": "icx-release" } ],
+  "testPresets": [ { "name": "icx-release", "configurePreset": "icx-release", "output": { "outputOnFailure": true } } ]
+}

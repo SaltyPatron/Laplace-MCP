@@ -2,7 +2,8 @@
 (chess_tablebase.c in the reader this service links), the same one `laplace tablebase` runs, never a recorded verdict.
 The verdict, the moves ranked and the best-play line answer from the tables alone, with no database; each move and ply
 carries its [P, M, P'] claim ID, the one the Engine's CLI gives and the claim a game that plays it records.
-    tests/chess-tablebase.py path/to/lpm path/to/laplace [TABLES]  (TABLES: Laplace-Engine/tests/chess beside it, KQvK)"""
+    tests/chess-tablebase.py path/to/lpm path/to/laplace TABLES   (TABLES: the syzygy source's own 3-4-5 directory, as
+    Laplace-Engine's tests/syzygy-tablebase.sh reads it; the repository keeps no copy of corpus files)"""
 import contextlib
 import json
 import os
@@ -16,9 +17,8 @@ import time
 import urllib.request
 
 
-lpm, engine = (Path(value).resolve() for value in sys.argv[1:3])
-tables = Path(sys.argv[3]).resolve() if len(sys.argv) > 3 else Path(__file__).resolve().parents[2] / 'Laplace-Engine' / 'tests' / 'chess'
-assert (tables / 'syzygy' / 'KQvK.rtbw').is_file(), tables
+lpm, engine, tables = (Path(value).resolve() for value in sys.argv[1:4])
+assert (tables / 'KQvK.rtbw').is_file(), tables
 
 FEN = '7k/1Q6/8/8/8/8/8/K7 b - -'
 cli = subprocess.run([str(engine), 'tablebase', '-T', str(tables), '--line', FEN], capture_output=True, text=True, encoding='utf-8', timeout=60)

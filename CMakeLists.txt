@@ -1,18 +1,13 @@
 cmake_minimum_required(VERSION 3.24)
 project(LaplaceMCP VERSION 0.1.0 LANGUAGES C CXX ASM)
 
-# Laplace-MCP: the HTTP service in front of Laplace. Built as the engine is: Laplace-Native as part of it, under the
-# floating-point contract (Laplace-Operations toolchain) with laplace-math answering every libm call, so the entity
-# this process names and the coordinate it computes are the ones every other Laplace build computes. The engine's
-# reader (read.c, pg.c) is compiled in from the engine's source beside this repository.
+# Laplace-MCP: the HTTP service in front of Laplace. Built as the engine is: against the installed Laplace-Native
+# package (find_package(LaplaceNative); CMAKE_PREFIX_PATH or LaplaceNative_DIR), under the floating-point contract it
+# carries, with laplace-math answering every libm call, so the entity this process names and the coordinate it
+# computes are the ones every other Laplace build computes. The engine's reader (read.c, pg.c) is compiled in from the
+# engine's source beside this repository (until the reader is its own package, Modular 3).
 set(CMAKE_C_STANDARD 17)
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LaplaceNative.cmake")
-if(NOT TARGET laplace_static)
-  add_subdirectory(${LAPLACE_NATIVE} native-lib EXCLUDE_FROM_ALL)
-endif()
-include(${LAPLACE_NATIVE}/cmake/LaplacePaths.cmake)
-include(${LAPLACE_NATIVE}/cmake/LaplaceFlags.cmake)
-include(${LAPLACE_NATIVE}/cmake/LaplaceWindowsUtf8.cmake)
+find_package(LaplaceNative CONFIG REQUIRED)
 find_package(OpenMP REQUIRED)
 
 laplace_path(LAPLACE_ENGINE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../Laplace-Engine/src" "Laplace-Engine's sources: the reader this service links")
@@ -60,22 +55,22 @@ set_target_properties(lpm_lib PROPERTIES OUTPUT_NAME lpm WINDOWS_EXPORT_ALL_SYMB
 if(WIN32)
   set_target_properties(lpm_lib PROPERTIES ARCHIVE_OUTPUT_NAME lpm_import)
 endif()
-target_include_directories(lpm_lib PUBLIC native PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_NATIVE}/src)
+target_include_directories(lpm_lib PUBLIC native PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_options(lpm_lib PRIVATE ${LP_C_FLAGS})
-target_link_libraries(lpm_lib PRIVATE laplace_text laplace_static lp_crmath BLAKE3::blake3 ${LP_SYSLIBS})
+target_link_libraries(lpm_lib PRIVATE Laplace::text Laplace::laplace_static Laplace::math BLAKE3::blake3 ${LP_SYSLIBS})
 
 # lpm: the commands and the service (serve).
 add_executable(lpm_program native/main.c native/api.c native/api_serve.c native/api_mcp.c native/api_substrate.c native/api_search.c native/api_code_db.c native/api_code_graph.c native/api_catalog.c native/api_chess.c native/api_chess_games.c native/db_bridge.c)
 laplace_utf8_executable(lpm_program)
 set_target_properties(lpm_program PROPERTIES OUTPUT_NAME lpm)
-target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR} ${LAPLACE_NATIVE}/src
-                           ${LAPLACE_BLAKE3_DIR} ${LAPLACE_ICU_DIR}/include)
+target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR}
+                           ${LAPLACE_ICU_DIR}/include)
 target_compile_options(lpm_program PRIVATE ${LP_C_FLAGS} -Wno-missing-field-initializers)
 if(WIN32)
   target_sources(lpm_program PRIVATE ${LPM_CORE_SOURCES})
-  target_link_libraries(lpm_program PRIVATE laplace_engine_reader laplace_text ts_runtime ws2_32 ${LP_SYSLIBS})
+  target_link_libraries(lpm_program PRIVATE laplace_engine_reader Laplace::text ts_runtime ws2_32 ${LP_SYSLIBS})
 else()
-  target_link_libraries(lpm_program PRIVATE lpm_lib laplace_engine_reader laplace_text ts_runtime ${LP_SYSLIBS})
+  target_link_libraries(lpm_program PRIVATE lpm_lib laplace_engine_reader Laplace::text ts_runtime ${LP_SYSLIBS})
   set_target_properties(lpm_lib lpm_program PROPERTIES
     BUILD_RPATH "${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib"
     INSTALL_RPATH "\$ORIGIN/../lib;${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib")
