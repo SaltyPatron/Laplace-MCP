@@ -1,4 +1,4 @@
-# Laplace-MCP on its runner: the service built with icx as the engine is, with Laplace-Native as part of it and the
+# Laplace-MCP on its runner: the service built with icx as the engine is, against the Laplace-Native package and the
 # engine's reader from Laplace-Engine (both checked out beside it), under Laplace-Operations' floating-point contract
 # (private: the secret LAPLACE_CHECKOUT, agents.sh's), and its own checks. The runner's environment (runner/.env, from
 # agents.sh) names its build root and the machine's dependencies, tier 0 and grammars. No check here starts a server,
@@ -35,12 +35,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LAPLACE_CHECKOUT }}
         run: bash Laplace-Operations/native-inputs.sh prepare "$GITHUB_WORKSPACE/Laplace-Native"
-      - name: Verify Native source selection across reconfiguration
-        run: cmake "-DSOURCE=$GITHUB_WORKSPACE/Laplace-MCP" "-DWORK=$RUNNER_TEMP/native-source-defaults" -P Laplace-MCP/tests/native-source-defaults.cmake
+      - name: Native package (built once per Native revision, Laplace-Operations native-package.sh)
+        run: |
+          . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
+          prefix=$(LAPLACE_SRC=$GITHUB_WORKSPACE bash Laplace-Operations/native-package.sh "$GITHUB_WORKSPACE/Laplace-Native")
+          echo "LAPLACE_NATIVE_PACKAGE=$prefix/lib/cmake/LaplaceNative" >> "$GITHUB_ENV"
       - name: build
         run: |
           . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
-          export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_NATIVE=$GITHUB_WORKSPACE/Laplace-Native LAPLACE_OPERATIONS=$GITHUB_WORKSPACE/Laplace-Operations
+          export LAPLACE_SRC=$GITHUB_WORKSPACE LAPLACE_OPERATIONS=$GITHUB_WORKSPACE/Laplace-Operations
           export LAPLACE_ENGINE_SRC=$GITHUB_WORKSPACE/Laplace-Engine/src OMP_NUM_THREADS=$(nproc) MKL_NUM_THREADS=$(nproc)
           . Laplace-Operations/laplace.env
           prepared_grammars=$LAPLACE_GRAMMARS
@@ -50,7 +53,7 @@ jobs:
           python3 Laplace-Operations/installation/artifact_store.py --prepared "$prepared_grammars" --compiled "$compiled_grammars" --output "$LAPLACE_GRAMMARS"
           echo "LAPLACE_GRAMMARS=$LAPLACE_GRAMMARS" >> "$GITHUB_ENV"
           cmake -S Laplace-MCP -B "$LAPLACE_BUILD/Laplace-MCP/icx-release" -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAPLACE_BUNDLE_ENGINE=ON -DLAPLACE_INSTALL_RECIPE_RESOURCES=OFF \
-            -DLAPLACE_TIER0:FILEPATH="$LAPLACE_TIER0" -DLAPLACE_NATIVE:PATH="$LAPLACE_NATIVE" -DLAPLACE_ENGINE_SRC:PATH="$LAPLACE_ENGINE_SRC" -DLAPLACE_OPERATIONS:PATH="$LAPLACE_OPERATIONS"
+            -DLAPLACE_TIER0:FILEPATH="$LAPLACE_TIER0" -DLaplaceNative_DIR:PATH="$LAPLACE_NATIVE_PACKAGE" -DLAPLACE_ENGINE_SRC:PATH="$LAPLACE_ENGINE_SRC" -DLAPLACE_OPERATIONS:PATH="$LAPLACE_OPERATIONS"
           cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib
           # A second build must leave every target current, including the shared Native dependency.
           cmake --build "$LAPLACE_BUILD/Laplace-MCP/icx-release" --target laplace_engine lpm_program lpm_lib | tee "$RUNNER_TEMP/modular-noop.txt"

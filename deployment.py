@@ -325,7 +325,6 @@ def _package(config, output, clean_build=False):
         raise ValueError('Selected Operations does not provide the packaged client interface')
     inspect.signature(client_api.run_client).bind(Path('/client.json'), release=Path('/release'))
     environment = dict(os.environ, LAPLACE_SRC=str(source), LAPLACE_BUILD=str(build),
-                       LAPLACE_NATIVE=str(source / 'Laplace-Native'),
                        LAPLACE_ENGINE_SRC=str(source / 'Laplace-Engine/src'),
                        LAPLACE_OPERATIONS=str(source / 'Laplace-Operations'),
                        LAPLACE_CONNINFO='', OMP_NUM_THREADS=str(config['threads']), MKL_NUM_THREADS='1')
@@ -346,9 +345,14 @@ def _package(config, output, clean_build=False):
         context = toolchain_context(source, environment)
         context_file = build / 'toolchain-context.json'
         previous = json.loads(context_file.read_text()) if context_file.exists() else {}
+        # Native once per revision, installed as the CMake package LaplaceNative (Operations' native-package.sh);
+        # the Engine and the service build against it.
+        native_package = run(['bash', source / 'Laplace-Operations/native-package.sh', source / 'Laplace-Native'],
+                             env=environment, stdout=subprocess.PIPE).stdout.strip().splitlines()[-1]
         run(['cmake', '-S', source / 'Laplace-MCP', '-B', tree, '-G', 'Ninja',
              '-DCMAKE_C_COMPILER=icx', '-DCMAKE_CXX_COMPILER=icpx',
              '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DCMAKE_INSTALL_LIBDIR=lib',
+             '-DLaplaceNative_DIR=' + str(Path(native_package) / 'lib/cmake/LaplaceNative'),
              '-DLAPLACE_BUNDLE_ENGINE=ON', '-DLAPLACE_INSTALL_RECIPE_RESOURCES=OFF', '-DLAPLACE_CONNINFO='], env=environment)
         if clean_build or previous.get('fingerprint') != context:
             run(['cmake', '--build', tree, '--target', 'clean'], env=environment)
