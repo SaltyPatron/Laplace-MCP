@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 #include "api_internal.h"
+#include "laplace/json.h"
+#include <limits.h>
 
 const lp_tier0_record *T0;
 lp_text *TX;
@@ -105,87 +107,83 @@ const char *api_capture_end(int stdio_mode, int *code_out) {
     }
 }
 
+/* JSON through the one reader and writer (laplace/json.h). A request's field is a member of the object its text begins
+ * with: a key inside a string or a nested object is none, and text that is no JSON object answers nothing. */
+static lp_json *api_jdoc(const char *body) {
+    return body ? lp_json_parse_prefix(body, strlen(body), NULL) : NULL;
+}
+
+/* s escaped for the inside of a JSON string, cut at cap without splitting an escape. */
 char *api_json_esc(const char *s, char *out, size_t cap) {
     size_t n = 0;
+    lp_buf one = { 0 };
     if (!s) s = "";
-    for (const unsigned char *p = (const unsigned char *)s; *p && n + 6 < cap; p++) {
-        if (*p == '"' || *p == '\\') {
-            out[n++] = '\\';
-            out[n++] = (char)*p;
-        } else if (*p == '\n') {
-            out[n++] = '\\';
-            out[n++] = 'n';
-        } else if (*p < 0x20) {
-            n += (size_t)snprintf(out + n, cap - n, "\\u%04x", *p);
-        } else out[n++] = (char)*p;
+    for (const char *p = s; *p; p++) {
+        one.n = 0;
+        lp_json_str(&one, p, 1);
+        size_t k = one.n - 2;
+        if (n + k >= cap) break;
+        memcpy(out + n, one.b + 1, k);
+        n += k;
     }
     out[n] = 0;
+    lp_buf_free(&one);
     return out;
 }
 
-/* A field of this object only. Quoted content and nested objects cannot shadow
- * the transport envelope or another argument. Full JSON validation belongs to
- * the caller; this bounded reader selects the protocol's scalar fields. */
-const char *api_jvalue(const char *body,const char *key){
-    const char *p=body;while(isspace((unsigned char)*p))p++;if(*p++!='{')return NULL;
-    while(*p){
-        while(isspace((unsigned char)*p)||*p==',')p++;if(*p!='"')return NULL;
-        const char *name=++p;while(*p&&*p!='"'){if(*p=='\\'&&p[1])p++;p++;}if(!*p)return NULL;
-        size_t len=(size_t)(p-name);p++;while(isspace((unsigned char)*p))p++;if(*p++!=':')return NULL;
-        while(isspace((unsigned char)*p))p++;
-        if(strlen(key)==len&&!memcmp(name,key,len))return p;
-        int depth=0,quoted=0;
-        for(;*p;p++){
-            if(quoted){if(*p=='\\'&&p[1])p++;else if(*p=='"')quoted=0;continue;}
-            if(*p=='"'){quoted=1;continue;}if(*p=='{'||*p=='[')depth++;
-            else if(*p=='}'||*p==']'){if(!depth)return NULL;depth--;}
-            else if(*p==','&&!depth){p++;break;}
-        }
-    }
-    return NULL;
+/* The member's own text in body (so a nested object is handed on as it came), or NULL. */
+const char *api_jvalue(const char *body, const char *key) {
+    lp_json *j = api_jdoc(body);
+    const char *value = lp_json_text(j, lp_json_get(j, LP_JSON_ROOT, key), NULL);
+    lp_json_free(j);
+    return value;
 }
-static int jhex4(const char *p,uint32_t *value){
-    *value=0;for(int i=0;i<4;i++){unsigned c=(unsigned char)p[i];if(!c)return 0;
-        unsigned n=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:16;
-        if(n>15)return 0;*value=(*value<<4)|n;}return 1;
-}
-/* JSON strings, including UTF-16 escape pairs, decoded as UTF-8 once. */
+
+/* A string member, decoded (escapes, surrogate pairs) into out; 0 when absent, no string, holding NUL, or too long. */
 int api_jstr(const char *body, const char *key, char *out, size_t cap) {
-    const char *p=api_jvalue(body,key);if(!p)return 0;
-    if (*p != '"') return 0;
-    p++;
+    lp_json *j = api_jdoc(body);
     size_t n = 0;
-    while (*p && *p != '"') {
-        if(n+1>=cap)return 0;
-        if (*p == '\\' && p[1]) {
-            p++;
-            if (*p == 'n') out[n++] = '\n';
-            else if(*p=='r')out[n++]='\r';else if(*p=='t')out[n++]='\t';else if(*p=='b')out[n++]='\b';else if(*p=='f')out[n++]='\f';
-            else if(*p=='u'){
-                uint32_t cp;if(!jhex4(p+1,&cp))return 0;p+=4;
-                if(cp>=0xd800&&cp<=0xdbff){uint32_t low;if(p[1]!='\\'||p[2]!='u'||!jhex4(p+3,&low)||low<0xdc00||low>0xdfff)return 0;cp=0x10000+((cp-0xd800)<<10)+low-0xdc00;p+=6;}
-                else if(cp>=0xdc00&&cp<=0xdfff)return 0;
-                if(!cp)return 0;
-                if(cp<0x80)out[n++]=(char)cp;
-                else if(cp<0x800){if(n+2>=cap)return 0;out[n++]=(char)(0xc0|(cp>>6));out[n++]=(char)(0x80|(cp&63));}
-                else if(cp<0x10000){if(n+3>=cap)return 0;out[n++]=(char)(0xe0|(cp>>12));out[n++]=(char)(0x80|((cp>>6)&63));out[n++]=(char)(0x80|(cp&63));}
-                else{if(n+4>=cap)return 0;out[n++]=(char)(0xf0|(cp>>18));out[n++]=(char)(0x80|((cp>>12)&63));out[n++]=(char)(0x80|((cp>>6)&63));out[n++]=(char)(0x80|(cp&63));}
-            }
-            else if(*p=='"'||*p=='\\'||*p=='/')out[n++]=*p;else return 0;
-            p++;
-        } else out[n++] = *p++;
-    }
-    if(*p!='"')return 0;
-    out[n] = 0;
-    return 1;
+    const char *s = lp_json_string(j, lp_json_get(j, LP_JSON_ROOT, key), &n);
+    int ok = s && n < cap && !memchr(s, 0, n);
+    if (ok) { memcpy(out, s, n); out[n] = 0; }
+    lp_json_free(j);
+    return ok;
 }
 
 /* A flag: JSON true or false, or the strings "true" and "false". Absent or anything else: dflt. */
 int api_jbool(const char *body, const char *key, int dflt) {
-    const char *p=api_jvalue(body,key);if(!p)return dflt;
-    if (!strncmp(p, "true", 4) || !strncmp(p, "\"true\"", 6)) return 1;
-    if (!strncmp(p, "false", 5) || !strncmp(p, "\"false\"", 7)) return 0;
-    return dflt;
+    lp_json *j = api_jdoc(body);
+    uint32_t v = lp_json_get(j, LP_JSON_ROOT, key);
+    bool b; const char *s = lp_json_string(j, v, NULL);
+    int answer = lp_json_bool(j, v, &b) ? b : s && !strcmp(s, "true") ? 1 : s && !strcmp(s, "false") ? 0 : dflt;
+    lp_json_free(j);
+    return answer;
+}
+
+/* An integer member that int holds. */
+int api_jint(const char *body, const char *key, int *out) {
+    lp_json *j = api_jdoc(body);
+    int64_t v;
+    int ok = lp_json_integer(j, lp_json_get(j, LP_JSON_ROOT, key), &v) && v >= INT_MIN && v <= INT_MAX;
+    if (ok) *out = (int)v;
+    lp_json_free(j);
+    return ok;
+}
+
+/* An array member's strings (an element that is an object gives its "text"), malloc'd into items, at most max_items. */
+size_t api_parse_str_array(const char *body, const char *key, char **items, size_t max_items) {
+    lp_json *j = api_jdoc(body);
+    uint32_t list = lp_json_get(j, LP_JSON_ROOT, key);
+    size_t count = 0;
+    if (lp_json_kind(j, list) == LP_JSON_ARRAY)
+        for (uint32_t i = 0; i < lp_json_count(j, list) && count < max_items; i++) {
+            uint32_t item = lp_json_item(j, list, i);
+            if (lp_json_kind(j, item) == LP_JSON_OBJECT) item = lp_json_get(j, item, "text");
+            size_t n = 0; const char *s = lp_json_string(j, item, &n);
+            if (s && !memchr(s, 0, n)) items[count++] = strdup(s);
+        }
+    lp_json_free(j);
+    return count;
 }
 
 int api_name_entity(const char *text, lp_ref *trunk, lp_ref *parts, size_t cap, size_t *nparts) {
@@ -232,15 +230,6 @@ int api_q2(PGconn *pg, const char *sql, const char *a, const char *b, char **out
     return *out != NULL;
 }
 
-int api_jint(const char *body, const char *key, int *out) {
-    const char *p=api_jvalue(body,key);if(!p)return 0;
-    if (*p == '"') return 0;
-    char *end = NULL;
-    long v = strtol(p, &end, 10);
-    if (end == p) return 0;
-    *out = (int)v;
-    return 1;
-}
 
 int api_mask_claim(const char *m, int len) {
     if (len < 5) return 0;
@@ -319,56 +308,6 @@ void api_unit_coord_json(const lp_ref *r, char *out, size_t cap) {
     snprintf(out, cap, "[%.17g,%.17g,%.17g,%.17g]", v[0], v[1], v[2], v[3]);
 }
 
-size_t api_parse_str_array(const char *body, const char *key, char **items, size_t max_items) {
-    char pat[80];
-    snprintf(pat, sizeof pat, "\"%s\"", key);
-    const char *p = strstr(body, pat);
-    if (!p) return 0;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != ':') return 0;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != '[') return 0;
-    p++;
-    size_t count = 0;
-    while (*p && count < max_items) {
-        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
-        if (*p == ']' || !*p) break;
-        if (*p == '{') {
-            const char *end = strchr(p, '}');
-            if (!end) break;
-            size_t len = (size_t)(end - p + 1);
-            char *sub = malloc(len + 1);
-            memcpy(sub, p, len);
-            sub[len] = 0;
-            char txt[16384] = "";
-            if (api_jstr(sub, "text", txt, sizeof txt)) items[count++] = strdup(txt);
-            free(sub);
-            p = end + 1;
-            continue;
-        }
-        if (*p != '"') break;
-        p++;
-        size_t cap = 4096, u = 0;
-        char *s = malloc(cap);
-        while (*p && *p != '"') {
-            if (u + 4 >= cap) { cap *= 2; s = realloc(s, cap); }
-            if (*p == '\\' && p[1]) {
-                p++;
-                if (*p == 'n') s[u++] = '\n';
-                else if (*p == 'r') s[u++] = '\r';
-                else if (*p == 't') s[u++] = '\t';
-                else s[u++] = *p;
-                p++;
-            } else s[u++] = *p++;
-        }
-        s[u] = 0;
-        if (*p == '"') p++;
-        items[count++] = s;
-    }
-    return count;
-}
 
 /* An answer grows the one way every Laplace array grows (lp_reserve: doubled, and an allocation that fails ends the
  * process rather than dropping part of an answer). lpm never replaces the allocator, so free() releases it. */
