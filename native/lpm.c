@@ -1,57 +1,23 @@
 #define _GNU_SOURCE
 #include "lpm_internal.h"
 
-static uint64_t mix(const uint8_t id[16]) {
-    uint64_t x;
-    memcpy(&x, id, 8);
-    x ^= x >> 30;
-    x *= 0xbf58476d1ce4e5b9ULL;
-    x ^= x >> 27;
-    x *= 0x94d049bb133111ebULL;
-    x ^= x >> 31;
-    return x;
-}
-
-static void rehash(Lpm *ix, size_t nslot) {
-    Ent *n = calloc(nslot, sizeof *n);
-    if (!n) abort();
-    for (size_t i = 0; i < ix->nslot; i++) {
-        if (!ix->slot[i].used) continue;
-        size_t k = mix(ix->slot[i].id) & (nslot - 1);
-        while (n[k].used) k = (k + 1) & (nslot - 1);
-        n[k] = ix->slot[i];
-    }
-    free(ix->slot);
-    ix->slot = n;
-    ix->nslot = nslot;
-}
-
+/* The compositions one decomposition made, kept in Native's ID map (lp_idmap: one open-addressed table keyed by ID,
+ * the one Laplace uses everywhere), each entry an Ent. An entry's address holds until the next one is added. */
 static Ent *ent_put(Lpm *ix, const lp_ref *r) {
-    if (ix->nent * 10 >= ix->nslot * 7) rehash(ix, ix->nslot ? ix->nslot * 2 : 1024);
-    size_t k = mix(r->id.b) & (ix->nslot - 1);
-    while (ix->slot[k].used) {
-        if (!memcmp(ix->slot[k].id, r->id.b, 16)) { ix->slot[k].seen++; return &ix->slot[k]; }
-        k = (k + 1) & (ix->nslot - 1);
-    }
-    Ent *e = &ix->slot[k];
+    bool fresh;
+    Ent *e = lp_idmap_get(ix->ents, &r->id, &fresh);
+    if (!fresh) { e->seen++; return e; }
     memcpy(e->id, r->id.b, 16);
     memcpy(e->m, r->c.m, sizeof e->m);
     e->hilbert = lp_hilbert4(&r->c);
     e->tier = r->tier;
     e->seen = 1;
-    e->used = 1;
-    ix->nent++;
     return e;
 }
 
 Ent *lpm_ent_find(const Lpm *ix, const uint8_t id[16]) {
-    if (!ix->nslot) return NULL;
-    size_t k = mix(id) & (ix->nslot - 1);
-    while (ix->slot[k].used) {
-        if (!memcmp(ix->slot[k].id, id, 16)) return &ix->slot[k];
-        k = (k + 1) & (ix->nslot - 1);
-    }
-    return NULL;
+    lp_id key; memcpy(key.b, id, 16);
+    return lp_idmap_lookup(ix->ents, &key);
 }
 
 lp_ref lpm_on_compose(void *ud, const lp_ref *ch, uint32_t n, uint8_t tier) {
@@ -73,13 +39,14 @@ Lpm *lpm_new(const char *tier0) {
     if (!ix->t0) { free(ix); return NULL; }
     ix->text = lp_text_new(ix->t0);
     if (!ix->text) { free(ix); return NULL; }
+    ix->ents = lp_idmap_sized(sizeof(Ent));
     return ix;
 }
 
 void lpm_free(Lpm *ix) {
     if (!ix) return;
-    for (size_t i = 0; i < ix->nslot; i++) free(ix->slot[i].kids);
-    free(ix->slot);
+    for (size_t i = 0; i < lp_idmap_count(ix->ents); i++) free(((Ent *)lp_idmap_at(ix->ents, i))->kids);
+    lp_idmap_free(ix->ents);
     lp_text_free(ix->text);
     free(ix);
 }
