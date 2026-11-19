@@ -241,7 +241,7 @@ void on_search(int c, const char *body) {
     double id_ms = (double)(api_nsec() - t0) / 1e6;
     PGconn *pg=api_db();
     if(!pg){
-        char escaped[512],error[640];api_json_esc(PQerrorMessage(PG),escaped,sizeof escaped);
+        char escaped[512],error[640];api_json_esc(api_db_error(),escaped,sizeof escaped);
         snprintf(error,sizeof error,"{\"error\":\"database\",\"detail\":\"%s\"}",escaped);api_http(c,503,error);return;
     }
     int fan = 0;
@@ -257,22 +257,22 @@ void on_search(int c, const char *body) {
         }
         np=total_parts>64?64:total_parts;
     }
-    uint8_t ab[40];size_t al=ids_param(pg,ab,&trunk.id,1);
-    const char *pv[1]={(const char *)ab};int pl[1]={(int)al},pf[1]={1};
-    PGresult *entity_row=db_exec_params(pg,"SELECT tier,mask FROM @extschema@.laplace_entities($1::@extschema@.blake3[])",1,NULL,pv,pl,pf,1);
-    if(PQresultStatus(entity_row)!=PGRES_TUPLES_OK){PQclear(entity_row);api_http(c,503,"{\"error\":\"entity\"}");return;}
-    int recorded=PQntuples(entity_row)?(int)lp_be(PQgetvalue(entity_row,0,0),2):-1;
+    Args sa={0};arg_ids(&sa,&trunk.id,1);
+    char err[512];
+    PGresult *entity_row=db_call_try(pg,LP_SQL_ENTITIES_TIER_MASK,&sa,err,sizeof err);
+    if(!entity_row){args_free(&sa);api_http(c,503,"{\"error\":\"entity\"}");return;}
+    int recorded=PQntuples(entity_row)?(int)col_i16(entity_row,0,0):-1;
     if(!np && recorded>=0)trunk.tier=(uint8_t)recorded;
     t0=api_nsec();int nh=0;
     /* Cache membership supplies canonical content, never observations. Read
      * reverse references from PostgreSQL using its stored tier, if present. */
     Hold *h=holds_above(pg,&trunk.id,1,recorded,0,1,&nh);
-    PGresult *self=db_exec_params(pg,
-        "SELECT path,tier,mask,mask::text FROM @extschema@.laplace_physicalities($1::@extschema@.blake3[])",1,NULL,pv,pl,pf,1);
-    if(PQresultStatus(self)!=PGRES_TUPLES_OK){
-        char escaped[512],error[700];api_json_esc(PQerrorMessage(pg),escaped,sizeof escaped);
+    PGresult *self=db_call_try(pg,LP_SQL_PHYSICALITIES_BY_ID,&sa,err,sizeof err);
+    args_free(&sa);
+    if(!self){
+        char escaped[512],error[700];api_json_esc(err,escaped,sizeof escaped);
         snprintf(error,sizeof error,"{\"error\":\"physicality\",\"detail\":\"%s\"}",escaped);
-        PQclear(self);PQclear(entity_row);holds_free(h,nh);api_http(c,503,error);return;
+        PQclear(entity_row);holds_free(h,nh);api_http(c,503,error);return;
     }
     /* Who said this ID and every claim that holds it: a walk up the containment from them (the engine's attested). */
     int nclaim = 0;
@@ -517,7 +517,7 @@ void on_search(int c, const char *body) {
     api_http(c, 200, out);
     free(out);
 }
-void on_by_parts(int c, const char *body, const char *sql, const char *kind) {
+void on_forward(int c, const char *body) {
     char text[8192];
     if (!api_jstr(body, "input", text, sizeof text) || !text[0]) {
         api_http(c, 400, "{\"error\":\"input\"}");
@@ -529,33 +529,48 @@ void on_by_parts(int c, const char *body, const char *sql, const char *kind) {
         api_http(c, 500, "{\"error\":\"tier0\"}");
         return;
     }
-    char list[256 * 34];
-    if (!api_part_list(parts, np, list, sizeof list)) {
-        api_http(c, 400, "{\"error\":\"phrase too long\"}");
-        return;
-    }
     PGconn *pg = api_db();
     if (!pg) {
         api_http(c, 503, "{\"error\":\"database\"}");
         return;
     }
-    char id[33], *rows = NULL, err[512], braced[256 * 34 + 2];
+    lp_id pids[256];
+    for (size_t i = 0; i < np; i++) pids[i] = parts[i].id;
+    Args a = { 0 };
+    arg_ids(&a, pids, np);
+    char id[33], err[512];
     api_hex_id(&trunk.id, id);
-    snprintf(braced, sizeof braced, "{%s}", list);
     uint64_t t0 = api_nsec();
-    if (!api_q1(pg, sql, braced, &rows, err, sizeof err)) {
+    PGresult *r = db_call_try(pg, LP_SQL_FORWARD_MCP, &a, err, sizeof err);
+    args_free(&a);
+    if (!r) {
         char e[512], b[700];
         api_json_esc(err, e, sizeof e);
-        snprintf(b, sizeof b, "{\"error\":\"%s\",\"detail\":\"%s\"}", kind, e);
+        snprintf(b, sizeof b, "{\"error\":\"forward\",\"detail\":\"%s\"}", e);
         api_http(c, 500, b);
         return;
     }
     double ms = (double)(api_nsec() - t0) / 1e6;
-    size_t cap = strlen(rows) + 128;
-    char *out = malloc(cap);
-    snprintf(out, cap, "{\"id\":\"%s\",\"ms\":%.3f,\"%s\":%s}", id, ms, kind, rows);
-    free(rows);
-    api_http(c, 200, out);
+    char *out = NULL;
+    size_t on = 0, cap = 0;
+    api_buf_fmt(&out, &on, &cap, "{\"id\":\"%s\",\"ms\":%.3f,\"forward\":[", id, ms);
+    int nrows = PQntuples(r);
+    for (int row = 0; row < nrows; row++) {
+        char next_json[40];
+        if (PQgetisnull(r, row, 4)) strcpy(next_json, "null");
+        else {
+            char hex[33];
+            api_hex_id(col_id(r, row, 4), hex);
+            snprintf(next_json, sizeof next_json, "\"%s\"", hex);
+        }
+        api_buf_fmt(&out, &on, &cap,
+                    "%s{\"i\":%d,\"j\":%d,\"paths\":%" PRId64 ",\"runs\":%" PRId64 ",\"next\":%s,\"times\":%" PRId64 "}",
+                    row ? "," : "", col_i32(r, row, 0), col_i32(r, row, 1),
+                    col_i64(r, row, 2), col_i64(r, row, 3), next_json, col_i64(r, row, 5));
+    }
+    api_buf_fmt(&out, &on, &cap, "]}");
+    PQclear(r);
+    api_http(c, 200, out ? out : "{\"error\":\"memory\"}");
     free(out);
 }
 
@@ -571,11 +586,7 @@ void on_shape(int c, const char *body) {
         api_http(c, 500, "{\"error\":\"tier0\"}");
         return;
     }
-    char la[256 * 34], lb[256 * 34], ida[33], idb[33];
-    if (!api_part_list(pa, na, la, sizeof la) || !api_part_list(pb, nb, lb, sizeof lb)) {
-        api_http(c, 400, "{\"error\":\"phrase too long\"}");
-        return;
-    }
+    char ida[33], idb[33];
     api_hex_id(&ta.id, ida);
     api_hex_id(&tb.id, idb);
     PGconn *pg = api_db();
@@ -583,21 +594,24 @@ void on_shape(int c, const char *body) {
         api_http(c, 503, "{\"error\":\"database\"}");
         return;
     }
-    char *dist = NULL, err[512];
+    lp_id idsa[256], idsb[256];
+    double ca[256 * 4], cb[256 * 4];
+    uint8_t hasa[256] = { 0 }, hasb[256] = { 0 };
+    for (size_t i = 0; i < na; i++) idsa[i] = pa[i].id;
+    for (size_t i = 0; i < nb; i++) idsb[i] = pb[i].id;
     uint64_t t0 = api_nsec();
-    if (!api_q2(pg, API_SHAPE_SQL, la, lb, &dist, err, sizeof err)) {
-        char e[512], buf[700];
-        api_json_esc(err, e, sizeof e);
-        snprintf(buf, sizeof buf, "{\"error\":\"shape\",\"detail\":\"%s\"}", e);
-        api_http(c, 500, buf);
-        return;
-    }
+    if (na) coords_of(pg, idsa, (int)na, ca, hasa);
+    if (nb) coords_of(pg, idsb, (int)nb, cb, hasb);
+    for (size_t i = 0; i < na; i++) if (!hasa[i]) lp_coord_xyzm(&pa[i].c, ca + i * 4);
+    for (size_t i = 0; i < nb; i++) if (!hasb[i]) lp_coord_xyzm(&pb[i].c, cb + i * 4);
+    double dist = (na && nb) ? lp_frechet4(ca, na, cb, nb) : NAN;
     double ms = (double)(api_nsec() - t0) / 1e6;
-    char out[512];
+    char dstr[64], out[512];
+    if (isfinite(dist)) snprintf(dstr, sizeof dstr, "%.17g", dist);
+    else strcpy(dstr, "null");
     snprintf(out, sizeof out,
              "{\"id\":\"%s\",\"other\":\"%s\",\"frechet\":%s,\"ms\":%.3f}",
-             ida, idb, dist, ms);
-    free(dist);
+             ida, idb, dstr, ms);
     api_http(c, 200, out);
 }
 

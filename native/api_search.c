@@ -122,15 +122,18 @@ static void qdag_free(QDag *d) { for (size_t i = 0; i < d->node.n; i++) free(d->
 static uint8_t *held_ids(PGconn *pg, const lp_id *ids, size_t n) {
     uint8_t *held = calloc(n ? n : 1, 1);
     if (!n) return held;
-    uint8_t *param = malloc(20 + 20 * n);
-    size_t pl = ids_param(pg, param, ids, (uint32_t)n);
-    const char *pv[1] = { (const char *)param };
-    int plen[1] = { (int)pl }, pf[1] = { 1 };
-    PGresult *r = db_exec_params(pg, "SELECT ordinal FROM @extschema@.laplace_entities($1::@extschema@.blake3[])", 1, NULL, pv, plen, pf, 1);
-    if (PQresultStatus(r) == PGRES_TUPLES_OK)
-        for (int row = 0; row < PQntuples(r); row++) { size_t i = (size_t)lp_be(PQgetvalue(r, row, 0), 8) - 1; if (i < n) held[i] = 1; }
-    PQclear(r);
-    free(param);
+    Args a = { 0 };
+    arg_ids(&a, ids, n);
+    char err[256];
+    PGresult *r = db_call_try(pg, LP_SQL_ENTITIES_ORDINAL, &a, err, sizeof err);
+    args_free(&a);
+    if (r) {
+        for (int row = 0; row < PQntuples(r); row++) {
+            int64_t ord = col_i64(r, row, 0);
+            if (ord > 0 && (size_t)(ord - 1) < n) held[ord - 1] = 1;
+        }
+        PQclear(r);
+    }
     return held;
 }
 /* The query's terms: walked from its root down, each held node that holds a letter or digit is a term and nothing
@@ -200,8 +203,9 @@ static uint8_t SCOPE_SIG[16];
 static int SCOPE_WITNESSES;
 static lp_id SCOPE_TRUNK;             /* the witness, when exactly one is named so */
 static lp_idmap *code_scope(PGconn *pg, Reader *rd, const char *name, int *witnesses) {
-    PGresult *r = db_exec_params(pg, "SELECT witness FROM @extschema@.laplace_witness_trust() ORDER BY witness", 0, NULL, NULL, NULL, NULL, 1);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) { PQclear(r); *witnesses = 0; return NULL; }
+    char err[256];
+    PGresult *r = db_call_try(pg, LP_SQL_WITNESS_TRUST_ID_ORDERED, NULL, err, sizeof err);
+    if (!r) { *witnesses = 0; return NULL; }
     int nw = PQntuples(r);
     lp_id *w = malloc(sizeof *w * (size_t)(nw ? nw : 1));
     uint8_t sig[16] = { 0 };
@@ -582,18 +586,18 @@ void on_code_search(int c, const char *body) {
     free(texts);
     free(lens);
     if (units.n) {
-        uint8_t *param = malloc(20 + 20 * units.n);
-        size_t pl = ids_param(pg, param, units.v, (uint32_t)units.n);
-        const char *pv[1] = { (const char *)param };
-        int plen[1] = { (int)pl }, pf[1] = { 1 };
-        PGresult *r = db_exec_params(pg, "SELECT ordinal, hilbert FROM @extschema@.laplace_entities($1::@extschema@.blake3[])", 1, NULL, pv, plen, pf, 1);
-        if (PQresultStatus(r) == PGRES_TUPLES_OK)
+        Args a = { 0 };
+        arg_ids(&a, units.v, units.n);
+        char err[256];
+        PGresult *r = db_call_try(pg, LP_SQL_ENTITIES_ORDINAL_HILBERT, &a, err, sizeof err);
+        args_free(&a);
+        if (r) {
             for (int row = 0; row < PQntuples(r); row++) {
-                size_t i = (size_t)lp_be(PQgetvalue(r, row, 0), 8) - 1;
-                if (i < shown) hits.v[i].hilbert = (int64_t)lp_be(PQgetvalue(r, row, 1), 8);
+                int64_t ord = col_i64(r, row, 0);
+                if (ord > 0 && (size_t)(ord - 1) < shown) hits.v[ord - 1].hilbert = col_i64(r, row, 1);
             }
-        PQclear(r);
-        free(param);
+            PQclear(r);
+        }
     }
     lp_vec_free(&units);
 

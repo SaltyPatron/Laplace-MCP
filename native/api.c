@@ -1,14 +1,53 @@
 #define _GNU_SOURCE
 #include "api_internal.h"
 #include "laplace/json.h"
+#include "os.h"
 #include <limits.h>
 
 const lp_tier0_record *T0;
 lp_text *TX;
-PGconn *PG;
 const char *ENGINE = LPM_ENGINE_DEFAULT;
 static const lp_highway *VIEW_HIGHWAY;
 const lp_highway *api_view_highway(void) { if (!VIEW_HIGHWAY) VIEW_HIGHWAY = lp_highway_map(NULL); return VIEW_HIGHWAY; }
+
+enum { DB_POOL_MAX = 16, DB_POOL_DEFAULT = 4 };
+typedef struct {
+    PGconn *pg;
+    char *conninfo;
+    int in_use;
+} DbPoolSlot;
+
+static pthread_mutex_t db_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static DbPoolSlot db_pool[DB_POOL_MAX];
+static _Thread_local int tl_pool_slot = -1;
+static _Thread_local PGconn *tl_pool_pg = NULL;
+static _Thread_local char tl_db_err[512];
+
+static int db_pool_limit(void) {
+    const char *env = getenv("LAPLACE_DB_POOL_SIZE");
+    if (!env || !*env) return DB_POOL_DEFAULT;
+    char *end = NULL;
+    long v = strtol(env, &end, 10);
+    if (end == env || v < 1) return 1;
+    if (v > DB_POOL_MAX) return DB_POOL_MAX;
+    return (int)v;
+}
+
+const char *api_db_error(void) {
+    return tl_db_err[0] ? tl_db_err : "database connection failed";
+}
+
+void api_db_release(void) {
+    lpm_read_end();
+    if (tl_pool_slot >= 0) {
+        int slot = tl_pool_slot;
+        tl_pool_slot = -1;
+        tl_pool_pg = NULL;
+        pthread_mutex_lock(&db_pool_mu);
+        if (slot < DB_POOL_MAX) db_pool[slot].in_use = 0;
+        pthread_mutex_unlock(&db_pool_mu);
+    }
+}
 
 void api_engine_resolve(void) {
     const char *e = getenv("LAPLACE_ENGINE");
@@ -41,14 +80,88 @@ int api_valid_id(const char *s) {
 
 PGconn *api_db(void) {
     const char *ci = laplace_db();
-    if(!PG || PQstatus(PG)!=CONNECTION_OK){
-        if(PG){lpm_read_end();PQfinish(PG);}
-        PG=db_try(ci);
+    tl_db_err[0] = 0;
+    if (tl_pool_pg) {
+        if (PQstatus(tl_pool_pg) == CONNECTION_OK &&
+            (db_read_snapshot(tl_pool_pg) || db_read_begin(tl_pool_pg, NULL))) {
+            lpm_read_scope(tl_pool_pg, ci);
+            return tl_pool_pg;
+        }
+        api_db_release();
     }
-    if (!PG) return NULL;
-    if(!db_read_snapshot(PG) && !db_read_begin(PG,NULL))return NULL;
-    lpm_read_scope(PG,ci);
-    return PG;
+
+    int cap = db_pool_limit();
+    int slot = -1;
+    PGconn *pg = NULL;
+    int need_connect = 0;
+
+    pthread_mutex_lock(&db_pool_mu);
+    for (int i = 0; i < cap; i++) {
+        if (!db_pool[i].in_use && db_pool[i].pg && db_pool[i].conninfo && !strcmp(db_pool[i].conninfo, ci)) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < cap; i++) {
+            if (!db_pool[i].in_use) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot >= 0) {
+        db_pool[slot].in_use = 1;
+        pg = db_pool[slot].pg;
+        need_connect = !pg || PQstatus(pg) != CONNECTION_OK || !db_pool[slot].conninfo || strcmp(db_pool[slot].conninfo, ci) != 0;
+        if (need_connect) {
+            db_pool[slot].pg = NULL;
+            free(db_pool[slot].conninfo);
+            db_pool[slot].conninfo = NULL;
+        }
+    }
+    pthread_mutex_unlock(&db_pool_mu);
+
+    if (slot < 0) {
+        snprintf(tl_db_err, sizeof tl_db_err, "database connection pool busy");
+        return NULL;
+    }
+
+    if (need_connect) {
+        if (pg) PQfinish(pg);
+        pg = PQconnectdb(ci);
+        if (!pg || PQstatus(pg) != CONNECTION_OK) {
+            snprintf(tl_db_err, sizeof tl_db_err, "%s", pg ? PQerrorMessage(pg) : "out of memory");
+            if (pg) PQfinish(pg);
+            pthread_mutex_lock(&db_pool_mu);
+            db_pool[slot].in_use = 0;
+            pthread_mutex_unlock(&db_pool_mu);
+            return NULL;
+        }
+        db_notices(pg);
+        char *ci_copy = strdup(ci);
+        pthread_mutex_lock(&db_pool_mu);
+        db_pool[slot].pg = pg;
+        db_pool[slot].conninfo = ci_copy;
+        pthread_mutex_unlock(&db_pool_mu);
+    }
+
+    if (!db_read_snapshot(pg) && !db_read_begin(pg, NULL)) {
+        snprintf(tl_db_err, sizeof tl_db_err, "%s", PQerrorMessage(pg));
+        PQfinish(pg);
+        pthread_mutex_lock(&db_pool_mu);
+        db_pool[slot].pg = NULL;
+        free(db_pool[slot].conninfo);
+        db_pool[slot].conninfo = NULL;
+        db_pool[slot].in_use = 0;
+        pthread_mutex_unlock(&db_pool_mu);
+        return NULL;
+    }
+
+    tl_pool_slot = slot;
+    tl_pool_pg = pg;
+    lpm_read_scope(pg, ci);
+    return pg;
 }
 
 static int capture;
@@ -59,7 +172,7 @@ static int stdio_code;
 static char *stdio_body;
 
 void api_http(int c, int code, const char *body) {
-    lpm_read_end();
+    api_db_release();
     if (capture) {
         capture_code = code;
         free(capture_body);
@@ -202,35 +315,6 @@ void api_parts_json(const lp_ref *parts, size_t n, char *out, size_t cap) {
     }
 }
 
-int api_q1(PGconn *pg, const char *sql, const char *a, char **out, char *err, size_t errcap) {
-    const char *v[1] = { a };
-    PGresult *r = db_exec_params(pg, sql, 1, NULL, v, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) < 1) {
-        snprintf(err, errcap, "%s", PQerrorMessage(pg));
-        PQclear(r);
-        PQclear(db_exec(pg, "ROLLBACK"));
-        return 0;
-    }
-    *out = strdup(PQgetvalue(r, 0, 0));
-    PQclear(r);
-    return *out != NULL;
-}
-
-int api_q2(PGconn *pg, const char *sql, const char *a, const char *b, char **out, char *err, size_t errcap) {
-    const char *v[2] = { a, b };
-    PGresult *r = db_exec_params(pg, sql, 2, NULL, v, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) < 1) {
-        snprintf(err, errcap, "%s", PQerrorMessage(pg));
-        PQclear(r);
-        PQclear(db_exec(pg, "ROLLBACK"));
-        return 0;
-    }
-    *out = strdup(PQgetvalue(r, 0, 0));
-    PQclear(r);
-    return *out != NULL;
-}
-
-
 int api_mask_claim(const char *m, int len) {
     if (len < 5) return 0;
     return ((const unsigned char *)m)[4] & 0x80;
@@ -256,33 +340,6 @@ void api_emit_mask_values(char **out,size_t *n,size_t *cap,const char *wire,int 
         }
     }
     api_buf_fmt(out,n,cap,"]");
-}
-
-const char *API_FORWARD_SQL =
-    "SELECT COALESCE((SELECT json_agg(x) FROM ("
-    "  SELECT json_build_object('i', i, 'j', j, 'paths', paths, 'runs', runs,"
-    "    'next', next::text, 'times', times) AS x"
-    "  FROM @extschema@.laplace_forward($1::@extschema@.blake3[], 64) LIMIT 128) s), '[]'::json)::text";
-
-const char *API_SHAPE_SQL =
-    "SELECT @extschema@.laplace_frechet4d("
-    " (SELECT @postgis@.ST_MakeLine(e.coord ORDER BY u.ord) FROM unnest(string_to_array($1, ',')::@extschema@.blake3[])"
-    "    WITH ORDINALITY AS u(id, ord) JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id),"
-    " (SELECT @postgis@.ST_MakeLine(e.coord ORDER BY u.ord) FROM unnest(string_to_array($2, ',')::@extschema@.blake3[])"
-    "    WITH ORDINALITY AS u(id, ord) JOIN @extschema@.entity e ON e.id OPERATOR(@extschema@.=) u.id)"
-    ")::text";
-
-int api_part_list(const lp_ref *parts, size_t n, char *out, size_t cap) {
-    size_t u = 0;
-    if (!n) return 0;
-    for (size_t i = 0; i < n; i++) {
-        char id[33];
-        api_hex_id(&parts[i].id, id);
-        int w = snprintf(out + u, cap - u, "%s%s", i ? "," : "", id);
-        if (w < 0 || u + (size_t)w >= cap) return 0;
-        u += (size_t)w;
-    }
-    return 1;
 }
 
 void api_coord_json(const lp_ref *r, char *out, size_t cap) {

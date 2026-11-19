@@ -54,7 +54,6 @@ void api_dispatch(int c, const char *method, const char *path, const char *body)
 
 extern const lp_tier0_record *T0;
 extern lp_text *TX;
-extern PGconn *PG;
 extern const char *ENGINE;
 
 const lp_highway *api_view_highway(void);
@@ -63,6 +62,8 @@ uint64_t api_nsec(void);
 void api_hex_id(const lp_id *id, char out[33]);
 int api_valid_id(const char *s);
 PGconn *api_db(void);
+const char *api_db_error(void);
+void api_db_release(void);
 PGconn *api_cc_db(int c);
 void api_http(int c, int code, const char *body);
 char *api_json_esc(const char *s, char *out, size_t cap);
@@ -88,11 +89,8 @@ long fo_holder(const FoDecl *declarations, size_t count, size_t position);
 
 int api_name_entity(const char *text, lp_ref *trunk, lp_ref *parts, size_t cap, size_t *nparts);
 void api_parts_json(const lp_ref *parts, size_t n, char *out, size_t cap);
-int api_part_list(const lp_ref *parts, size_t n, char *out, size_t cap);
 void api_coord_json(const lp_ref *r, char *out, size_t cap);
 void api_unit_coord_json(const lp_ref *r, char *out, size_t cap);
-int api_q1(PGconn *pg, const char *sql, const char *a, char **out, char *err, size_t errcap);
-int api_q2(PGconn *pg, const char *sql, const char *a, const char *b, char **out, char *err, size_t errcap);
 int api_mask_claim(const char *m, int len);
 void api_emit_mask_values(char **out, size_t *n, size_t *cap, const char *wire, int len);
 
@@ -100,13 +98,10 @@ int api_engine_run(char **av, char **outp, int *code, int timeout_s);
 int api_plain_arg(const char *s);
 void api_on_engine(int c, char **av);
 
-extern const char *API_FORWARD_SQL;
-extern const char *API_SHAPE_SQL;
-
 /* Route handlers */
 void on_embeddings(int c, const char *body);
 void on_search(int c, const char *body);
-void on_by_parts(int c, const char *body, const char *sql, const char *kind);
+void on_forward(int c, const char *body);
 void on_shape(int c, const char *body);
 void on_ingest(int c, const char *body);
 void on_hop(int c, const char *body);

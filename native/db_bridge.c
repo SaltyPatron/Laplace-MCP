@@ -2,7 +2,7 @@
  * reader's (laplace_db, db_connect, db_try in its pg.c); the service only names the connection a request reads on. */
 #include "db_bridge.h"
 
-static PGconn *read_master;
+static _Thread_local PGconn *read_master;
 
 void lpm_read_scope(PGconn *pg,const char *connection){
     read_master=pg;db_note(connection);

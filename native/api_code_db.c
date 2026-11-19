@@ -274,7 +274,7 @@ void on_file_outline(int c, const char *body) {
     PGconn *pg = api_db();
     if (!pg) {
         char e[512], b[640];
-        api_json_esc(PQerrorMessage(PG), e, sizeof e);
+        api_json_esc(api_db_error(), e, sizeof e);
         snprintf(b, sizeof b, "{\"error\":\"database\",\"detail\":\"%s\"}", e);
         api_http(c, 503, b);
         return;

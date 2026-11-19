@@ -20,12 +20,12 @@ void on_ingest_status(int c, const char *body) {
     PGconn *pg = api_cc_db(c);
     if (!pg) return;
     uint64_t t0 = api_nsec();
-    PGresult *r = db_exec_params(pg, "SELECT witness, trust FROM @extschema@.laplace_witness_trust() ORDER BY witness", 0, NULL, NULL, NULL, NULL, 1);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+    char err[512];
+    PGresult *r = db_call_try(pg, LP_SQL_WITNESS_TRUST_ORDERED, NULL, err, sizeof err);
+    if (!r) {
         char e[512], b[640];
-        api_json_esc(PQerrorMessage(pg), e, sizeof e);
+        api_json_esc(err, e, sizeof e);
         snprintf(b, sizeof b, "{\"error\":\"witness\",\"detail\":\"%s\"}", e);
-        PQclear(r);
         api_http(c, 500, b);
         return;
     }
@@ -73,20 +73,19 @@ void on_ingest_status(int c, const char *body) {
     free(nfiles);
     reader_free(rd);
     api_buf_fmt(&out, &on, &ocap, "],\"activity\":[");
-    r = db_exec(pg, "SELECT pid, coalesce(usename::text, ''), coalesce(state, ''), coalesce(extract(epoch FROM now() - query_start)::bigint, 0), "
-                   "left(regexp_replace(coalesce(query, ''), '\\s+', ' ', 'g'), 200) FROM pg_stat_activity "
-                   "WHERE datname = current_database() AND pid <> pg_backend_pid() AND state IS DISTINCT FROM 'idle' ORDER BY query_start NULLS LAST LIMIT 32");
-    if (PQresultStatus(r) == PGRES_TUPLES_OK)
+    r = db_call_try(pg, LP_SQL_MCP_ACTIVITY, NULL, err, sizeof err);
+    if (r) {
         for (int i = 0; i < PQntuples(r); i++) {
-            api_buf_fmt(&out, &on, &ocap, "%s{\"pid\":%s,\"user\":\"", i ? "," : "", PQgetvalue(r, i, 0));
-            api_cw_str(&out, &on, &ocap, PQgetvalue(r, i, 1));
+            api_buf_fmt(&out, &on, &ocap, "%s{\"pid\":%d,\"user\":\"", i ? "," : "", col_i32(r, i, 0));
+            api_cw_str(&out, &on, &ocap, col_str(r, i, 1));
             api_buf_fmt(&out, &on, &ocap, "\",\"state\":\"");
-            api_cw_str(&out, &on, &ocap, PQgetvalue(r, i, 2));
-            api_buf_fmt(&out, &on, &ocap, "\",\"seconds\":%s,\"query\":\"", PQgetvalue(r, i, 3));
-            api_cw_str(&out, &on, &ocap, PQgetvalue(r, i, 4));
+            api_cw_str(&out, &on, &ocap, col_str(r, i, 2));
+            api_buf_fmt(&out, &on, &ocap, "\",\"seconds\":%" PRId64 ",\"query\":\"", col_i64(r, i, 3));
+            api_cw_str(&out, &on, &ocap, col_str(r, i, 4));
             api_buf_fmt(&out, &on, &ocap, "\"}");
         }
-    PQclear(r);
+        PQclear(r);
+    }
     api_buf_fmt(&out, &on, &ocap, "],\"logs\":");
     const char *ld = getenv("LAPLACE_INGEST_LOGS"), *lr = getenv("LAPLACE_INGEST_RUNS"), *work = getenv("LAPLACE_WORK");
     char dir[4096] = "", runs[4096] = "";
@@ -218,10 +217,11 @@ void on_ready(int c) {
     uint64_t t0 = api_nsec();
     PGconn *pg = api_cc_db(c);
     if (!pg) return;
-    PGresult *r = db_exec(pg, "SELECT current_database(), coalesce((SELECT extversion FROM pg_extension WHERE extname = 'laplace'), '')");
-    if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) != 1) {
+    char err[512];
+    PGresult *r = db_call_try(pg, LP_SQL_MCP_READY, NULL, err, sizeof err);
+    if (!r || PQntuples(r) != 1) {
         char e[512], b[640];
-        api_json_esc(PQerrorMessage(pg), e, sizeof e);
+        api_json_esc(r ? PQerrorMessage(pg) : err, e, sizeof e);
         snprintf(b, sizeof b, "{\"ok\":false,\"error\":\"query\",\"detail\":\"%s\"}", e);
         PQclear(r);
         api_http(c, 503, b);
@@ -229,12 +229,13 @@ void on_ready(int c) {
     }
     char *out = NULL;
     size_t on = 0, ocap = 0;
-    int ext = *PQgetvalue(r, 0, 1) != 0;
+    const char *db_name = col_str(r, 0, 0), *ext_ver = col_str(r, 0, 1);
+    int ext = *ext_ver != 0;
     api_buf_fmt(&out, &on, &ocap, "{\"ok\":%s,\"database\":\"", ext ? "true" : "false");
-    api_cw_str(&out, &on, &ocap, PQgetvalue(r, 0, 0));
+    api_cw_str(&out, &on, &ocap, db_name);
     if (ext) {
         api_buf_fmt(&out, &on, &ocap, "\",\"laplace\":\"");
-        api_cw_str(&out, &on, &ocap, PQgetvalue(r, 0, 1));
+        api_cw_str(&out, &on, &ocap, ext_ver);
         api_buf_fmt(&out, &on, &ocap, "\"");
     } else api_buf_fmt(&out, &on, &ocap, "\",\"error\":\"extension\",\"detail\":\"the database does not hold the laplace extension\"");
     api_buf_fmt(&out, &on, &ocap, ",\"ms\":%.3f}", (double)(api_nsec() - t0) / 1e6);
@@ -249,12 +250,12 @@ void on_sources(int c, const char *body) {
     (void)body;
     PGconn *pg = api_db();
     if (!pg) { api_http(c, 503, "{\"error\":\"database\"}"); return; }
-    PGresult *r = db_exec_params(pg, "SELECT witness, trust FROM @extschema@.laplace_witness_trust() ORDER BY witness", 0, NULL, NULL, NULL, NULL, 1);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+    char err[512];
+    PGresult *r = db_call_try(pg, LP_SQL_WITNESS_TRUST_ORDERED, NULL, err, sizeof err);
+    if (!r) {
         char e[512], b[640];
-        api_json_esc(PQerrorMessage(pg), e, sizeof e);
+        api_json_esc(err, e, sizeof e);
         snprintf(b, sizeof b, "{\"error\":\"witness\",\"detail\":\"%s\"}", e);
-        PQclear(r);
         api_http(c, 500, b);
         return;
     }
@@ -285,15 +286,10 @@ void on_sources(int c, const char *body) {
 
 void on_catalog(int c,const char *body){
     (void)body;PGconn *pg=api_db();if(!pg){api_http(c,503,"{\"error\":\"database\"}");return;}
-    PGresult *r=db_exec_params(pg,
-        "SELECT json_build_object('database',current_database(),'read_only',current_setting('transaction_read_only')::boolean,"
-        "'database_bytes',pg_database_size(current_database())::text,'entities',(SELECT count(*)::text FROM @extschema@.entity),"
-        "'physicalities',(SELECT count(*)::text FROM @extschema@.physicality),'standing_rows',(SELECT count(*)::text FROM @extschema@.consensus),"
-        "'attestation_rows',(SELECT count(*)::text FROM @extschema@.attestation),"
-        "'registered_witness_rows',(SELECT count(DISTINCT witness)::text FROM @extschema@.attestation),'as_of',statement_timestamp(),'count_kind','exact')::text",
-        0,NULL,NULL,NULL,NULL,0);
-    if(PQresultStatus(r)!=PGRES_TUPLES_OK||PQntuples(r)!=1){PQclear(r);api_http(c,503,"{\"error\":\"catalog_unavailable\"}");return;}
-    char *json=strdup(PQgetvalue(r,0,0));PQclear(r);api_http(c,200,json);free(json);
+    char err[512];
+    PGresult *r=db_call_try(pg,LP_SQL_MCP_CATALOG,NULL,err,sizeof err);
+    if(!r||PQntuples(r)!=1){PQclear(r);api_http(c,503,"{\"error\":\"catalog_unavailable\"}");return;}
+    char *json=strdup(col_str(r,0,0));PQclear(r);api_http(c,200,json);free(json);
 }
 
 /* Discover stored provenance trunks through the native kind bank, regardless
@@ -303,13 +299,12 @@ void on_library(int c,const char *body){
     char after[64]="";api_jstr(body,"after",after,sizeof after);
     if(*after&&!api_valid_id(after)){api_http(c,400,"{\"error\":\"after\"}");return;}
     PGconn *pg=api_db();if(!pg){api_http(c,503,"{\"error\":\"database\"}");return;}
-    const char *values[1]={after};
-    PGresult *rows=db_exec_params(pg,
-        "SELECT entity,tier,path,mask::text FROM @extschema@.physicality"
-        " WHERE mask OPERATOR(@extschema@.?) @extschema@.laplace_bank_bit('kind','file')"
-        " AND ($1='' OR entity OPERATOR(@extschema@.>) NULLIF($1,'')::@extschema@.blake3) ORDER BY entity LIMIT 65",
-        1,NULL,values,NULL,NULL,1);
-    if(PQresultStatus(rows)!=PGRES_TUPLES_OK){PQclear(rows);api_http(c,503,"{\"error\":\"library_unavailable\"}");return;}
+    Args args={0};
+    if(*after){lp_id cursor={0};lp_id_unhex(after,&cursor);arg_id(&args,&cursor);}else arg_null(&args);
+    char err[512];
+    PGresult *rows=db_call_try(pg,LP_SQL_LIBRARY_PAGE,&args,err,sizeof err);
+    args_free(&args);
+    if(!rows){api_http(c,503,"{\"error\":\"library_unavailable\"}");return;}
     int count=PQntuples(rows),more=count>64;if(more)count=64;
     Reader *reader=reader_new(pg);lp_vec(lp_id) names={0};
     for(int i=0;i<count;i++){lp_id id;memcpy(&id,PQgetvalue(rows,i,0),16);lp_push(&names,id);}

@@ -395,9 +395,9 @@ void on_chess_games(int c, const char *body){
     if (!tag_ids()) { api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
     PGconn *pg = api_db(); if (!pg) { unavailable(c); return; }
     /* the witnesses whose trunk begins with a record of that name: a source's trunk is [its record, its files...] */
-    Args a = { 0 };
-    PGresult *q = ask_try(pg, "SELECT witness FROM @extschema@.laplace_witness_trust()", &a);
-    if (!q) { args_free(&a); unavailable(c); return; }
+    char err[256];
+    PGresult *q = db_call_try(pg, LP_SQL_WITNESS_TRUST_ID_ORDERED, NULL, err, sizeof err);
+    if (!q) { unavailable(c); return; }
     lp_vec(lp_id) trunks = { 0 };
     { Reader *names = reader_new(pg);
       for (int r = 0; r < PQntuples(q); r++) { lp_id first[2]; const lp_id *w = col_id(q, r, 0);
@@ -427,7 +427,7 @@ void on_chess_games(int c, const char *body){
           if (v) for (size_t k = 1; k < v->n; k++) claims |= v->said[k] == LP_SAID_CLAIM;
           Game *g = game_add(&L, claims ? &v->id[0] : &held.v[i]); g->order = (int64_t)i; }
       paths_free(&hp); lp_vec_free(&held); }
-    args_free(&a); games_load(pg, &L);
+    games_load(pg, &L);
     size_t *idx = ordered(&L); char *o = NULL; size_t on = 0, oc = 0;
     api_buf_fmt(&o, &on, &oc, "{\"witness\":"); emit_str(&o, &on, &oc, witness);
     api_buf_fmt(&o, &on, &oc, ",\"total\":%zu,\"offset\":%d,\"games\":", L.n, offset); emit_page(&o, &on, &oc, pg, &L, idx, offset, limit, 0);

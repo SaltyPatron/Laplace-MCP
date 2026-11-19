@@ -149,7 +149,7 @@ static void emit_deepest(char **o, size_t *on, size_t *oc, const Book *b, const 
     api_buf_fmt(o, on, oc, "null");
 }
 static void db_unavailable(int c){
-    char escaped[512], error[640]; api_json_esc(PG ? PQerrorMessage(PG) : "", escaped, sizeof escaped);
+    char escaped[512], error[640]; api_json_esc(api_db_error(), escaped, sizeof escaped);
     snprintf(error, sizeof error, "{\"error\":\"database\",\"detail\":\"%s\"}", escaped); api_http(c, 503, error);
 }
 

@@ -192,7 +192,7 @@ static void mcp_rpc(int c, const char *body) {
         else if (!strcmp(name, "search")) on_search(c, body);
         else if (!strcmp(name, "embeddings")) on_embeddings(c, body);
         else if (!strcmp(name, "shape")) on_shape(c, body);
-        else if (!strcmp(name, "forward")) on_by_parts(c, body, API_FORWARD_SQL, "forward");
+        else if (!strcmp(name, "forward")) on_forward(c, body);
         else if (!strcmp(name, "ingest")) on_ingest(c, body);
         else if (!strcmp(name, "hop")) on_hop(c, body);
         else if (!strcmp(name, "text")) on_text(c, body);
@@ -306,7 +306,7 @@ void api_dispatch(int c, const char *method, const char *path, const char *body)
     else if (!strcmp(path, "/v1/recipe_plan")) on_recipe_plan(c, body);
     else if (!strcmp(path, "/v1/recipe_catalog")) on_recipe_catalog(c, body);
     else if (!strcmp(path, "/v1/search")) on_search(c, body);
-    else if (!strcmp(path, "/v1/forward")) on_by_parts(c, body, API_FORWARD_SQL, "forward");
+    else if (!strcmp(path, "/v1/forward")) on_forward(c, body);
     else if (!strcmp(path, "/v1/shape")) on_shape(c, body);
     else if (!strcmp(path, "/v1/ingest")) on_ingest(c, body);
     else if (!strcmp(path, "/v1/hop")) on_hop(c, body);
@@ -347,6 +347,7 @@ int api_mcp_stdio(void) {
         if (!len) continue;
         api_capture_begin(1);
         mcp_rpc(-1, line);
+        api_db_release();
         int scode = 500;
         const char *sbody = api_capture_end(1, &scode);
         if (scode != 202 && sbody && sbody[0]) {

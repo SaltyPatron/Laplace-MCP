@@ -253,6 +253,7 @@ int api_serve(const char *host, int port) {
         }
         body = body ? body + 4 : "";
         api_dispatch(c, method, path, body);
+        api_db_release();
         free(req);
         close_sock(c);
     }

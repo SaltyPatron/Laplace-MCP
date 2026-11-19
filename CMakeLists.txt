@@ -37,9 +37,9 @@ configure_file(native/config.h.in ${CMAKE_CURRENT_BINARY_DIR}/lpm_config.h @ONLY
 set(LPM_CORE_SOURCES native/lpm.c)
 add_library(lpm_lib SHARED ${LPM_CORE_SOURCES})
 set_target_properties(lpm_lib PROPERTIES OUTPUT_NAME lpm WINDOWS_EXPORT_ALL_SYMBOLS ON)
-# Windows: the DLL's import library and export file must not share lpm.lib/lpm.exp with lpm.exe.
+# Windows: the DLL's import library, export file and PDB must not share lpm.lib/lpm.exp/lpm.pdb with lpm.exe.
 if(WIN32)
-  set_target_properties(lpm_lib PROPERTIES ARCHIVE_OUTPUT_NAME lpm_import)
+  set_target_properties(lpm_lib PROPERTIES ARCHIVE_OUTPUT_NAME lpm_import PDB_NAME lpm_import)
 endif()
 target_include_directories(lpm_lib PUBLIC native PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_options(lpm_lib PRIVATE ${LP_C_FLAGS})
