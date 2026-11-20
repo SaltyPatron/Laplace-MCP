@@ -22,11 +22,15 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { path: Laplace-MCP, persist-credentials: false }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: main, path: Laplace-Native, persist-credentials: false }
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: main, path: Laplace-Engine, persist-credentials: false }
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: { repository: "${{ github.repository_owner }}/Laplace-Operations", ref: main, path: Laplace-Operations, token: "${{ secrets.LAPLACE_CHECKOUT }}", persist-credentials: false }
+      # Siblings at the revisions staging last verified (Laplace-Operations components.lock.tsv), never at their main.
+      - name: Sibling revisions from the version lock
+        id: lock
+        run: awk -F'\t' '!/^#/ && NF == 3 { print $1 "=" $3 }' Laplace-Operations/components.lock.tsv | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: { repository: "${{ github.repository_owner }}/Laplace-Native", ref: "${{ steps.lock.outputs.native }}", path: Laplace-Native, persist-credentials: false }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: { repository: "${{ github.repository_owner }}/Laplace-Engine", ref: "${{ steps.lock.outputs.engine }}", path: Laplace-Engine, persist-credentials: false }
       - name: Provide the pinned Tree-sitter generator toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
