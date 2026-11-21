@@ -307,8 +307,8 @@ static int bridge_has(const char *list, const char *w) {     /* list: "\na\nb\n"
     return strstr(list, k) != NULL;
 }
 
-static char *bridge_query(const char *query, char *info, size_t icap, double *ms, const char **error) {
-    uint64_t t0 = api_nsec();
+static char *bridge_query(const char *query, lp_buf *info, double *ms, const char **error) {
+    uint64_t t0 = os_monotonic_ns();
     *error = NULL;
     const char *lang = getenv("LAPLACE_CODE_BRIDGE_LANGUAGE"), *nc = getenv("LAPLACE_CODE_BRIDGE_CONCEPTS");
     if (!lang || !*lang) lang = "en";
@@ -322,12 +322,10 @@ static char *bridge_query(const char *query, char *info, size_t icap, double *ms
         }
         snprintf(concepts, sizeof concepts, "%ld", k);
     }
-    size_t ql = strlen(query);
-    char *out = malloc(ql + 8192), *seen = malloc(ql + 8192);
-    if (!out || !seen) { free(out); free(seen); *ms = 0; *error = "{\"error\":\"vocabulary bridge allocation failed\"}"; return NULL; }
-    size_t on = (size_t)snprintf(out, ql + 8192, "%s", query), ocap = ql + 8192, in = 0;
-    strcpy(seen, "\n");
-    in += (size_t)snprintf(info + in, icap - in, "{");
+    lp_buf out = { 0 }, seen = { 0 };
+    lp_buf_cstr(&out, query);
+    lp_buf_byte(&seen, '\n');
+    lp_buf_byte(info, '{');
     int words = 0, added = 0, first = 1;
     for (const char *p = query; *p && words < 16;) {
         while (*p && !isalpha((unsigned char)*p)) p++;
@@ -338,22 +336,21 @@ static char *bridge_query(const char *query, char *info, size_t icap, double *ms
         char w[48];
         for (size_t i = 0; i < l; i++) w[i] = (char)tolower((unsigned char)s[i]);
         w[l] = 0;
-        if (bridge_has(seen, w)) continue;
-        size_t sl = strlen(seen);
-        snprintf(seen + sl, ql + 8192 - sl, "%s\n", w);
+        lp_buf_byte(&seen, 0);
+        if (bridge_has((const char *)seen.b, w)) { seen.n--; continue; }
+        seen.n--;
+        lp_buf_fmt(&seen, "%s\n", w);
         words++;
         char *av[] = { (char *)ENGINE, "translate", "-n", concepts, w, (char *)lang, (char *)lang, NULL };
         char *log = NULL;
         int code = 0;
-        if (!api_engine_run(av, &log, &code, 20) || code != 0) {
-            free(log); free(out); free(seen);
+        if (!os_run_captured(av, 20, (size_t)1 << 22, &log, &code) || code != 0) {
+            free(log); lp_buf_free(&out); lp_buf_free(&seen);
             *error = "{\"error\":\"vocabulary bridge engine execution failed\"}";
             return NULL;
         }
         int listed = 0;
-        char wj[2048];
-        size_t wn = 0;
-        wj[0] = 0;
+        lp_buf wj = { 0 };
         for (char *line = log; line && *line;) {
             char *nl = strchr(line, '\n');
             if (nl) *nl = 0;
@@ -370,13 +367,14 @@ static char *bridge_query(const char *query, char *info, size_t icap, double *ms
                     if (yl && yl < sizeof syn) {
                         for (size_t i = 0; i < yl; i++) syn[i] = (char)tolower((unsigned char)q[i]);
                         syn[yl] = 0;
-                        if (bridge_word_ok(syn) && !bridge_has(seen, syn) && listed < 8) {
-                            size_t sl2 = strlen(seen);
-                            if (sl2 + yl + 2 < ql + 8192) snprintf(seen + sl2, ql + 8192 - sl2, "%s\n", syn);
-                            if (on + yl + 2 < ocap) on += (size_t)snprintf(out + on, ocap - on, " %s", syn);
-                            char se[160];
-                            api_json_esc(syn, se, sizeof se);
-                            if (wn + strlen(se) + 4 < sizeof wj) wn += (size_t)snprintf(wj + wn, sizeof wj - wn, "%s\"%s\"", listed ? "," : "", se);
+                        lp_buf_byte(&seen, 0);
+                        int dup = bridge_has((const char *)seen.b, syn);
+                        seen.n--;
+                        if (bridge_word_ok(syn) && !dup && listed < 8) {
+                            lp_buf_fmt(&seen, "%s\n", syn);
+                            lp_buf_fmt(&out, " %s", syn);
+                            if (listed) lp_buf_byte(&wj, ',');
+                            lp_json_str(&wj, syn, strlen(syn));
                             listed++;
                             added++;
                         }
@@ -386,14 +384,23 @@ static char *bridge_query(const char *query, char *info, size_t icap, double *ms
             }
             line = nl ? nl + 1 : NULL;
         }
-        if (listed && in + wn + 64 < icap) { in += (size_t)snprintf(info + in, icap - in, "%s\"%s\":[%s]", first ? "" : ",", w, wj); first = 0; }
+        if (listed) {
+            if (!first) lp_buf_byte(info, ',');
+            lp_json_str(info, w, strlen(w));
+            lp_buf_cstr(info, ":[");
+            lp_buf_put(info, wj.b, wj.n);
+            lp_buf_byte(info, ']');
+            first = 0;
+        }
+        lp_buf_free(&wj);
         free(log);
     }
-    snprintf(info + in, icap - in, "}");
-    free(seen);
-    *ms = (double)(api_nsec() - t0) / 1e6;
-    if (!added) { free(out); return NULL; }
-    return out;
+    lp_buf_byte(info, '}');
+    lp_buf_free(&seen);
+    *ms = (double)(os_monotonic_ns() - t0) / 1e6;
+    if (!added) { lp_buf_free(&out); return NULL; }
+    lp_buf_byte(&out, 0);
+    return (char *)out.b;
 }
 
 /* ---- one hit: a file, its score, and the unit of its content that answers */
@@ -447,30 +454,30 @@ void on_code_search(int c, const char *body) {
     if (!env_count(c, "LAPLACE_CODE_HUB", 4096, &cap) || !env_count(c, "LAPLACE_CODE_NODES", 400000, &most)) return;
     PGconn *pg = api_cc_db(c);
     if (!pg) return;
-    uint64_t t0 = api_nsec();
+    uint64_t t0 = os_monotonic_ns();
 
     /* bridge (LAPLACE_CODE_BRIDGE): the query's words joined by what the database's wordnets attest of them */
     const char *be = getenv("LAPLACE_CODE_BRIDGE");
     int bridge = api_jbool(body, "bridge", be && *be && strcmp(be, "0"));
-    char binfo[8192] = "{}";
+    lp_buf binfo = { 0 };
     double bridge_ms = 0;
     const char *bridge_error = NULL;
-    char *bridged = bridge ? bridge_query(query, binfo, sizeof binfo, &bridge_ms, &bridge_error) : NULL;
-    if (bridge_error) { api_http(c, 502, bridge_error); return; }
+    char *bridged = bridge ? bridge_query(query, &binfo, &bridge_ms, &bridge_error) : NULL;
+    if (bridge_error) { lp_buf_free(&binfo); api_http(c, 502, bridge_error); return; }
     Terms terms;
     size_t qnodes = 0, qheld = 0;
     query_terms(pg, bridged ? bridged : query, &terms, &qnodes, &qheld);
     free(bridged);
-    if (!terms.n) { api_http(c, 400, "{\"error\":\"the query holds no word\"}"); return; }
+    if (!terms.n) { lp_buf_free(&binfo); api_http(c, 400, "{\"error\":\"the query holds no word\"}"); return; }
 
     Reader *rd = reader_new(pg);
     int witnesses = 0;
-    uint64_t t_scope = api_nsec();
+    uint64_t t_scope = os_monotonic_ns();
     lp_idmap *scope = code_scope(pg, rd, source, &witnesses);
 
     /* how common each term is: the paths that hold it directly, read from the container index at once; a term with
      * more than LAPLACE_CODE_HUB of a kind is a hub */
-    uint64_t t_terms = api_nsec();
+    uint64_t t_terms = os_monotonic_ns();
     double holders[64] = { 0 }, idf[64] = { 0 }, total = 0;
     uint64_t hubs = 0;
     {
@@ -491,7 +498,7 @@ void on_code_search(int c, const char *body) {
     int walked_term[64], nwalked = 0;
     for (int b = 0; b < terms.n; b++)
         if (holders[b] > 0 && !(hubs >> b & 1)) { walked[nwalked] = terms.id[b]; walked_term[nwalked++] = b; }
-    uint64_t t_walk = api_nsec();
+    uint64_t t_walk = os_monotonic_ns();
     uint64_t walk_hubs = 0;
     int levels = 0, cut = 0;
     size_t nfound = 0;
@@ -500,7 +507,7 @@ void on_code_search(int c, const char *body) {
 
     /* each file scores its unit by BM25 (k1 1.2, b 0.75) over the terms' occurrences; the unit's size is its tier (a
      * whole file's path is only its record and its content), against the mean of the units' */
-    uint64_t t_rank = api_nsec();
+    uint64_t t_rank = os_monotonic_ns();
     double mean = 0;
     size_t counted = 0;
     for (size_t i = 0; i < nfound; i++) if (!scope || lp_idmap_find(scope, &found[i].file) >= 0) { mean += (double)found[i].tier; counted++; }
@@ -554,7 +561,7 @@ void on_code_search(int c, const char *body) {
     size_t shown = explain ? hits.n : hits.n < (size_t)limit ? hits.n : (size_t)limit;
 
     /* text only for what is returned: each shown unit's lines in its file's recorded text, and its first 60 lines */
-    uint64_t t_units = api_nsec();
+    uint64_t t_units = os_monotonic_ns();
     lp_vec(lp_id) units = { 0 };
     /* every shown file's tree read in one walk, a level at a time for all of them */
     lp_id *shown_files = malloc(sizeof *shown_files * (shown ? shown : 1));
@@ -601,52 +608,54 @@ void on_code_search(int c, const char *body) {
     }
     lp_vec_free(&units);
 
-    double ms = (double)(api_nsec() - t0) / 1e6;
-    char *out = NULL;
-    size_t un = 0, ucap = 0;
-    api_buf_fmt(&out, &un, &ucap,
+    double ms = (double)(os_monotonic_ns() - t0) / 1e6;
+    lp_buf out = { 0 };
+    lp_buf_fmt(&out,
             "{\"docs\":%zu,\"entities\":%zu,\"ms\":%.3f,\"model\":\"laplace-containment\",\"scope\":\"%s\","
-            "\"source\":\"", scope ? lp_idmap_count(scope) : 0, nfound, ms, scope_s);
-    api_cw_str(&out, &un, &ucap, source);
-    api_buf_fmt(&out, &un, &ucap, "\",\"query\":{\"nodes\":%zu,\"held\":%zu},\"witnesses\":%d,\"levels\":%d,\"cut\":%s,"
+            "\"source\":", scope ? lp_idmap_count(scope) : 0, nfound, ms, scope_s);
+    lp_json_str(&out, source, strlen(source));
+    lp_buf_fmt(&out, ",\"query\":{\"nodes\":%zu,\"held\":%zu},\"witnesses\":%d,\"levels\":%d,\"cut\":%s,"
             "\"phases_ms\":{\"scope\":%.1f,\"terms\":%.1f,\"walk\":%.1f,\"rank\":%.1f,\"text\":%.1f},\"terms\":[",
             qnodes, qheld, witnesses, levels, cut ? "true" : "false", (double)(t_terms - t_scope) / 1e6,
             (double)(t_walk - t_terms) / 1e6, (double)(t_rank - t_walk) / 1e6, (double)(t_units - t_rank) / 1e6,
-            (double)(api_nsec() - t_units) / 1e6);
+            (double)(os_monotonic_ns() - t_units) / 1e6);
     for (int b = 0; b < terms.n; b++) {
         char id[33];
         int seed = 0;
         for (int w = 0; w < nwalked; w++) if (walked_term[w] == b) seed = 1;
         api_hex_id(&terms.id[b], id);
-        api_buf_fmt(&out, &un, &ucap, "%s{\"text\":\"", b ? "," : "");
-        api_cw_str(&out, &un, &ucap, terms.text[b]);
-        api_buf_fmt(&out, &un, &ucap, "\",\"id\":\"%s\",\"holders\":%.0f,\"idf\":%.6f,\"hub\":%s,\"walked\":%s}", id, holders[b],
+        lp_buf_fmt(&out, "%s{\"text\":", b ? "," : "");
+        lp_json_str(&out, terms.text[b], strlen(terms.text[b]));
+        lp_buf_fmt(&out, ",\"id\":\"%s\",\"holders\":%.0f,\"idf\":%.6f,\"hub\":%s,\"walked\":%s}", id, holders[b],
                 idf[b], hubs >> b & 1 ? "true" : "false", seed ? "true" : "false");
     }
-    if (bridge) api_buf_fmt(&out, &un, &ucap, "],\"bridge\":{\"words\":%s,\"ms\":%.3f}", binfo, bridge_ms);
-    else api_buf_add(&out, &un, &ucap, "]", 1);
-    api_buf_fmt(&out, &un, &ucap, ",\"candidates\":{\"reached\":%zu,\"kept\":%zu},\"hits\":[", reached, hits.n);
+    if (bridge) {
+        lp_buf_cstr(&out, "],\"bridge\":{\"words\":");
+        lp_buf_put(&out, binfo.b, binfo.n);
+        lp_buf_fmt(&out, ",\"ms\":%.3f}", bridge_ms);
+    } else lp_buf_byte(&out, ']');
+    lp_buf_free(&binfo);
+    lp_buf_fmt(&out, ",\"candidates\":{\"reached\":%zu,\"kept\":%zu},\"hits\":[", reached, hits.n);
     for (size_t i = 0; i < shown; i++) {
         CodeHit *h = &hits.v[i];
         char id[33];
         api_hex_id(&h->unit, id);
         double score = total > 0 ? h->score * h->prior / (total * 2.2 / 1.3) : 0;
-        api_buf_fmt(&out, &un, &ucap, "%s{\"rank\":%zu,\"path\":\"", i ? "," : "", i + 1);
-        api_cw_str(&out, &un, &ucap, h->path);
-        api_buf_fmt(&out, &un, &ucap,
-                "\",\"line0\":%zu,\"line1\":%zu,\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%d,"
-                "\"rerank\":%.6f,\"bm25\":%.6f,\"snippet\":\"",
+        lp_buf_fmt(&out, "%s{\"rank\":%zu,\"path\":", i ? "," : "", i + 1);
+        lp_json_str(&out, h->path, strlen(h->path));
+        lp_buf_fmt(&out,
+                ",\"line0\":%zu,\"line1\":%zu,\"id\":\"%s\",\"hilbert\":\"%016llx\",\"shared\":%d,"
+                "\"rerank\":%.6f,\"bm25\":%.6f,\"snippet\":",
                 h->line0, h->line1, id, (unsigned long long)h->hilbert, h->shared, score, h->score);
-        api_cw_str(&out, &un, &ucap, h->snippet ? h->snippet : "");
-        api_buf_add(&out, &un, &ucap, "\"}", 2);
+        lp_json_str(&out, h->snippet ? h->snippet : "", strlen(h->snippet ? h->snippet : ""));
+        lp_buf_byte(&out, '}');
     }
-    api_buf_add(&out, &un, &ucap, "]}", 2);
+    lp_buf_cstr(&out, "]}");
     for (size_t i = 0; i < hits.n; i++) { free(hits.v[i].path); free(hits.v[i].snippet); }
     lp_vec_free(&hits);
     free(found);
     reader_free(rd);
-    api_http(c, 200, out ? out : "{\"hits\":[]}");
-    free(out);
+    api_reply_buf(c, 200, &out);
 }
 
 /* reindex: the code is the database's, so bringing it up to date is ingesting its source again (LAPLACE_CODE_INGEST,
@@ -693,7 +702,7 @@ void on_rerank(int c, const char *body) {
     if (!env_count(c, "LAPLACE_CODE_HUB", 4096, &cap)) { for (size_t i = 0; i < nd; i++) free(docs[i]); return; }
     PGconn *pg = api_cc_db(c);
     if (!pg) { for (size_t i = 0; i < nd; i++) free(docs[i]); return; }
-    uint64_t t0 = api_nsec();
+    uint64_t t0 = os_monotonic_ns();
     Terms q;
     code_terms(query, &q);
     double df[64] = { 0 }, idf[64] = { 0 }, total = 0;
@@ -721,15 +730,13 @@ void on_rerank(int c, const char *body) {
     free(d);
     qsort(items, nd, sizeof *items, cmp_rerank_item);
     size_t shown = (size_t)top_n < nd ? (size_t)top_n : nd;
-    double ms = (double)(api_nsec() - t0) / 1e6;
-    char *out = NULL;
-    size_t un = 0, ucap = 0;
-    api_buf_fmt(&out, &un, &ucap, "{\"model\":\"laplace-containment\",\"ms\":%.3f,\"results\":[", ms);
+    double ms = (double)(os_monotonic_ns() - t0) / 1e6;
+    lp_buf out = { 0 };
+    lp_buf_fmt(&out, "{\"model\":\"laplace-containment\",\"ms\":%.3f,\"results\":[", ms);
     for (size_t i = 0; i < shown; i++)
-        api_buf_fmt(&out, &un, &ucap, "%s{\"index\":%u,\"relevance_score\":%.6f,\"shared\":%u}",
+        lp_buf_fmt(&out, "%s{\"index\":%u,\"relevance_score\":%.6f,\"shared\":%u}",
                 i ? "," : "", items[i].index, items[i].score, items[i].shared);
-    api_buf_add(&out, &un, &ucap, "]}", 2);
+    lp_buf_cstr(&out, "]}");
     free(items);
-    api_http(c, 200, out ? out : "{\"results\":[]}");
-    free(out);
+    api_reply_buf(c, 200, &out);
 }

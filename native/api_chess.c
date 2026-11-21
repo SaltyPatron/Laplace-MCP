@@ -13,9 +13,7 @@
  * An opening named at or before a position along any recorded line through it is an opening of that position. Its
  * line is its own line and plies that line's moves. A position held by more recorded lines than LINES_CAP (the start
  * position, once games are recorded) is a hub: its own names are read, the routes through it are not. */
-#define _GNU_SOURCE
 #include "api_internal.h"
-#include "os.h"
 #include "chess_rules.h"
 #include "chess_tablebase.h"
 
@@ -73,32 +71,37 @@ static int book_read(PGconn *pg, const lp_id *keys, int nkeys, int routes, const
     lp_idmap_free(seen);
     lp_idmap *texts = lp_idmap_new(); size_t ncap = 0;
     if (wanted.n) {
-        int nh = 0, *hub = calloc(wanted.n * 2, sizeof(int));
-        Hold *h = holds_capped(pg, wanted.v, (int)wanted.n, -1, 1, 1, hub, &nh);
-        for (int k = 0; k < nh; k++) {
-            lp_id part[3]; if (!h[k].claim || lp_path_ids(h[k].path, (size_t)h[k].path_len, part, 3) != 3) continue;
-            int is_name = lp_id_eq(&part[1], &name_predicate), is_eco = lp_id_eq(&part[1], &eco_predicate);
-            if (!is_name && !is_eco) continue;
-            bool fresh; size_t slot = lp_idmap_put(b->at, &part[0], &fresh); int *index = lp_idmap_at(b->at, slot);
-            if (fresh) { if (b->nnamed == ncap) { ncap = ncap ? ncap * 2 : 64; b->named = realloc(b->named, sizeof(Named) * ncap); }
-                memset(&b->named[b->nnamed], 0, sizeof(Named)); b->named[b->nnamed].position = part[0]; b->named[b->nnamed].plies = -1; *index = (int)b->nnamed++; }
-            Named *n = &b->named[*index];
-            /* a position two rows name: the name with the higher standing */
-            if (is_name && (!n->has_name || (h[k].stood && (!n->stood || h[k].r.rating > n->r.rating)))) { n->name = part[2]; n->has_name = 1; n->stood = h[k].stood; n->r = h[k].r; }
-            if (is_eco && !n->has_eco) { n->eco = part[2]; n->has_eco = 1; }
-            lp_idmap_put(texts, &part[2], NULL);
+        const lp_id preds[2] = { name_predicate, eco_predicate };
+        for (int pi = 0; pi < 2; pi++) {
+            int nh = 0;
+            Hold *h = holds_both(pg, wanted.v, (int)wanted.n, &preds[pi], &nh);
+            for (int k = 0; k < nh; k++) {
+                lp_id part[3]; if (!h[k].claim || lp_path_ids(h[k].path, (size_t)h[k].path_len, part, 3) != 3) continue;
+                if (h[k].src < 0 || (size_t)h[k].src >= wanted.n || !lp_id_eq(&part[0], &wanted.v[h[k].src])) continue;
+                int is_name = (pi == 0) && lp_id_eq(&part[1], &name_predicate);
+                int is_eco  = (pi == 1) && lp_id_eq(&part[1], &eco_predicate);
+                if (!is_name && !is_eco) continue;
+                bool fresh; size_t slot = lp_idmap_put(b->at, &part[0], &fresh); int *index = lp_idmap_at(b->at, slot);
+                if (fresh) { if (b->nnamed == ncap) { ncap = ncap ? ncap * 2 : 64; b->named = realloc(b->named, sizeof(Named) * ncap); }
+                    memset(&b->named[b->nnamed], 0, sizeof(Named)); b->named[b->nnamed].position = part[0]; b->named[b->nnamed].plies = -1; *index = (int)b->nnamed++; }
+                Named *n = &b->named[*index];
+                /* a position two rows name: the name with the higher standing */
+                if (is_name && (!n->has_name || (h[k].stood && (!n->stood || h[k].r.rating > n->r.rating)))) { n->name = part[2]; n->has_name = 1; n->stood = h[k].stood; n->r = h[k].r; }
+                if (is_eco && !n->has_eco) { n->eco = part[2]; n->has_eco = 1; }
+                lp_idmap_put(texts, &part[2], NULL);
+            }
+            holds_free(h, nh);
         }
-        holds_free(h, nh); free(hub);
     }
     lp_vec_free(&wanted);
     /* 4: each named position's own line, the shortest recorded line ending in it. A one-move line [P0, M0, P1] is the
      * same entity as the transition claim [P0, M0, P1] Engine chess.c states for that move, so it is held as a claim and
      * is read here all the same. The other claims of a position ([P, "opening name", name], its ECO code, a NAG) end in
-     * their value, never in the position, so the ending test below keeps only lines. */
+     * their value, never in the position, so endpoint=2 (last vertex) selects lines ending in the position directly. */
     if (b->nnamed) {
         lp_id *positions = malloc(sizeof(lp_id) * b->nnamed); for (size_t i = 0; i < b->nnamed; i++) positions[i] = b->named[i].position;
         int nh = 0, *hub = calloc(b->nnamed * 2, sizeof(int));
-        Hold *h = holds_capped(pg, positions, (int)b->nnamed, LINES_CAP, 0, 2, hub, &nh);
+        Hold *h = holds_endpoint(pg, positions, (int)b->nnamed, LINES_CAP, 0, 3, 2, hub, &nh);
         for (int k = 0; k < nh; k++) {
             if (h[k].src < 0 || (size_t)h[k].src >= b->nnamed) continue;
             Named *n = &b->named[h[k].src]; Run run = run_of(h[k].path, (size_t)h[k].path_len);
@@ -112,20 +115,22 @@ static int book_read(PGconn *pg, const lp_id *keys, int nkeys, int routes, const
     return 1;
 }
 
-static void emit_text(char **o, size_t *on, size_t *oc, Reader *rd, const lp_id *id, int has){
-    if (!has) { api_buf_fmt(o, on, oc, "null"); return; }
-    char *text = reader_text(rd, id, 240); api_buf_fmt(o, on, oc, "\""); api_cw_str(o, on, oc, text ? text : ""); api_buf_fmt(o, on, oc, "\""); free(text);
+static void emit_text(lp_buf *o, Reader *rd, const lp_id *id, int has){
+    if (!has) { lp_buf_cstr(o, "null"); return; }
+    char *text = reader_text(rd, id, 240);
+    lp_json_cstr(o, text ? text : "");
+    free(text);
 }
 /* {line, name, eco, plies[, standing]}: line and plies its own line's, or the route's plies where none is recorded */
-static void emit_opening(char **o, size_t *on, size_t *oc, const Book *b, const Named *n, int route_plies, int standing){
+static void emit_opening(lp_buf *o, const Book *b, const Named *n, int route_plies, int standing){
     char hex[33];
-    if (n->has_line) { api_hex_id(&n->line, hex); api_buf_fmt(o, on, oc, "{\"line\":\"%s\",\"name\":", hex); } else api_buf_fmt(o, on, oc, "{\"line\":null,\"name\":");
-    emit_text(o, on, oc, b->rd, &n->name, n->has_name); api_buf_fmt(o, on, oc, ",\"eco\":"); emit_text(o, on, oc, b->rd, &n->eco, n->has_eco);
+    if (n->has_line) { api_hex_id(&n->line, hex); lp_buf_fmt(o, "{\"line\":\"%s\",\"name\":", hex); } else lp_buf_cstr(o, "{\"line\":null,\"name\":");
+    emit_text(o, b->rd, &n->name, n->has_name); lp_buf_cstr(o, ",\"eco\":"); emit_text(o, b->rd, &n->eco, n->has_eco);
     int plies = n->has_line ? n->plies : route_plies;
-    if (plies >= 0) api_buf_fmt(o, on, oc, ",\"plies\":%d", plies); else api_buf_fmt(o, on, oc, ",\"plies\":null");
-    if (!standing) { api_buf_fmt(o, on, oc, "}"); return; }
-    if (n->stood) api_buf_fmt(o, on, oc, ",\"standing\":{\"rating\":%.3f,\"deviation\":%.3f}}", n->r.rating, n->r.deviation);
-    else api_buf_fmt(o, on, oc, ",\"standing\":null}");
+    if (plies >= 0) lp_buf_fmt(o, ",\"plies\":%d", plies); else lp_buf_cstr(o, ",\"plies\":null");
+    if (!standing) { lp_buf_byte(o, '}'); return; }
+    if (n->stood) lp_buf_fmt(o, ",\"standing\":{\"rating\":%.3f,\"deviation\":%.3f}}", n->r.rating, n->r.deviation);
+    else lp_buf_cstr(o, ",\"standing\":null}");
 }
 typedef struct { const Named *n; int plies; } Shown;
 static int shown_order(const void *a, const void *b){
@@ -133,38 +138,37 @@ static int shown_order(const void *a, const void *b){
     return px != py ? (px < py ? -1 : 1) : memcmp(&x->n->position, &y->n->position, 16);
 }
 /* The openings of key: each named position along its routes once, by plies ascending. */
-static void emit_openings(char **o, size_t *on, size_t *oc, const Book *b, int key){
+static void emit_openings(lp_buf *o, const Book *b, int key){
     Shown *s = malloc(sizeof(Shown) * (b->nroutes ? b->nroutes : 1)); size_t n = 0; lp_idmap *once = lp_idmap_new();
     for (size_t i = 0; i < b->nroutes; i++) { if (b->routes[i].key != key) continue; const Named *named = named_of(b, &b->routes[i].position); if (!named) continue;
         bool fresh; lp_idmap_put(once, &named->position, &fresh); if (!fresh) continue;
         s[n++] = (Shown){ named, named->has_line ? named->plies : b->routes[i].plies }; }
     qsort(s, n, sizeof(Shown), shown_order);
-    api_buf_fmt(o, on, oc, "[");
-    for (size_t i = 0; i < n; i++) { if (i) api_buf_fmt(o, on, oc, ","); emit_opening(o, on, oc, b, s[i].n, s[i].plies, 1); }
-    api_buf_fmt(o, on, oc, "]"); lp_idmap_free(once); free(s);
+    lp_buf_byte(o, '[');
+    for (size_t i = 0; i < n; i++) { if (i) lp_buf_byte(o, ','); emit_opening(o, b, s[i].n, s[i].plies, 1); }
+    lp_buf_byte(o, ']'); lp_idmap_free(once); free(s);
 }
 /* The deepest opening a game reaches: the named position latest along it. */
-static void emit_deepest(char **o, size_t *on, size_t *oc, const Book *b, const lp_id *positions, size_t n){
-    for (size_t i = n; i-- > 0;) { const Named *named = named_of(b, &positions[i]); if (named) { emit_opening(o, on, oc, b, named, (int)i, 0); return; } }
-    api_buf_fmt(o, on, oc, "null");
+static void emit_deepest(lp_buf *o, const Book *b, const lp_id *positions, size_t n){
+    for (size_t i = n; i-- > 0;) { const Named *named = named_of(b, &positions[i]); if (named) { emit_opening(o, b, named, (int)i, 0); return; } }
+    lp_buf_cstr(o, "null");
 }
 static void db_unavailable(int c){
-    char escaped[512], error[640]; api_json_esc(api_db_error(), escaped, sizeof escaped);
-    snprintf(error, sizeof error, "{\"error\":\"database\",\"detail\":\"%s\"}", escaped); api_http(c, 503, error);
+    api_reply_error(c, 503, "database", api_db_error());
 }
 
 /* POST /v1/chess_position {fen}: {position, openings: [{line, name, eco, plies, standing}], games}. An input that is
  * no position answers {error} (the web host's 400). */
 void on_chess_position(int c, const char *body){
     char fen[256]; lp_id position;
-    if (!api_jstr(body, "fen", fen, sizeof fen) || !lp_chess_fen_position(fen, strlen(fen), &position)) { api_http(c, 200, "{\"error\":\"fen: no position\"}"); return; }
+    if (!api_jstr(body, "fen", fen, sizeof fen) || !lp_chess_fen_position(fen, strlen(fen), &position)) { api_reply_error(c, 200, "fen: no position", NULL); return; }
     PGconn *pg = api_db(); if (!pg) { db_unavailable(c); return; }
-    Book b; if (!book_read(pg, &position, 1, 1, NULL, &b)) { book_free(&b); api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
+    Book b; if (!book_read(pg, &position, 1, 1, NULL, &b)) { book_free(&b); api_reply_error(c, 500, "tier0", NULL); return; }
     long games = holds_count(pg, &position, 1, 0);
-    char hex[33]; api_hex_id(&position, hex); char *o = NULL; size_t on = 0, oc = 0;
-    api_buf_fmt(&o, &on, &oc, "{\"position\":\"%s\",\"openings\":", hex); emit_openings(&o, &on, &oc, &b, 0);
-    api_buf_fmt(&o, &on, &oc, ",\"games\":%ld}", games);
-    book_free(&b); api_http(c, 200, o ? o : "{\"error\":\"memory\"}"); free(o);
+    char hex[33]; api_hex_id(&position, hex); lp_buf o = { 0 };
+    lp_buf_fmt(&o, "{\"position\":\"%s\",\"openings\":", hex); emit_openings(&o, &b, 0);
+    lp_buf_fmt(&o, ",\"games\":%ld}", games);
+    book_free(&b); api_reply_buf(c, 200, &o);
 }
 
 /* A game's positions, P0 first: its PGN (or bare movetext) read by the Engine's chess with the engine's own grammars,
@@ -212,28 +216,28 @@ void on_chess_game_openings(int c, const char *body){
         char *list[GAMES_MAX]; size_t ngames = api_parse_str_array(body, "pgns", list, GAMES_MAX), total = 0;
         lp_id *all = malloc(sizeof(lp_id) * (ngames ? ngames : 1) * (GAME_PLIES + 1)); size_t *count = calloc(ngames ? ngames : 1, sizeof(size_t));
         for (size_t g = 0; g < ngames; g++) { lp_id line; count[g] = game_positions(pg, list[g], NULL, all + total, &line); total += count[g]; free(list[g]); }
-        Book b; if (!book_read(pg, all, (int)total, 0, NULL, &b)) { book_free(&b); free(all); free(count); api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
-        char *o = NULL; size_t on = 0, oc = 0, at = 0; api_buf_fmt(&o, &on, &oc, "[");
-        for (size_t g = 0; g < ngames; g++) { api_buf_fmt(&o, &on, &oc, "%s{\"deepest\":", g ? "," : ""); emit_deepest(&o, &on, &oc, &b, all + at, count[g]); api_buf_fmt(&o, &on, &oc, "}"); at += count[g]; }
-        api_buf_fmt(&o, &on, &oc, "]");
-        book_free(&b); free(all); free(count); api_http(c, 200, o ? o : "[]"); free(o); return;
+        Book b; if (!book_read(pg, all, (int)total, 0, NULL, &b)) { book_free(&b); free(all); free(count); api_reply_error(c, 500, "tier0", NULL); return; }
+        lp_buf o = { 0 }; size_t at = 0; lp_buf_byte(&o, '[');
+        for (size_t g = 0; g < ngames; g++) { lp_buf_fmt(&o, "%s{\"deepest\":", g ? "," : ""); emit_deepest(&o, &b, all + at, count[g]); lp_buf_byte(&o, '}'); at += count[g]; }
+        lp_buf_byte(&o, ']');
+        book_free(&b); free(all); free(count); api_reply_buf(c, 200, &o); return;
     }
     size_t cap = strlen(body) + 1; char *pgn = malloc(cap), idtext[64]; lp_id line_id, line, *positions = malloc(sizeof(lp_id) * (GAME_PLIES + 1));
     size_t n = 0; int recorded = 0;
     if (api_jstr(body, "pgn", pgn, cap)) n = game_positions(pg, pgn, NULL, positions, &line);
     else if (api_jstr(body, "line", idtext, sizeof idtext) && api_valid_id(idtext)) { lp_id_unhex(idtext, &line_id); n = game_positions(pg, NULL, &line_id, positions, &line); recorded = 1; }
-    else { free(pgn); free(positions); api_http(c, 200, "{\"error\":\"pgn, line or pgns\"}"); return; }
+    else { free(pgn); free(positions); api_reply_error(c, 200, "pgn, line or pgns", NULL); return; }
     free(pgn);
-    if (!n) { free(positions); api_http(c, 200, "{\"error\":\"the game does not replay, or the line is no recorded line\"}"); return; }
-    Book b; if (!book_read(pg, positions, (int)n, 1, recorded ? &line : NULL, &b)) { book_free(&b); free(positions); api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
+    if (!n) { free(positions); api_reply_error(c, 200, "the game does not replay, or the line is no recorded line", NULL); return; }
+    Book b; if (!book_read(pg, positions, (int)n, 1, recorded ? &line : NULL, &b)) { book_free(&b); free(positions); api_reply_error(c, 500, "tier0", NULL); return; }
     long out = -1; for (size_t i = 1; i < n && out < 0; i++) if (!b.in_book[i]) out = (long)i;     /* the first ply no other recorded line reaches */
-    char hex[33]; api_hex_id(&line, hex); char *o = NULL; size_t on = 0, oc = 0;
-    api_buf_fmt(&o, &on, &oc, "{\"line\":\"%s\",\"plies\":[", hex);
+    char hex[33]; api_hex_id(&line, hex); lp_buf o = { 0 };
+    lp_buf_fmt(&o, "{\"line\":\"%s\",\"plies\":[", hex);
     for (size_t i = 0; i < n; i++) { api_hex_id(&positions[i], hex);
-        api_buf_fmt(&o, &on, &oc, "%s{\"ply\":%zu,\"position\":\"%s\",\"openings\":", i ? "," : "", i, hex); emit_openings(&o, &on, &oc, &b, (int)i); api_buf_fmt(&o, &on, &oc, "}"); }
-    api_buf_fmt(&o, &on, &oc, "],\"deepest\":"); emit_deepest(&o, &on, &oc, &b, positions, n);
-    if (out >= 0) api_buf_fmt(&o, &on, &oc, ",\"out_of_book_at\":%ld}", out); else api_buf_fmt(&o, &on, &oc, ",\"out_of_book_at\":null}");
-    book_free(&b); free(positions); api_http(c, 200, o ? o : "{\"error\":\"memory\"}"); free(o);
+        lp_buf_fmt(&o, "%s{\"ply\":%zu,\"position\":\"%s\",\"openings\":", i ? "," : "", i, hex); emit_openings(&o, &b, (int)i); lp_buf_byte(&o, '}'); }
+    lp_buf_cstr(&o, "],\"deepest\":"); emit_deepest(&o, &b, positions, n);
+    if (out >= 0) lp_buf_fmt(&o, ",\"out_of_book_at\":%ld}", out); else lp_buf_cstr(&o, ",\"out_of_book_at\":null}");
+    book_free(&b); free(positions); api_reply_buf(c, 200, &o);
 }
 
 /* ---- the tablebase: a position's verdict, its moves and its best-play line, read from the Syzygy tables
@@ -249,12 +253,12 @@ void on_chess_game_openings(int c, const char *body){
 #define TB_HUB 4096                         /* a position held by more claims is read as a hub: its transitions' standings are not */
 #define TB_LINE 1024
 static const char *const TB_WDL[5] = { "loss", "blessed loss", "draw", "cursed win", "win" };
-static void emit_recorded(char **o, size_t *on, size_t *oc, lp_idmap *stood, const Hold *h, const lp_id *claim){
+static void emit_recorded(lp_buf *o, lp_idmap *stood, const Hold *h, const lp_id *claim){
     int64_t at = stood ? lp_idmap_find(stood, claim) : -1;
-    if (at < 0) { api_buf_fmt(o, on, oc, ",\"recorded\":null"); return; }
+    if (at < 0) { lp_buf_cstr(o, ",\"recorded\":null"); return; }
     const Hold *x = &h[*(int *)lp_idmap_at(stood, (size_t)at)];
-    if (x->stood) api_buf_fmt(o, on, oc, ",\"recorded\":{\"rating\":%.3f,\"deviation\":%.3f,\"matches\":%lld}", x->r.rating, x->r.deviation, (long long)x->matches);
-    else api_buf_fmt(o, on, oc, ",\"recorded\":{\"rating\":null,\"deviation\":null,\"matches\":0}");
+    if (x->stood) lp_buf_fmt(o, ",\"recorded\":{\"rating\":%.3f,\"deviation\":%.3f,\"matches\":%lld}", x->r.rating, x->r.deviation, (long long)x->matches);
+    else lp_buf_cstr(o, ",\"recorded\":{\"rating\":null,\"deviation\":null,\"matches\":0}");
 }
 /* /v1/chess_tablebase {fen}: {position, tables, covered, wdl, dtz, moves: [{san, uci, position, claim, wdl, dtz,
  * value, zeroing, mate, recorded}], line: {id, result, plies: [{san, uci, position, claim, recorded}]} | null, claims,
@@ -262,10 +266,10 @@ static void emit_recorded(char **o, size_t *on, size_t *oc, lp_idmap *stood, con
  * distance to zeroing through it); null where the tables do not cover the position (more pieces than they hold,
  * castling rights). claims: how many recorded claims hold the position (-1 its holders are more than a hub's). */
 void on_chess_tablebase(int c, const char *body){
-    char fen[256]; if (!api_jstr(body, "fen", fen, sizeof fen)) { api_http(c, 200, "{\"error\":\"fen: no position\"}"); return; }
+    char fen[256]; if (!api_jstr(body, "fen", fen, sizeof fen)) { api_reply_error(c, 200, "fen: no position", NULL); return; }
     LpTablebase *tb = lp_tablebase_shared();
     LpTbProbe *p = malloc(sizeof *p); int covered = lp_tablebase_probe_fen(tb, fen, strlen(fen), p);
-    if (covered < 0) { free(p); api_http(c, 200, "{\"error\":\"fen: no position\"}"); return; }
+    if (covered < 0) { free(p); api_reply_error(c, 200, "fen: no position", NULL); return; }
     LpTbPly *ply = malloc(sizeof(LpTbPly) * TB_LINE); lp_id line_id; char result[8] = ""; int plies = covered ? lp_tablebase_line_fen(tb, fen, strlen(fen), ply, TB_LINE, &line_id, result) : -1;
     /* what the database holds: the claims holding the position and the line's positions before each ply */
     PGconn *pg = api_db(); int nkeys = 1 + (plies > 0 ? plies : 0), nh = 0, *hub = calloc((size_t)nkeys * 2, sizeof(int)); Hold *h = NULL; lp_idmap *stood = NULL; long claims = 0;
@@ -276,23 +280,23 @@ void on_chess_tablebase(int c, const char *body){
         for (int k = 0; k < nh; k++) { if (!h[k].claim) continue; if (h[k].src == 0) claims++; *(int *)lp_idmap_get(stood, &h[k].entity, NULL) = k; }
         if (hub[0]) claims = -1;
         free(keys); }
-    char hex[33]; char *o = NULL; size_t on = 0, oc = 0; api_hex_id(&p->position, hex);
-    api_buf_fmt(&o, &on, &oc, "{\"position\":\"%s\",\"tables\":%s,\"covered\":%s,", hex, tb ? "true" : "false", covered ? "true" : "false");
-    if (covered) api_buf_fmt(&o, &on, &oc, "\"wdl\":\"%s\",\"dtz\":%d", TB_WDL[p->wdl + 2], p->dtz); else api_buf_fmt(&o, &on, &oc, "\"wdl\":null,\"dtz\":null");
-    api_buf_fmt(&o, &on, &oc, ",\"moves\":[");
+    char hex[33]; lp_buf o = { 0 }; api_hex_id(&p->position, hex);
+    lp_buf_fmt(&o, "{\"position\":\"%s\",\"tables\":%s,\"covered\":%s,", hex, tb ? "true" : "false", covered ? "true" : "false");
+    if (covered) lp_buf_fmt(&o, "\"wdl\":\"%s\",\"dtz\":%d", TB_WDL[p->wdl + 2], p->dtz); else lp_buf_cstr(&o, "\"wdl\":null,\"dtz\":null");
+    lp_buf_cstr(&o, ",\"moves\":[");
     for (int i = 0; i < p->nmoves; i++) { const LpTbMove *m = &p->move[i]; char ph[33], ch[33]; api_hex_id(&m->position, ph); api_hex_id(&m->claim, ch);
-        api_buf_fmt(&o, &on, &oc, "%s{\"san\":\"%s\",\"uci\":\"%s\",\"position\":\"%s\",\"claim\":\"%s\",", i ? "," : "", m->san, m->uci, ph, ch);
-        if (covered) api_buf_fmt(&o, &on, &oc, "\"wdl\":\"%s\",\"dtz\":%d,\"value\":%d,\"zeroing\":%s,\"mate\":%s", TB_WDL[m->wdl + 2], m->dtz, m->value, m->zeroing ? "true" : "false", m->mate ? "true" : "false");
-        else api_buf_fmt(&o, &on, &oc, "\"wdl\":null,\"dtz\":null,\"value\":null,\"zeroing\":null,\"mate\":null");
-        emit_recorded(&o, &on, &oc, stood, h, &m->claim); api_buf_fmt(&o, &on, &oc, "}"); }
-    api_buf_fmt(&o, &on, &oc, "],\"line\":");
-    if (plies > 0) { api_hex_id(&line_id, hex); api_buf_fmt(&o, &on, &oc, "{\"id\":\"%s\",\"result\":\"%s\",\"plies\":[", hex, result);
+        lp_buf_fmt(&o, "%s{\"san\":\"%s\",\"uci\":\"%s\",\"position\":\"%s\",\"claim\":\"%s\",", i ? "," : "", m->san, m->uci, ph, ch);
+        if (covered) lp_buf_fmt(&o, "\"wdl\":\"%s\",\"dtz\":%d,\"value\":%d,\"zeroing\":%s,\"mate\":%s", TB_WDL[m->wdl + 2], m->dtz, m->value, m->zeroing ? "true" : "false", m->mate ? "true" : "false");
+        else lp_buf_cstr(&o, "\"wdl\":null,\"dtz\":null,\"value\":null,\"zeroing\":null,\"mate\":null");
+        emit_recorded(&o, stood, h, &m->claim); lp_buf_byte(&o, '}'); }
+    lp_buf_cstr(&o, "],\"line\":");
+    if (plies > 0) { api_hex_id(&line_id, hex); lp_buf_fmt(&o, "{\"id\":\"%s\",\"result\":\"%s\",\"plies\":[", hex, result);
         for (int i = 0; i < plies; i++) { char ph[33], ch[33]; api_hex_id(&ply[i].position, ph); api_hex_id(&ply[i].claim, ch);
-            api_buf_fmt(&o, &on, &oc, "%s{\"san\":\"%s\",\"uci\":\"%s\",\"position\":\"%s\",\"claim\":\"%s\"", i ? "," : "", ply[i].san, ply[i].uci, ph, ch);
-            emit_recorded(&o, &on, &oc, stood, h, &ply[i].claim); api_buf_fmt(&o, &on, &oc, "}"); }
-        api_buf_fmt(&o, &on, &oc, "]}"); }
-    else api_buf_fmt(&o, &on, &oc, "null");
-    if (pg) api_buf_fmt(&o, &on, &oc, ",\"claims\":%ld,\"database\":true}", claims); else api_buf_fmt(&o, &on, &oc, ",\"claims\":null,\"database\":false}");
+            lp_buf_fmt(&o, "%s{\"san\":\"%s\",\"uci\":\"%s\",\"position\":\"%s\",\"claim\":\"%s\"", i ? "," : "", ply[i].san, ply[i].uci, ph, ch);
+            emit_recorded(&o, stood, h, &ply[i].claim); lp_buf_byte(&o, '}'); }
+        lp_buf_cstr(&o, "]}"); }
+    else lp_buf_cstr(&o, "null");
+    if (pg) lp_buf_fmt(&o, ",\"claims\":%ld,\"database\":true}", claims); else lp_buf_cstr(&o, ",\"claims\":null,\"database\":false}");
     if (h) holds_free(h, nh); if (stood) lp_idmap_free(stood); free(hub); free(ply); free(p);
-    api_http(c, 200, o ? o : "{\"error\":\"memory\"}"); free(o);
+    api_reply_buf(c, 200, &o);
 }

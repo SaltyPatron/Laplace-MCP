@@ -1,0 +1,7 @@
+# LaplaceMCP: reusable HTTP/MCP shell package (Laplace::http).
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+
+find_dependency(LaplaceNative CONFIG HINTS "@LAPLACE_NATIVE_PACKAGE_DIR@")
+include("${CMAKE_CURRENT_LIST_DIR}/LaplaceMCPTargets.cmake")
+check_required_components(LaplaceMCP)

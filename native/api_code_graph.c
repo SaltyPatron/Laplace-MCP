@@ -13,12 +13,7 @@ static const char *cc_word(const char *base, const char *from, const char *end, 
 }
 PGconn *api_cc_db(int c) {
     PGconn *pg = api_db();
-    if (!pg) {
-        char e[512], b[640];
-        api_json_esc(api_db_error(), e, sizeof e);
-        snprintf(b, sizeof b, "{\"error\":\"database\",\"detail\":\"%s\"}", e);
-        api_http(c, 503, b);
-    }
+    if (!pg) api_reply_error(c, 503, "database", api_db_error());
     return pg;
 }
 typedef struct { int n; long l[16]; } CcLines;
@@ -26,10 +21,10 @@ static void cc_line(CcLines *cl, long line) {
     for (int z = 0; z < cl->n; z++) if (cl->l[z] == line) return;
     if (cl->n < 16) cl->l[cl->n++] = line;
 }
-static void cc_lines_json(char **out, size_t *on, size_t *ocap, const CcLines *cl) {
-    api_buf_fmt(out, on, ocap, "\"at\":[");
-    for (int z = 0; z < cl->n; z++) api_buf_fmt(out, on, ocap, "%s%ld", z ? "," : "", cl->l[z]);
-    api_buf_fmt(out, on, ocap, "]");
+static void cc_lines_json(lp_buf *out, const CcLines *cl) {
+    lp_buf_cstr(out, "\"at\":[");
+    for (int z = 0; z < cl->n; z++) lp_buf_fmt(out, "%s%ld", z ? "," : "", cl->l[z]);
+    lp_buf_byte(out, ']');
 }
 
 /* code_callers: the declarations whose code uses the name, each with the lines it does at; a use outside every
@@ -48,16 +43,18 @@ void on_code_callers(int c, const char *body) {
     if (!api_name_entity(name, &trunk, parts, 256, &np)) { api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
     PGconn *pg = api_cc_db(c);
     if (!pg) return;
-    uint64_t t0 = api_nsec();
+    uint64_t t0 = os_monotonic_ns();
     HeldUp d;
     held_up(pg, &trunk.id, 1, HELD_CONTENT, -1, 400000, &d);
     int cut = d.cut;
     Reader *rd = reader_new(pg);
-    char *out = NULL, *top = NULL;
-    size_t on = 0, ocap = 0, tn = 0, tcap = 0, files = 0;
-    api_buf_fmt(&out, &on, &ocap, "{\"name\":\"");
-    api_cw_str(&out, &on, &ocap, name);
-    api_buf_fmt(&out, &on, &ocap, "\",\"database\":\"%s\",\"callers\":[", PQdb(pg));
+    lp_buf out = { 0 }, top = { 0 };
+    size_t files = 0;
+    lp_buf_cstr(&out, "{\"name\":");
+    lp_json_str(&out, name, strlen(name));
+    lp_buf_cstr(&out, ",\"database\":");
+    lp_json_str(&out, PQdb(pg), strlen(PQdb(pg)));
+    lp_buf_cstr(&out, ",\"callers\":[");
     int shown = 0, ntop = 0;
     for (size_t i = 0; i < d.n && shown < limit; i++) {
         if (!d.node[i].file) continue;
@@ -80,24 +77,24 @@ void on_code_callers(int c, const char *body) {
         int any = 0;
         for (size_t q = 0; q < nd && shown < limit; q++) {
             if (!by[q].n) continue;
-            api_buf_fmt(&out, &on, &ocap, "%s{\"name\":\"", shown ? "," : "");
-            api_cw_str(&out, &on, &ocap, dl[q].name);
-            api_buf_fmt(&out, &on, &ocap, "\",\"kind\":\"");
-            api_cw_str(&out, &on, &ocap, dl[q].kind);
-            api_buf_fmt(&out, &on, &ocap, "\",\"path\":\"");
-            api_cw_str(&out, &on, &ocap, path);
-            api_buf_fmt(&out, &on, &ocap, "\",\"file\":\"%s\",\"line\":%zu,", fh, dl[q].line);
-            cc_lines_json(&out, &on, &ocap, &by[q]);
-            api_buf_fmt(&out, &on, &ocap, "}");
+            lp_buf_fmt(&out, "%s{\"name\":", shown ? "," : "");
+            lp_json_str(&out, dl[q].name, strlen(dl[q].name));
+            lp_buf_cstr(&out, ",\"kind\":");
+            lp_json_str(&out, dl[q].kind, strlen(dl[q].kind));
+            lp_buf_cstr(&out, ",\"path\":");
+            lp_json_str(&out, path, strlen(path));
+            lp_buf_fmt(&out, ",\"file\":\"%s\",\"line\":%zu,", fh, dl[q].line);
+            cc_lines_json(&out, &by[q]);
+            lp_buf_byte(&out, '}');
             shown++;
             any = 1;
         }
         if (alone.n) {
-            api_buf_fmt(&top, &tn, &tcap, "%s{\"path\":\"", ntop ? "," : "");
-            api_cw_str(&top, &tn, &tcap, path);
-            api_buf_fmt(&top, &tn, &tcap, "\",\"file\":\"%s\",", fh);
-            cc_lines_json(&top, &tn, &tcap, &alone);
-            api_buf_fmt(&top, &tn, &tcap, "}");
+            lp_buf_fmt(&top, "%s{\"path\":", ntop ? "," : "");
+            lp_json_str(&top, path, strlen(path));
+            lp_buf_fmt(&top, ",\"file\":\"%s\",", fh);
+            cc_lines_json(&top, &alone);
+            lp_buf_byte(&top, '}');
             ntop++;
         }
         if (any || alone.n) files++;
@@ -106,14 +103,13 @@ void on_code_callers(int c, const char *body) {
         free(text);
         free(path);
     }
-    api_buf_fmt(&out, &on, &ocap, "],\"top_level\":[");
-    if (top) api_buf_add(&out, &on, &ocap, top, tn);
-    api_buf_fmt(&out, &on, &ocap, "],\"files\":%zu,\"shown\":%d,\"cut\":%s,\"ms\":%.3f}", files, shown, cut ? "true" : "false", (double)(api_nsec() - t0) / 1e6);
-    free(top);
+    lp_buf_cstr(&out, "],\"top_level\":[");
+    if (top.n) lp_buf_put(&out, top.b, top.n);
+    lp_buf_fmt(&out, "],\"files\":%zu,\"shown\":%d,\"cut\":%s,\"ms\":%.3f}", files, shown, cut ? "true" : "false", (double)(os_monotonic_ns() - t0) / 1e6);
+    lp_buf_free(&top);
     reader_free(rd);
     held_up_free(&d);
-    api_http(c, 200, out ? out : "{\"error\":\"memory\"}");
-    free(out);
+    api_reply_buf(c, 200, &out);
 }
 
 /* code_callees: what a declaration calls. Its code is its node (the outermost node starting on the line of a
@@ -138,7 +134,7 @@ void on_code_callees(int c, const char *body) {
     if (!api_name_entity(name, &trunk, parts, 256, &np)) { api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
     PGconn *pg = api_cc_db(c);
     if (!pg) return;
-    uint64_t t0 = api_nsec();
+    uint64_t t0 = os_monotonic_ns();
     HeldUp d;
     held_up(pg, &trunk.id, 1, HELD_CONTENT, -1, 400000, &d);
     int cut = d.cut;
@@ -241,59 +237,58 @@ void on_code_callees(int c, const char *body) {
         lp_vec_free(&decls);
         lp_vec_free(&owner);
     }
-    char *out = NULL;
-    size_t on = 0, ocap = 0;
-    api_buf_fmt(&out, &on, &ocap, "{\"name\":\"");
-    api_cw_str(&out, &on, &ocap, name);
-    api_buf_fmt(&out, &on, &ocap, "\",\"database\":\"%s\",\"definitions\":[", PQdb(pg));
+    lp_buf out = { 0 };
+    lp_buf_cstr(&out, "{\"name\":");
+    lp_json_str(&out, name, strlen(name));
+    lp_buf_cstr(&out, ",\"database\":");
+    lp_json_str(&out, PQdb(pg), strlen(PQdb(pg)));
+    lp_buf_cstr(&out, ",\"definitions\":[");
     for (size_t f = 0; f < ndef; f++) {
         CeDef *df = &defs[f];
         char fh[33];
         api_hex_id(&d.node[df->node].id, fh);
-        api_buf_fmt(&out, &on, &ocap, "%s{\"path\":\"", f ? "," : "");
-        api_cw_str(&out, &on, &ocap, df->path);
-        api_buf_fmt(&out, &on, &ocap, "\",\"file\":\"%s\",\"kind\":\"", fh);
-        api_cw_str(&out, &on, &ocap, df->kind);
-        api_buf_fmt(&out, &on, &ocap, "\",\"line0\":%zu,\"line1\":%ld,\"callees\":[", df->line, df->line1);
+        lp_buf_fmt(&out, "%s{\"path\":", f ? "," : "");
+        lp_json_str(&out, df->path, strlen(df->path));
+        lp_buf_fmt(&out, ",\"file\":\"%s\",\"kind\":", fh);
+        lp_json_str(&out, df->kind, strlen(df->kind));
+        lp_buf_fmt(&out, ",\"line0\":%zu,\"line1\":%ld,\"callees\":[", df->line, df->line1);
         int n = 0;
         for (size_t z = 0; z < df->calls.n; z++) {
             CeCand *x = &cs.v[df->calls.v[z]];
             if (!x->nfile) continue;
-            api_buf_fmt(&out, &on, &ocap, "%s{\"name\":\"", n++ ? "," : "");
-            api_cw_str(&out, &on, &ocap, x->name);
-            api_buf_fmt(&out, &on, &ocap, "\",\"kind\":\"");
-            api_cw_str(&out, &on, &ocap, x->kind ? x->kind : "");
-            api_buf_fmt(&out, &on, &ocap, "\",\"declared_in\":%d,\"files\":[", x->total);
+            lp_buf_fmt(&out, "%s{\"name\":", n++ ? "," : "");
+            lp_json_str(&out, x->name, strlen(x->name));
+            lp_buf_cstr(&out, ",\"kind\":");
+            lp_json_str(&out, x->kind ? x->kind : "", strlen(x->kind ? x->kind : ""));
+            lp_buf_fmt(&out, ",\"declared_in\":%d,\"files\":[", x->total);
             for (int k = 0; k < x->nfile; k++) {
                 char *pth = api_cw_file_name(rd, &x->file[k]), xh[33];
                 api_hex_id(&x->file[k], xh);
-                api_buf_fmt(&out, &on, &ocap, "%s{\"path\":\"", k ? "," : "");
-                api_cw_str(&out, &on, &ocap, pth);
-                api_buf_fmt(&out, &on, &ocap, "\",\"file\":\"%s\"}", xh);
+                lp_buf_fmt(&out, "%s{\"path\":", k ? "," : "");
+                lp_json_str(&out, pth, strlen(pth));
+                lp_buf_fmt(&out, ",\"file\":\"%s\"}", xh);
                 free(pth);
             }
-            api_buf_fmt(&out, &on, &ocap, "]}");
+            lp_buf_cstr(&out, "]}");
         }
-        api_buf_fmt(&out, &on, &ocap, "],\"outside\":[");
+        lp_buf_cstr(&out, "],\"outside\":[");
         n = 0;
         for (size_t z = 0; z < df->calls.n; z++) {
             CeCand *x = &cs.v[df->calls.v[z]];
             if (x->nfile) continue;
-            api_buf_fmt(&out, &on, &ocap, "%s\"", n++ ? "," : "");
-            api_cw_str(&out, &on, &ocap, x->name);
-            api_buf_fmt(&out, &on, &ocap, "\"");
+            if (n++) lp_buf_byte(&out, ',');
+            lp_json_str(&out, x->name, strlen(x->name));
         }
-        api_buf_fmt(&out, &on, &ocap, "]}");
+        lp_buf_cstr(&out, "]}");
         free(df->path);
         free(df->kind);
         lp_vec_free(&df->calls);
     }
-    api_buf_fmt(&out, &on, &ocap, "],\"cut\":%s,\"ms\":%.3f}", cut ? "true" : "false", (double)(api_nsec() - t0) / 1e6);
+    lp_buf_fmt(&out, "],\"cut\":%s,\"ms\":%.3f}", cut ? "true" : "false", (double)(os_monotonic_ns() - t0) / 1e6);
     for (size_t z = 0; z < cs.n; z++) { free(cs.v[z].name); free(cs.v[z].kind); }
     lp_vec_free(&cs);
     lp_idmap_free(cand);
     reader_free(rd);
     held_up_free(&d);
-    api_http(c, 200, out ? out : "{\"error\":\"memory\"}");
-    free(out);
+    api_reply_buf(c, 200, &out);
 }

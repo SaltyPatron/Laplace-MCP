@@ -33,6 +33,22 @@ if(NOT LAPLACE_MCP_PORT MATCHES "^[0-9]+$")
 endif()
 configure_file(native/config.h.in ${CMAKE_CURRENT_BINARY_DIR}/lpm_config.h @ONLY)
 
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+# Laplace::http: reusable Bearer-authenticated HTTP listener and MCP JSON-RPC 2.0 shell (include/laplace/http.h).
+add_library(laplace_http STATIC native/http_shell.c)
+set_target_properties(laplace_http PROPERTIES POSITION_INDEPENDENT_CODE ON EXPORT_NAME http)
+target_include_directories(laplace_http PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_options(laplace_http PRIVATE ${LP_C_FLAGS})
+if(WIN32)
+  target_compile_definitions(laplace_http PUBLIC _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
+endif()
+target_link_libraries(laplace_http PUBLIC Laplace::laplace_static $<$<PLATFORM_ID:Windows>:ws2_32>)
+add_library(Laplace::http ALIAS laplace_http)
+
 # liblpm: the in-process client (check, id, text): a text's entity and constituent tree, from the Native decomposer.
 set(LPM_CORE_SOURCES native/lpm.c)
 add_library(lpm_lib SHARED ${LPM_CORE_SOURCES})
@@ -54,9 +70,9 @@ target_include_directories(lpm_program PRIVATE native ${CMAKE_CURRENT_BINARY_DIR
 target_compile_options(lpm_program PRIVATE ${LP_C_FLAGS} -Wno-missing-field-initializers)
 if(WIN32)
   target_sources(lpm_program PRIVATE ${LPM_CORE_SOURCES})
-  target_link_libraries(lpm_program PRIVATE Laplace::engine_reader Laplace::text Laplace::ts_runtime ws2_32 ${LP_SYSLIBS})
+  target_link_libraries(lpm_program PRIVATE laplace_http Laplace::engine_reader Laplace::os Laplace::text Laplace::ts_runtime ws2_32 ${LP_SYSLIBS})
 else()
-  target_link_libraries(lpm_program PRIVATE lpm_lib Laplace::engine_reader Laplace::text Laplace::ts_runtime ${LP_SYSLIBS})
+  target_link_libraries(lpm_program PRIVATE lpm_lib laplace_http Laplace::engine_reader Laplace::os Laplace::text Laplace::ts_runtime ${LP_SYSLIBS})
   set_target_properties(lpm_lib lpm_program PROPERTIES
     BUILD_RPATH "${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib"
     INSTALL_RPATH "\$ORIGIN/../lib;${LAPLACE_ICU_DIR}/lib;${LAPLACE_PG_DIR}/lib")
@@ -65,9 +81,18 @@ endif()
 enable_testing()
 add_test(NAME check COMMAND lpm_program check)
 
-include(GNUInstallDirs)
+set(LAPLACE_MCP_PACKAGE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/LaplaceMCP)
 install(TARGETS lpm_program RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS lpm_lib LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(TARGETS laplace_http EXPORT LaplaceMCPTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/laplace/http.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/laplace)
+install(EXPORT LaplaceMCPTargets NAMESPACE Laplace:: DESTINATION ${LAPLACE_MCP_PACKAGE_DIR})
+file(TO_CMAKE_PATH "${LaplaceNative_DIR}" LAPLACE_NATIVE_PACKAGE_DIR)
+configure_package_config_file(cmake/LaplaceMCPConfig.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/LaplaceMCPConfig.cmake
+                              INSTALL_DESTINATION ${LAPLACE_MCP_PACKAGE_DIR})
+write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/LaplaceMCPConfigVersion.cmake COMPATIBILITY ExactVersion)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/LaplaceMCPConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/LaplaceMCPConfigVersion.cmake
+        DESTINATION ${LAPLACE_MCP_PACKAGE_DIR})
 if(LAPLACE_INSTALL_ENGINE)
   install(PROGRAMS "${LaplaceEngine_PROGRAM}" DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()

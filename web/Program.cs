@@ -209,8 +209,9 @@ app.MapPost("/api/chess/game-openings", async (JsonElement body, NativeRuntime n
 static int Page(int? value, int fallback, int max) => Math.Clamp(value ?? fallback, 0, max);
 app.MapGet("/api/chess/players", async (string? search, int? limit, int? offset, NativeRuntime native, CancellationToken ct) =>
 {
-    if (string.IsNullOrWhiteSpace(search) || search.Length > 200) return Results.BadRequest(new { error = "search: a name, or a word of one, up to 200 characters" });
-    return NativeAnswer(await native.Read("/v1/chess_players", new { search = search.Trim(), limit = Math.Max(1, Page(limit, 25, 200)), offset = Page(offset, 0, 1 << 30) }, ct));
+    var q = (search ?? "").Trim();
+    if (q.Length > 200) return Results.BadRequest(new { error = "search: up to 200 characters" });
+    return NativeAnswer(await native.Read("/v1/chess_players", new { search = q, limit = Math.Max(1, Page(limit, 25, 200)), offset = Page(offset, 0, 1 << 30) }, ct));
 });
 app.MapGet("/api/chess/player", async (string? name, int? limit, int? offset, int? opponents, NativeRuntime native, CancellationToken ct) =>
 {

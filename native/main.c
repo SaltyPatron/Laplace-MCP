@@ -1,8 +1,7 @@
-#define _GNU_SOURCE
 #include "lpm.h"
 #include "api.h"
 #include "lpm_config.h"
-#include "os.h"
+#include "laplace/os.h"
 #include "db_bridge.h"
 
 #include "laplace/laplace.h"
@@ -11,9 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#ifndef _WIN32
-#include <unistd.h>
-#endif
 
 static void hex(const uint8_t b[16], char out[33]) {
     static const char H[] = "0123456789abcdef";

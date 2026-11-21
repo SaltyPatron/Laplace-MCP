@@ -49,14 +49,6 @@ size_t cw_lines(const char *text, size_t upto) {
     return l;
 }
 
-void api_cw_str(char **out, size_t *on, size_t *ocap, const char *s) {
-    size_t l = strlen(s) * 6 + 8;
-    char *e = malloc(l);
-    api_json_esc(s, e, l);
-    api_buf_add(out, on, ocap, e, strlen(e));
-    free(e);
-}
-
 typedef struct { size_t file; int defines, occ; char *path; } CwFile;
 static int cw_file_cmp(const void *a, const void *b) {
     const CwFile *x = a, *y = b;
@@ -273,13 +265,10 @@ void on_file_outline(int c, const char *body) {
     if (!want[0] && !fid[0]) { api_http(c, 400, "{\"error\":\"path or file\"}"); return; }
     PGconn *pg = api_db();
     if (!pg) {
-        char e[512], b[640];
-        api_json_esc(api_db_error(), e, sizeof e);
-        snprintf(b, sizeof b, "{\"error\":\"database\",\"detail\":\"%s\"}", e);
-        api_http(c, 503, b);
+        api_reply_error(c, 503, "database", api_db_error());
         return;
     }
-    uint64_t t0 = api_nsec();
+    uint64_t t0 = os_monotonic_ns();
     Reader *rd = reader_new(pg);
     lp_vec(lp_id) files = { 0 };
     if (fid[0]) {
@@ -305,42 +294,41 @@ void on_file_outline(int c, const char *body) {
         }
         held_up_free(&up);
     }
-    char *out = NULL;
-    size_t on = 0, ocap = 0;
-    api_buf_fmt(&out, &on, &ocap, "{\"database\":\"%s\",\"files\":[", PQdb(pg));
+    lp_buf out = { 0 };
+    lp_buf_cstr(&out, "{\"database\":");
+    lp_json_str(&out, PQdb(pg), strlen(PQdb(pg)));
+    lp_buf_cstr(&out, ",\"files\":[");
     for (size_t f = 0; f < files.n && f < 16; f++) {
         FoDecl *dl = NULL;
         char *text = NULL;
         size_t tn = 0, nd = fo_outline(pg, rd, &files.v[f], &dl, &text, &tn);
-        char *path = api_cw_file_name(rd, &files.v[f]), pe[8192], fh[33];
-        api_json_esc(path, pe, sizeof pe);
+        char *path = api_cw_file_name(rd, &files.v[f]), fh[33];
         api_hex_id(&files.v[f], fh);
-        api_buf_fmt(&out, &on, &ocap, "%s{\"path\":\"%s\",\"file\":\"%s\",\"bytes\":%zu,\"declarations\":[", f ? "," : "", pe, fh, tn);
+        lp_buf_fmt(&out, "%s{\"path\":", f ? "," : "");
+        lp_json_str(&out, path, strlen(path));
+        lp_buf_fmt(&out, ",\"file\":\"%s\",\"bytes\":%zu,\"declarations\":[", fh, tn);
         free(path);
         for (size_t k = 0; k < nd; k++) {
-            api_buf_add(&out, &on, &ocap, k ? ",{\"kind\":\"" : "{\"kind\":\"", k ? 10 : 9);
-            api_cw_str(&out, &on, &ocap, dl[k].kind);
-            api_buf_add(&out, &on, &ocap, "\",\"name\":\"", 10);
-            api_cw_str(&out, &on, &ocap, dl[k].name);
-            api_buf_add(&out, &on, &ocap, "\"", 1);
-            if (dl[k].line) api_buf_fmt(&out, &on, &ocap, ",\"line\":%zu", dl[k].line);
-            api_buf_add(&out, &on, &ocap, "}", 1);
+            lp_buf_cstr(&out, k ? ",{\"kind\":" : "{\"kind\":");
+            lp_json_str(&out, dl[k].kind, strlen(dl[k].kind));
+            lp_buf_cstr(&out, ",\"name\":");
+            lp_json_str(&out, dl[k].name, strlen(dl[k].name));
+            if (dl[k].line) lp_buf_fmt(&out, ",\"line\":%zu", dl[k].line);
+            lp_buf_byte(&out, '}');
         }
-        api_buf_add(&out, &on, &ocap, "]", 1);
+        lp_buf_byte(&out, ']');
         if (api_jbool(body, "include_text", 0)) {
-            api_buf_add(&out, &on, &ocap, ",\"text\":\"", 9);
-            api_cw_str(&out, &on, &ocap, text);
-            api_buf_add(&out, &on, &ocap, "\"", 1);
+            lp_buf_cstr(&out, ",\"text\":");
+            lp_json_str(&out, text, strlen(text));
         }
-        api_buf_add(&out, &on, &ocap, "}", 1);
+        lp_buf_byte(&out, '}');
         fo_free(dl, nd);
         free(text);
     }
-    api_buf_fmt(&out, &on, &ocap, "],\"ms\":%.3f}", (double)(api_nsec() - t0) / 1e6);
+    lp_buf_fmt(&out, "],\"ms\":%.3f}", (double)(os_monotonic_ns() - t0) / 1e6);
     lp_vec_free(&files);
     reader_free(rd);
-    api_http(c, 200, out);
-    free(out);
+    api_reply_buf(c, 200, &out);
 }
 
 /* recipe_plan: which recipe reads what, as laplace ingest --plan answers it; nothing is read into the database. */
@@ -372,10 +360,10 @@ void on_code_where(int c, const char *body) {
     lp_ref trunk, parts[256]; size_t np=0;
     if (!api_name_entity(name,&trunk,parts,256,&np)) { api_http(c,500,"{\"error\":\"tier0\"}"); return; }
     PGconn *pg=api_cc_db(c); if(!pg) return;
-    uint64_t t0=api_nsec(); HeldUp d;
+    uint64_t t0=os_monotonic_ns(); HeldUp d;
     held_up(pg,&trunk.id,1,HELD_CONTENT,-1,400000,&d);
     size_t nfiles=0; for(size_t i=0;i<d.n;i++) nfiles+=d.node[i].file;
-    double walk_ms=(double)(api_nsec()-t0)/1e6;
+    double walk_ms=(double)(os_monotonic_ns()-t0)/1e6;
     Reader *rd=reader_new(pg);
     typedef struct { CwFile rank; FoDecl *declarations; size_t count,length; char *text; } Found;
     Found *found=calloc(nfiles+1,sizeof *found); size_t nf=0;
@@ -394,24 +382,26 @@ void on_code_where(int c, const char *body) {
     /* CwFile is the first member: preserve definition-first ordering. */
     qsort(found,nf,sizeof *found,cw_file_cmp);
     char idh[33]; api_hex_id(&trunk.id,idh);
-    char *out=NULL; size_t on=0,ocap=0;
-    api_buf_fmt(&out,&on,&ocap,"{\"query\":\""); api_cw_str(&out,&on,&ocap,name);
-    api_buf_fmt(&out,&on,&ocap,"\",\"id\":\"%s\",\"database\":\"%s\",\"levels\":%d,\"nodes\":%zu,\"files\":%zu,\"cut\":%s,\"hits\":[",
-            idh,PQdb(pg),d.levels,d.n,nf,d.cut?"true":"false");
+    lp_buf out={0};
+    lp_buf_cstr(&out,"{\"query\":"); lp_json_str(&out,name,strlen(name));
+    lp_buf_fmt(&out,",\"id\":\"%s\",\"database\":",idh); lp_json_str(&out,PQdb(pg),strlen(PQdb(pg)));
+    lp_buf_fmt(&out,",\"levels\":%d,\"nodes\":%zu,\"files\":%zu,\"cut\":%s,\"hits\":[",
+               d.levels,d.n,nf,d.cut?"true":"false");
     size_t shown=0;
     for(size_t f=0;f<nf&&shown<(size_t)limit;f++){
         Found *file=&found[f]; char fh[33]; api_hex_id(&d.node[file->rank.file].id,fh);
-        api_buf_fmt(&out,&on,&ocap,"%s{\"path\":\"",shown?",":""); api_cw_str(&out,&on,&ocap,file->rank.path);
-        api_buf_fmt(&out,&on,&ocap,"\",\"file\":\"%s\",\"defines\":[",fh);
+        lp_buf_fmt(&out,"%s{\"path\":",shown?",":""); lp_json_str(&out,file->rank.path,strlen(file->rank.path));
+        lp_buf_fmt(&out,",\"file\":\"%s\",\"defines\":[",fh);
         int nk=0;
         for(size_t k=0;k<file->count;k++){
             FoDecl *decl=&file->declarations[k]; if(strcmp(decl->name,name)) continue;
             int duplicate=0;
             for(size_t j=0;j<k;j++) if(!strcmp(file->declarations[j].name,name)&&!strcmp(file->declarations[j].kind,decl->kind)) duplicate=1;
             if(duplicate) continue;
-            api_buf_fmt(&out,&on,&ocap,"%s\"",nk++?",":""); api_cw_str(&out,&on,&ocap,decl->kind); api_buf_add(&out,&on,&ocap,"\"",1);
+            if(nk++) lp_buf_byte(&out,',');
+            lp_json_str(&out,decl->kind,strlen(decl->kind));
         }
-        api_buf_fmt(&out,&on,&ocap,"],\"occurrences\":%d,\"at\":[",file->rank.occ);
+        lp_buf_fmt(&out,"],\"occurrences\":%d,\"at\":[",file->rank.occ);
         const char *at=file->text; int emitted=0;
         while(emitted<per&&(at=strstr(at,name))){
             size_t position=(size_t)(at-file->text),start=position,end=position+strlen(name);
@@ -419,20 +409,20 @@ void on_code_where(int c, const char *body) {
             if(holder>=0){start=file->declarations[holder].start;end=start+file->declarations[holder].length;}
             else {while(start&&file->text[start-1]!='\n')start--;while(end<file->length&&file->text[end]!='\n')end++;}
             size_t line=cw_lines(file->text,position),line0=cw_lines(file->text,start),line1=cw_lines(file->text,end)-(end>start&&file->text[end-1]=='\n');
-            api_buf_fmt(&out,&on,&ocap,"%s{\"line\":%zu,\"line0\":%zu,\"line1\":%zu,\"context\":\"",emitted?",":"",line,line0,line1);
+            lp_buf_fmt(&out,"%s{\"line\":%zu,\"line0\":%zu,\"line1\":%zu,\"context\":",emitted?",":"",line,line0,line1);
             size_t bytes=end-start; if(bytes>(size_t)context) bytes=(size_t)context;
             while(bytes&&((uint8_t)file->text[start+bytes]&0xc0)==0x80)bytes--;
-            char saved=file->text[start+bytes];file->text[start+bytes]=0;api_cw_str(&out,&on,&ocap,file->text+start);file->text[start+bytes]=saved;
-            api_buf_fmt(&out,&on,&ocap,"\",\"enclosing\":\"");
+            lp_json_str(&out,file->text+start,bytes);
+            lp_buf_cstr(&out,",\"enclosing\":");
             size_t head=strcspn(file->text+start,"\r\n");if(head>end-start)head=end-start;if(head>240)head=240;
             while(head&&((uint8_t)file->text[start+head]&0xc0)==0x80)head--;
-            saved=file->text[start+head];file->text[start+head]=0;api_cw_str(&out,&on,&ocap,file->text+start);file->text[start+head]=saved;
-            api_buf_add(&out,&on,&ocap,"\"}",2);emitted++;at+=strlen(name);
+            lp_json_str(&out,file->text+start,head);
+            lp_buf_byte(&out,'}');emitted++;at+=strlen(name);
         }
-        api_buf_add(&out,&on,&ocap,"]}",2);shown++;
+        lp_buf_cstr(&out,"]}");shown++;
     }
-    api_buf_fmt(&out,&on,&ocap,"],\"shown\":%zu,\"walk_ms\":%.3f,\"ms\":%.3f}",shown,walk_ms,(double)(api_nsec()-t0)/1e6);
+    lp_buf_fmt(&out,"],\"shown\":%zu,\"walk_ms\":%.3f,\"ms\":%.3f}",shown,walk_ms,(double)(os_monotonic_ns()-t0)/1e6);
     for(size_t f=0;f<nf;f++){fo_free(found[f].declarations,found[f].count);free(found[f].text);free(found[f].rank.path);}
     free(found);reader_free(rd);held_up_free(&d);
-    api_http(c,200,out?out:"{\"error\":\"memory\"}");free(out);
+    api_reply_buf(c,200,&out);
 }

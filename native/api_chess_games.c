@@ -109,11 +109,11 @@ static const TagPair *tag_of(const Load *L, const Game *g, const lp_id *name){
     return NULL;
 }
 static char *tag_text(const Load *L, const Game *g, const lp_id *name){ const TagPair *t = tag_of(L, g, name); return t ? reader_text(L->rd, &t->value, 512) : NULL; }
-static void emit_str(char **o, size_t *on, size_t *oc, const char *s){
-    if (!s) { api_buf_fmt(o, on, oc, "null"); return; } api_buf_fmt(o, on, oc, "\""); api_cw_str(o, on, oc, s); api_buf_fmt(o, on, oc, "\"");
+static void emit_str(lp_buf *o, const char *s){
+    lp_json_cstr(o, s);
 }
-static void emit_tag(char **o, size_t *on, size_t *oc, const Load *L, const Game *g, const char *key, const lp_id *name){
-    char *t = tag_text(L, g, name); api_buf_fmt(o, on, oc, ",\"%s\":", key); emit_str(o, on, oc, t); free(t);
+static void emit_tag(lp_buf *o, const Load *L, const Game *g, const char *key, const lp_id *name){
+    char *t = tag_text(L, g, name); lp_buf_fmt(o, ",\"%s\":", key); emit_str(o, t); free(t);
 }
 
 /* ---- a line written again: SAN, UCI and FEN of each ply, by the Engine's rules */
@@ -154,18 +154,19 @@ static void replay_line(const Verts *line, const lp_id *one, const char *fen, co
     }
     r->complete = r->n == moves;
 }
-static void emit_movetext(char **o, size_t *on, size_t *oc, const Replay *r, const char *result){
-    char *s = NULL; size_t sn = 0, sc = 0; int full = 1, black_first = 0;
+static void emit_movetext(lp_buf *o, const Replay *r, const char *result){
+    lp_buf s = { 0 }; int full = 1, black_first = 0;
     { const char *f = r->start; for (int k = 0; k < 5 && f; k++) { f = strchr(f, ' '); if (f) f++; } if (f) full = atoi(f); if (full < 1) full = 1;
       const char *side = strchr(r->start, ' '); black_first = side && side[1] == 'b'; }
     for (size_t i = 0; i < r->n; i++) {
-        if (r->p[i].white_moved) api_buf_fmt(&s, &sn, &sc, "%s%d. ", i ? " " : "", full);
-        else if (i == 0 && black_first) api_buf_fmt(&s, &sn, &sc, "%d... ", full);
-        else api_buf_fmt(&s, &sn, &sc, " ");
-        api_buf_fmt(&s, &sn, &sc, "%s", r->p[i].san); if (!r->p[i].white_moved) full++;
+        if (r->p[i].white_moved) lp_buf_fmt(&s, "%s%d. ", i ? " " : "", full);
+        else if (i == 0 && black_first) lp_buf_fmt(&s, "%d... ", full);
+        else lp_buf_byte(&s, ' ');
+        lp_buf_cstr(&s, r->p[i].san); if (!r->p[i].white_moved) full++;
     }
-    if (result && *result) api_buf_fmt(&s, &sn, &sc, "%s%s", sn ? " " : "", result);
-    emit_str(o, on, oc, s ? s : ""); free(s);
+    if (result && *result) lp_buf_fmt(&s, "%s%s", s.n ? " " : "", result);
+    lp_buf_byte(&s, 0);
+    emit_str(o, (const char *)s.b); lp_buf_free(&s);
 }
 /* The page's lines, one level: id -> vertices. */
 static void lines_read(PGconn *pg, const Load *L, const size_t *page, size_t n, Paths *p){
@@ -206,22 +207,22 @@ static void clocks_read(PGconn *pg, Reader *rd, const Game *g, const Verts *line
 }
 
 /* A row: the record, its line, the players, the result and the tags a list shows, and its movetext. */
-static void emit_row(char **o, size_t *on, size_t *oc, const Load *L, const Paths *lines, const Game *g, int player){
-    char hex[33]; api_hex_id(&g->rec, hex); api_buf_fmt(o, on, oc, "{\"id\":\"%s\",\"line\":", hex);
-    if (g->has_line) { api_hex_id(&g->line, hex); api_buf_fmt(o, on, oc, "\"%s\"", hex); } else api_buf_fmt(o, on, oc, "null");
-    emit_tag(o, on, oc, L, g, "white", &T_WHITE); emit_tag(o, on, oc, L, g, "black", &T_BLACK);
-    char *result = tag_text(L, g, &T_RESULT); api_buf_fmt(o, on, oc, ",\"result\":"); emit_str(o, on, oc, result);
-    emit_tag(o, on, oc, L, g, "date", &T_DATE); emit_tag(o, on, oc, L, g, "event", &T_EVENT); emit_tag(o, on, oc, L, g, "eco", &T_ECO);
+static void emit_row(lp_buf *o, const Load *L, const Paths *lines, const Game *g, int player){
+    char hex[33]; api_hex_id(&g->rec, hex); lp_buf_fmt(o, "{\"id\":\"%s\",\"line\":", hex);
+    if (g->has_line) { api_hex_id(&g->line, hex); lp_buf_fmt(o, "\"%s\"", hex); } else lp_buf_cstr(o, "null");
+    emit_tag(o, L, g, "white", &T_WHITE); emit_tag(o, L, g, "black", &T_BLACK);
+    char *result = tag_text(L, g, &T_RESULT); lp_buf_cstr(o, ",\"result\":"); emit_str(o, result);
+    emit_tag(o, L, g, "date", &T_DATE); emit_tag(o, L, g, "event", &T_EVENT); emit_tag(o, L, g, "eco", &T_ECO);
     if (player) {
         int w = g->side == 0; char *opp = tag_text(L, g, w ? &T_BLACK : &T_WHITE);
-        api_buf_fmt(o, on, oc, ",\"as_white\":%s,\"opponent\":", w ? "true" : "false"); emit_str(o, on, oc, opp); free(opp);
+        lp_buf_fmt(o, ",\"as_white\":%s,\"opponent\":", w ? "true" : "false"); emit_str(o, opp); free(opp);
         int outcome = -1; if (result) { if (!strcmp(result, "1/2-1/2")) outcome = 1; else if (!strcmp(result, "1-0")) outcome = w ? 2 : 0; else if (!strcmp(result, "0-1")) outcome = w ? 0 : 2; }
-        if (outcome >= 0) api_buf_fmt(o, on, oc, ",\"outcome\":%d", outcome); else api_buf_fmt(o, on, oc, ",\"outcome\":null");
+        if (outcome >= 0) lp_buf_fmt(o, ",\"outcome\":%d", outcome); else lp_buf_cstr(o, ",\"outcome\":null");
     }
-    api_buf_fmt(o, on, oc, ",\"movetext\":");
-    if (g->replays) { Replay r; game_replay(L, lines, g, &r); if (r.complete) emit_movetext(o, on, oc, &r, result); else api_buf_fmt(o, on, oc, "null"); free(r.p); }
-    else api_buf_fmt(o, on, oc, "null");
-    api_buf_fmt(o, on, oc, "}"); free(result);
+    lp_buf_cstr(o, ",\"movetext\":");
+    if (g->replays) { Replay r; game_replay(L, lines, g, &r); if (r.complete) emit_movetext(o, &r, result); else lp_buf_cstr(o, "null"); free(r.p); }
+    else lp_buf_cstr(o, "null");
+    lp_buf_byte(o, '}'); free(result);
 }
 
 /* Newest first: the Date tag as written (PGN's YYYY.MM.DD sorts as text), then the witness's own order, then the ID. */
@@ -243,42 +244,61 @@ static Game *game_add(Load *L, const lp_id *rec){
     if (L->n == L->cap) { L->cap = L->cap ? L->cap * 2 : 256; L->g = realloc(L->g, sizeof(Game) * L->cap); }
     Game *g = &L->g[L->n++]; memset(g, 0, sizeof *g); g->rec = *rec; g->side = -1; return g;
 }
-static void emit_page(char **o, size_t *on, size_t *oc, PGconn *pg, const Load *L, const size_t *idx, int offset, int limit, int player){
+static void emit_page(lp_buf *o, PGconn *pg, const Load *L, const size_t *idx, int offset, int limit, int player){
     size_t from = (size_t)offset < L->n ? (size_t)offset : L->n, to = from + (size_t)limit < L->n ? from + (size_t)limit : L->n;
     Paths lines; lines_read(pg, L, idx + from, to - from, &lines);
-    api_buf_fmt(o, on, oc, "[");
-    for (size_t i = from; i < to; i++) { if (i > from) api_buf_fmt(o, on, oc, ","); emit_row(o, on, oc, L, &lines, &L->g[idx[i]], player); }
-    api_buf_fmt(o, on, oc, "]"); paths_free(&lines);
+    lp_buf_byte(o, '[');
+    for (size_t i = from; i < to; i++) { if (i > from) lp_buf_byte(o, ','); emit_row(o, L, &lines, &L->g[idx[i]], player); }
+    lp_buf_byte(o, ']'); paths_free(&lines);
 }
 
-/* POST /v1/chess_players {search, limit, offset}: {search, offset, total, players: [{name, games, games_complete}]}. The
- * names in a White or Black tag that are the text searched, or hold it (a word of a name, "Carlsen" of "Carlsen,
- * Magnus"); games: the tag lists naming it, the games recorded with it, at most CHESS_CAP a colour. */
+/* POST /v1/chess_players {search, limit, offset}: {search, offset, total, players: [{name, games, games_complete}]}.
+ * When search is given, finds names in a White or Black tag that equal or hold it (a word of a name, "Carlsen" of
+ * "Carlsen, Magnus"); when search is empty or omitted, reads the [White|Black, name] pairs directly (endpoint=1) so
+ * the full recorded player roster can be browsed most-games-first. */
 void on_chess_players(int c, const char *body){
-    char search[256]; int limit = 25, offset = 0; api_jint(body, "limit", &limit); api_jint(body, "offset", &offset);
+    char search[256] = ""; int limit = 25, offset = 0; api_jint(body, "limit", &limit); api_jint(body, "offset", &offset);
     limit = clamp(limit, 1, PAGE_MAX); offset = clamp(offset, 0, 1 << 30);
-    if (!api_jstr(body, "search", search, sizeof search) || !*search) { api_http(c, 200, "{\"error\":\"search: the name, or a word of it\"}"); return; }
+    (void)api_jstr(body, "search", search, sizeof search);
     if (!tag_ids()) { api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
-    lp_id sid; if (!lp_text_id(TX, search, strlen(search), &sid)) { api_http(c, 200, "{\"error\":\"search: no text\"}"); return; }
     PGconn *pg = api_db(); if (!pg) { unavailable(c); return; }
-    /* 1: the text itself, and every text that holds it */
-    lp_vec(lp_id) values = { 0 }; lp_push(&values, sid);
-    { int nh = 0, hub[2] = { 0 }; Hold *h = holds_capped(pg, &sid, 1, SEARCH_CAP, 0, 2, hub, &nh);
-      lp_idmap *once = lp_idmap_new(); lp_idmap_put(once, &sid, NULL);
-      for (int k = 0; k < nh; k++) { bool fresh; lp_idmap_put(once, &h[k].entity, &fresh); if (fresh) lp_push(&values, h[k].entity); }
-      lp_idmap_free(once); holds_free(h, nh); }
-    /* 2: the [White|Black, value] pairs among their holders */
     typedef struct { lp_id value, pair[2]; uint8_t has[2]; } Named;
-    lp_vec(Named) names = { 0 }; lp_vec(lp_id) pairs = { 0 };
-    { int nh = 0, *hub = calloc(values.n * 2, sizeof(int)); Hold *h = holds_capped(pg, values.v, (int)values.n, NAME_CAP, 0, 2, hub, &nh);
-      lp_idmap *at = lp_idmap_sized(sizeof(int));
-      for (int k = 0; k < nh; k++) { lp_id part[3]; if (h[k].src < 0 || (size_t)h[k].src >= values.n || lp_path_ids(h[k].path, (size_t)h[k].path_len, part, 3) != 2) continue;
-          int side = lp_id_eq(&part[0], &T_WHITE) ? 0 : lp_id_eq(&part[0], &T_BLACK) ? 1 : -1;
-          if (side < 0 || !lp_id_eq(&part[1], &values.v[h[k].src])) continue;
-          bool fresh; size_t s = lp_idmap_put(at, &part[1], &fresh);
-          if (fresh) { *(int *)lp_idmap_at(at, s) = (int)names.n; Named *n = lp_vec_add(&names); n->value = part[1]; }
-          Named *n = &names.v[*(int *)lp_idmap_at(at, s)]; if (!n->has[side]) { n->pair[side] = h[k].entity; n->has[side] = 1; } }
-      lp_idmap_free(at); holds_free(h, nh); free(hub); }
+    lp_vec(Named) names = { 0 }; lp_vec(lp_id) pairs = { 0 }; lp_vec(lp_id) values = { 0 };
+    if (*search) {
+        lp_id sid; if (!lp_text_id(TX, search, strlen(search), &sid)) { api_http(c, 200, "{\"error\":\"search: no text\"}"); return; }
+        /* 1: the text itself, and every text that holds it */
+        lp_push(&values, sid);
+        { int nh = 0, hub[2] = { 0 }; Hold *h = holds_capped(pg, &sid, 1, SEARCH_CAP, 0, 2, hub, &nh);
+          lp_idmap *once = lp_idmap_new(); lp_idmap_put(once, &sid, NULL);
+          for (int k = 0; k < nh; k++) { bool fresh; lp_idmap_put(once, &h[k].entity, &fresh); if (fresh) lp_push(&values, h[k].entity); }
+          lp_idmap_free(once); holds_free(h, nh); }
+        /* 2: the [White|Black, value] pairs among their holders */
+        { int nh = 0, *hub = calloc(values.n * 2, sizeof(int)); Hold *h = holds_capped(pg, values.v, (int)values.n, NAME_CAP, 0, 2, hub, &nh);
+          lp_idmap *at = lp_idmap_sized(sizeof(int));
+          for (int k = 0; k < nh; k++) { lp_id part[3]; if (h[k].src < 0 || (size_t)h[k].src >= values.n || lp_path_ids(h[k].path, (size_t)h[k].path_len, part, 3) != 2) continue;
+              int side = lp_id_eq(&part[0], &T_WHITE) ? 0 : lp_id_eq(&part[0], &T_BLACK) ? 1 : -1;
+              if (side < 0 || !lp_id_eq(&part[1], &values.v[h[k].src])) continue;
+              bool fresh; size_t s = lp_idmap_put(at, &part[1], &fresh);
+              if (fresh) { *(int *)lp_idmap_at(at, s) = (int)names.n; Named *n = lp_vec_add(&names); n->value = part[1]; }
+              Named *n = &names.v[*(int *)lp_idmap_at(at, s)]; if (!n->has[side]) { n->pair[side] = h[k].entity; n->has[side] = 1; } }
+          lp_idmap_free(at); holds_free(h, nh); free(hub); }
+    } else {
+        /* Unfiltered roster: read 2-tuples whose first constituent is T_WHITE or T_BLACK via GIN endpoint=1. */
+        const lp_id wb[2] = { T_WHITE, T_BLACK };
+        int nh = 0, hub[4] = { 0 };
+        Hold *h = holds_endpoint(pg, wb, 2, CHESS_CAP, 0, 2, 1, hub, &nh);
+        lp_idmap *at = lp_idmap_sized(sizeof(int));
+        for (int k = 0; k < nh; k++) {
+            lp_id part[3];
+            if (h[k].src < 0 || h[k].src > 1 || h[k].claim || lp_path_ids(h[k].path, (size_t)h[k].path_len, part, 3) != 2) continue;
+            int side = lp_id_eq(&part[0], &T_WHITE) ? 0 : lp_id_eq(&part[0], &T_BLACK) ? 1 : -1;
+            if (side < 0) continue;
+            bool fresh; size_t s = lp_idmap_put(at, &part[1], &fresh);
+            if (fresh) { *(int *)lp_idmap_at(at, s) = (int)names.n; Named *n = lp_vec_add(&names); n->value = part[1]; }
+            Named *n = &names.v[*(int *)lp_idmap_at(at, s)]; if (!n->has[side]) { n->pair[side] = h[k].entity; n->has[side] = 1; }
+        }
+        lp_idmap_free(at); holds_free(h, nh);
+    }
     /* 3: the tag lists that hold each pair, counted */
     long *games = calloc(names.n ? names.n : 1, sizeof(long)); uint8_t *capped = calloc(names.n ? names.n : 1, 1);
     int *owner = malloc(sizeof(int) * (names.n * 2 + 1));
@@ -295,13 +315,13 @@ void on_chess_players(int c, const char *body){
     size_t from = (size_t)offset < names.n ? (size_t)offset : names.n, to = from + (size_t)limit < names.n ? from + (size_t)limit : names.n;
     Reader *rd = reader_new(pg); lp_vec(lp_id) shown = { 0 }; for (size_t i = from; i < to; i++) lp_push(&shown, names.v[idx[i]].value);
     if (shown.n) reader_prefetch(rd, shown.v, shown.n, 512);
-    char *o = NULL; size_t on = 0, oc = 0; api_buf_fmt(&o, &on, &oc, "{\"search\":"); emit_str(&o, &on, &oc, search);
-    api_buf_fmt(&o, &on, &oc, ",\"offset\":%d,\"total\":%zu,\"players\":[", offset, names.n);
+    lp_buf o = { 0 }; lp_buf_cstr(&o, "{\"search\":"); emit_str(&o, search);
+    lp_buf_fmt(&o, ",\"offset\":%d,\"total\":%zu,\"players\":[", offset, names.n);
     for (size_t i = from; i < to; i++) { const Named *n = &names.v[idx[i]]; char *t = reader_text(rd, &n->value, 512);
-        api_buf_fmt(&o, &on, &oc, "%s{\"name\":", i > from ? "," : ""); emit_str(&o, &on, &oc, t ? t : ""); free(t);
-        api_buf_fmt(&o, &on, &oc, ",\"games\":%ld,\"games_complete\":%s}", games[idx[i]], capped[idx[i]] ? "false" : "true"); }
-    api_buf_fmt(&o, &on, &oc, "]}");
-    api_http(c, 200, o ? o : "{\"error\":\"memory\"}"); free(o);
+        lp_buf_fmt(&o, "%s{\"name\":", i > from ? "," : ""); emit_str(&o, t ? t : ""); free(t);
+        lp_buf_fmt(&o, ",\"games\":%ld,\"games_complete\":%s}", games[idx[i]], capped[idx[i]] ? "false" : "true"); }
+    lp_buf_cstr(&o, "]}");
+    api_reply_buf(c, 200, &o);
     reader_free(rd); lp_vec_free(&shown); free(idx); free(owner); free(games); free(capped); lp_vec_free(&pairs); lp_vec_free(&names); lp_vec_free(&values);
 }
 
@@ -319,10 +339,10 @@ static void records_of_tags(PGconn *pg, const lp_id *tags, const int *side, size
     lp_idmap_free(once); holds_free(h, nh); free(hub);
 }
 typedef struct { long games, wins, draws, losses, unscored; } Record;
-static void emit_record(char **o, size_t *on, size_t *oc, const char *key, const Record *r){
+static void emit_record(lp_buf *o, const char *key, const Record *r){
     long scored = r->wins + r->draws + r->losses;
-    api_buf_fmt(o, on, oc, ",\"%s\":{\"games\":%ld,\"wins\":%ld,\"draws\":%ld,\"losses\":%ld,\"unscored\":%ld,\"score\":", key, r->games, r->wins, r->draws, r->losses, r->unscored);
-    if (scored) api_buf_fmt(o, on, oc, "%.6g}", (double)r->wins + r->draws / 2.0); else api_buf_fmt(o, on, oc, "null}");
+    lp_buf_fmt(o, ",\"%s\":{\"games\":%ld,\"wins\":%ld,\"draws\":%ld,\"losses\":%ld,\"unscored\":%ld,\"score\":", key, r->games, r->wins, r->draws, r->losses, r->unscored);
+    if (scored) lp_buf_fmt(o, "%.6g}", (double)r->wins + r->draws / 2.0); else lp_buf_cstr(o, "null}");
 }
 /* POST /v1/chess_player {name, limit, offset}: {name, overall, as_white, as_black, total, offset, games: [...]}, a
  * record {games, wins, draws, losses, unscored, score} over the games naming name as White or Black, score the wins and
@@ -361,26 +381,26 @@ void on_chess_player(int c, const char *body){
             else if (r && (!strcmp(r, "1-0") || !strcmp(r, "0-1"))) { if ((r[0] == '1') == (s == 0)) x[j]->wins++; else x[j]->losses++; }
             else x[j]->unscored++; }
         free(r); }
-    size_t *idx = ordered(&L); char *o = NULL; size_t on = 0, oc = 0;
-    api_buf_fmt(&o, &on, &oc, "{\"name\":"); emit_str(&o, &on, &oc, name);
-    emit_record(&o, &on, &oc, "overall", &all); emit_record(&o, &on, &oc, "as_white", &by[0]); emit_record(&o, &on, &oc, "as_black", &by[1]);
+    size_t *idx = ordered(&L); lp_buf o = { 0 };
+    lp_buf_cstr(&o, "{\"name\":"); emit_str(&o, name);
+    emit_record(&o, "overall", &all); emit_record(&o, "as_white", &by[0]); emit_record(&o, "as_black", &by[1]);
     /* the ratings the player's own Elo tag wrote, highest first, and the players met, most games first then the name's ID */
     for (size_t i = 1; i < elos.n; i++) { Elo x = elos.v[i]; size_t j = i; while (j && elos.v[j - 1].rating < x.rating) { elos.v[j] = elos.v[j - 1]; j--; } elos.v[j] = x; }
     for (size_t i = 1; i < rivals.n; i++) { Rival x = rivals.v[i]; size_t j = i;
         while (j && (rivals.v[j - 1].r.games < x.r.games || (rivals.v[j - 1].r.games == x.r.games && memcmp(&rivals.v[j - 1].name, &x.name, 16) > 0))) { rivals.v[j] = rivals.v[j - 1]; j--; }
         rivals.v[j] = x; }
-    if (elos.n) api_buf_fmt(&o, &on, &oc, ",\"peak_rating\":%d", elos.v[0].rating); else api_buf_fmt(&o, &on, &oc, ",\"peak_rating\":null");
-    api_buf_fmt(&o, &on, &oc, ",\"ratings\":[");
-    for (size_t i = 0; i < elos.n; i++) api_buf_fmt(&o, &on, &oc, "%s{\"rating\":%d,\"games\":%ld}", i ? "," : "", elos.v[i].rating, elos.v[i].games);
-    api_buf_fmt(&o, &on, &oc, "],\"opponents_total\":%zu,\"opponents\":[", rivals.n);
+    if (elos.n) lp_buf_fmt(&o, ",\"peak_rating\":%d", elos.v[0].rating); else lp_buf_cstr(&o, ",\"peak_rating\":null");
+    lp_buf_cstr(&o, ",\"ratings\":[");
+    for (size_t i = 0; i < elos.n; i++) lp_buf_fmt(&o, "%s{\"rating\":%d,\"games\":%ld}", i ? "," : "", elos.v[i].rating, elos.v[i].games);
+    lp_buf_fmt(&o, "],\"opponents_total\":%zu,\"opponents\":[", rivals.n);
     for (size_t i = 0; i < rivals.n && i < (size_t)opponents; i++) { char *t = reader_text(L.rd, &rivals.v[i].name, 512);
-        api_buf_fmt(&o, &on, &oc, "%s{\"name\":", i ? "," : ""); emit_str(&o, &on, &oc, t ? t : ""); free(t);
+        lp_buf_fmt(&o, "%s{\"name\":", i ? "," : ""); emit_str(&o, t ? t : ""); free(t);
         const Record *rr = &rivals.v[i].r; long scored = rr->wins + rr->draws + rr->losses;
-        api_buf_fmt(&o, &on, &oc, ",\"games\":%ld,\"wins\":%ld,\"draws\":%ld,\"losses\":%ld,\"unscored\":%ld,\"score\":", rr->games, rr->wins, rr->draws, rr->losses, rr->unscored);
-        if (scored) api_buf_fmt(&o, &on, &oc, "%.6g}", (double)rr->wins + rr->draws / 2.0); else api_buf_fmt(&o, &on, &oc, "null}"); }
-    api_buf_fmt(&o, &on, &oc, "]");
-    api_buf_fmt(&o, &on, &oc, ",\"total\":%zu,\"offset\":%d,\"games\":", L.n, offset); emit_page(&o, &on, &oc, pg, &L, idx, offset, limit, 1);
-    api_buf_fmt(&o, &on, &oc, "}"); api_http(c, 200, o ? o : "{\"error\":\"memory\"}"); free(o);
+        lp_buf_fmt(&o, ",\"games\":%ld,\"wins\":%ld,\"draws\":%ld,\"losses\":%ld,\"unscored\":%ld,\"score\":", rr->games, rr->wins, rr->draws, rr->losses, rr->unscored);
+        if (scored) lp_buf_fmt(&o, "%.6g}", (double)rr->wins + rr->draws / 2.0); else lp_buf_cstr(&o, "null}"); }
+    lp_buf_cstr(&o, "]");
+    lp_buf_fmt(&o, ",\"total\":%zu,\"offset\":%d,\"games\":", L.n, offset); emit_page(&o, pg, &L, idx, offset, limit, 1);
+    lp_buf_byte(&o, '}'); api_reply_buf(c, 200, &o);
     free(idx); load_free(&L); lp_vec_free(&tags); lp_vec_free(&side); lp_vec_free(&rivals); lp_vec_free(&elos); lp_idmap_free(rival_at);
 }
 
@@ -428,10 +448,10 @@ void on_chess_games(int c, const char *body){
           Game *g = game_add(&L, claims ? &v->id[0] : &held.v[i]); g->order = (int64_t)i; }
       paths_free(&hp); lp_vec_free(&held); }
     games_load(pg, &L);
-    size_t *idx = ordered(&L); char *o = NULL; size_t on = 0, oc = 0;
-    api_buf_fmt(&o, &on, &oc, "{\"witness\":"); emit_str(&o, &on, &oc, witness);
-    api_buf_fmt(&o, &on, &oc, ",\"total\":%zu,\"offset\":%d,\"games\":", L.n, offset); emit_page(&o, &on, &oc, pg, &L, idx, offset, limit, 0);
-    api_buf_fmt(&o, &on, &oc, "}"); api_http(c, 200, o ? o : "{\"error\":\"memory\"}"); free(o);
+    size_t *idx = ordered(&L); lp_buf o = { 0 };
+    lp_buf_cstr(&o, "{\"witness\":"); emit_str(&o, witness);
+    lp_buf_fmt(&o, ",\"total\":%zu,\"offset\":%d,\"games\":", L.n, offset); emit_page(&o, pg, &L, idx, offset, limit, 0);
+    lp_buf_byte(&o, '}'); api_reply_buf(c, 200, &o);
     free(idx); load_free(&L); lp_vec_free(&trunks);
 }
 
@@ -447,24 +467,24 @@ void on_chess_game(int c, const char *body){
     { int nh = 0; Hold *h = paths_of(pg, &id, 1, &nh); holds_free(h, nh); if (!nh) { api_http(c, 200, "{\"error\":\"id: no record\"}"); return; } }
     Load L = { 0 }; L.rd = reader_new(pg); Game *g = game_add(&L, &id); games_load(pg, &L); g = &L.g[0];
     size_t one = 0; Paths lines; lines_read(pg, &L, &one, 1, &lines);
-    char *o = NULL; size_t on = 0, oc = 0; char hex[33];
-    api_hex_id(&g->rec, hex); api_buf_fmt(&o, &on, &oc, "{\"id\":\"%s\",\"line\":", hex);
-    if (g->has_line) { api_hex_id(&g->line, hex); api_buf_fmt(&o, &on, &oc, "\"%s\"", hex); } else api_buf_fmt(&o, &on, &oc, "null");
-    api_buf_fmt(&o, &on, &oc, ",\"tags\":[");
+    lp_buf o = { 0 }; char hex[33];
+    api_hex_id(&g->rec, hex); lp_buf_fmt(&o, "{\"id\":\"%s\",\"line\":", hex);
+    if (g->has_line) { api_hex_id(&g->line, hex); lp_buf_fmt(&o, "\"%s\"", hex); } else lp_buf_cstr(&o, "null");
+    lp_buf_cstr(&o, ",\"tags\":[");
     for (size_t i = 0; i < g->nt; i++) { const TagPair *t = &L.pairs.v[g->t0 + i]; char *nm = reader_text(L.rd, &t->name, 512), *v = t->has_value ? reader_text(L.rd, &t->value, 4096) : NULL;
-        api_buf_fmt(&o, &on, &oc, "%s{\"name\":", i ? "," : ""); emit_str(&o, &on, &oc, nm ? nm : ""); api_buf_fmt(&o, &on, &oc, ",\"value\":"); emit_str(&o, &on, &oc, v); api_buf_fmt(&o, &on, &oc, "}"); free(nm); free(v); }
-    api_buf_fmt(&o, &on, &oc, "]");
-    emit_tag(&o, &on, &oc, &L, g, "white", &T_WHITE); emit_tag(&o, &on, &oc, &L, g, "black", &T_BLACK);
-    char *result = tag_text(&L, g, &T_RESULT); api_buf_fmt(&o, &on, &oc, ",\"result\":"); emit_str(&o, &on, &oc, result);
-    emit_tag(&o, &on, &oc, &L, g, "date", &T_DATE); emit_tag(&o, &on, &oc, &L, g, "event", &T_EVENT); emit_tag(&o, &on, &oc, &L, g, "eco", &T_ECO);
+        lp_buf_fmt(&o, "%s{\"name\":", i ? "," : ""); emit_str(&o, nm ? nm : ""); lp_buf_cstr(&o, ",\"value\":"); emit_str(&o, v); lp_buf_byte(&o, '}'); free(nm); free(v); }
+    lp_buf_byte(&o, ']');
+    emit_tag(&o, &L, g, "white", &T_WHITE); emit_tag(&o, &L, g, "black", &T_BLACK);
+    char *result = tag_text(&L, g, &T_RESULT); lp_buf_cstr(&o, ",\"result\":"); emit_str(&o, result);
+    emit_tag(&o, &L, g, "date", &T_DATE); emit_tag(&o, &L, g, "event", &T_EVENT); emit_tag(&o, &L, g, "eco", &T_ECO);
     Replay r = { 0 }; if (g->replays) game_replay(&L, &lines, g, &r);
     char **clock = calloc(r.n ? r.n : 1, sizeof(char *)); if (r.complete) clocks_read(pg, L.rd, g, line_verts(&lines, g), clock, r.n);
-    api_buf_fmt(&o, &on, &oc, ",\"start_fen\":"); emit_str(&o, &on, &oc, *r.start ? r.start : NULL);
-    api_buf_fmt(&o, &on, &oc, ",\"movetext\":"); if (r.complete) emit_movetext(&o, &on, &oc, &r, result); else api_buf_fmt(&o, &on, &oc, "null");
-    api_buf_fmt(&o, &on, &oc, ",\"complete\":%s,\"plies\":[", r.complete ? "true" : "false");
+    lp_buf_cstr(&o, ",\"start_fen\":"); emit_str(&o, *r.start ? r.start : NULL);
+    lp_buf_cstr(&o, ",\"movetext\":"); if (r.complete) emit_movetext(&o, &r, result); else lp_buf_cstr(&o, "null");
+    lp_buf_fmt(&o, ",\"complete\":%s,\"plies\":[", r.complete ? "true" : "false");
     for (size_t i = 0; i < r.n; i++) { const Ply *p = &r.p[i]; api_hex_id(&p->position, hex);
-        api_buf_fmt(&o, &on, &oc, "%s{\"ply\":%zu,\"san\":\"%s\",\"uci\":\"%s\",\"fen\":\"%s\",\"white_moved\":%s,\"position\":\"%s\",\"clock\":", i ? "," : "", i + 1, p->san, p->uci, p->fen, p->white_moved ? "true" : "false", hex);
-        emit_str(&o, &on, &oc, clock[i]); api_buf_fmt(&o, &on, &oc, "}"); free(clock[i]); }
-    api_buf_fmt(&o, &on, &oc, "]}"); api_http(c, 200, o ? o : "{\"error\":\"memory\"}"); free(o);
+        lp_buf_fmt(&o, "%s{\"ply\":%zu,\"san\":\"%s\",\"uci\":\"%s\",\"fen\":\"%s\",\"white_moved\":%s,\"position\":\"%s\",\"clock\":", i ? "," : "", i + 1, p->san, p->uci, p->fen, p->white_moved ? "true" : "false", hex);
+        emit_str(&o, clock[i]); lp_buf_byte(&o, '}'); free(clock[i]); }
+    lp_buf_cstr(&o, "]}"); api_reply_buf(c, 200, &o);
     free(clock); free(r.p); free(result); paths_free(&lines); load_free(&L);
 }
