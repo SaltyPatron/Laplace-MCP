@@ -8,6 +8,9 @@ project(LaplaceMCP VERSION 0.1.0 LANGUAGES C CXX ASM)
 # the installed Laplace-Engine package (find_package(LaplaceEngine); LaplaceEngine_DIR), which also names the program
 # the routes run; no Engine source is compiled here.
 set(CMAKE_C_STANDARD 17)
+if(UNIX)
+  add_compile_definitions(_GNU_SOURCE)
+endif()
 find_package(LaplaceNative CONFIG REQUIRED)
 find_package(OpenMP REQUIRED)
 
