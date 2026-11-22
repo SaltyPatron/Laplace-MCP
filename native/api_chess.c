@@ -45,23 +45,62 @@ static const Named *named_of(const Book *b, const lp_id *position){
     int64_t slot = lp_idmap_find(b->at, position); return slot < 0 ? NULL : &b->named[*(int *)lp_idmap_at(b->at, (size_t)slot)];
 }
 
+/* Extract a pure board-state trajectory [P0, P1, ..., Pn] (n >= 2, said == 0 on every vertex, no Tier-0 leaf). */
+static int line_run_of(const uint8_t *ewkb, size_t len, lp_id **out_ids){
+    *out_ids = NULL;
+    size_t nv = lp_path_vertices(ewkb, len, NULL, 0);
+    if (!nv) return 0;
+    lp_vertex *vx = malloc(sizeof(lp_vertex) * nv);
+    lp_path_vertices(ewkb, len, vx, nv);
+    size_t total = 0;
+    for (size_t i = 0; i < nv; i++) {
+        if (vx[i].said != 0 || lp_tier0_codepoint(T0, &vx[i].id) >= 0) { free(vx); return 0; }
+        total += vx[i].run ? vx[i].run : 1;
+    }
+    if (total < 2 || total > INT_MAX) { free(vx); return 0; }
+    lp_id *ids = malloc(sizeof(lp_id) * total);
+    size_t at = 0;
+    for (size_t i = 0; i < nv; i++) {
+        uint32_t run = vx[i].run ? vx[i].run : 1;
+        for (uint32_t k = 0; k < run; k++) ids[at++] = vx[i].id;
+    }
+    free(vx);
+    *out_ids = ids;
+    return (int)total;
+}
+static int is_position_path(const uint8_t *ewkb, size_t len){
+    lp_id part[8];
+    size_t n = lp_path_ids(ewkb, len, part, 8);
+    if (n < 4 || n > 7) return 0;
+    int64_t side = lp_tier0_codepoint(T0, &part[1]);
+    return (side == 'w' || side == 'b') && lp_tier0_codepoint(T0, &part[0]) < 0;
+}
+
 /* keys: the positions asked about. routes 1 reads the lines through them; 0 their own names alone (a list of games).
  * exclude: a line that is not evidence of a book (the game's own, when it is recorded), or NULL. */
 static int book_read(PGconn *pg, const lp_id *keys, int nkeys, int routes, const lp_id *exclude, Book *b){
-    memset(b, 0, sizeof *b); lp_id name_predicate, eco_predicate;
+    memset(b, 0, sizeof *b); lp_id name_predicate, eco_predicate, start_pos;
     if (!predicates(&name_predicate, &eco_predicate)) return 0;
+    { Bd b0; lp_chess_board_start(&b0); lp_chess_id_position(&b0, &start_pos); }
     b->in_book = calloc((size_t)(nkeys ? nkeys : 1), 1); b->at = lp_idmap_sized(sizeof(int)); b->rd = reader_new(pg);
     for (int i = 0; i < nkeys; i++) route_add(b, i, &keys[i], -1);                          /* each position names itself */
     if (routes && nkeys) {                                                                  /* 1, 2: the lines through each */
         int *hub = calloc((size_t)nkeys * 2, sizeof(int)), nh = 0;
-        Hold *h = holds_capped(pg, keys, nkeys, LINES_CAP, 0, 2, hub, &nh);
+        Hold *h = holds_capped(pg, keys, nkeys, LINES_CAP, 0, 3, hub, &nh);
         for (int i = 0; i < nkeys; i++) if (hub[2 * i + 1]) b->in_book[i] = 1;
         for (int k = 0; k < nh; k++) {
-            int key = h[k].src; if (key < 0 || key >= nkeys || h[k].claim || (exclude && lp_id_eq(&h[k].entity, exclude))) continue;
-            Run run = run_of(h[k].path, (size_t)h[k].path_len);
-            if (run.n & 1) for (int j = 0; j < run.n; j += 2) if (lp_id_eq(&run.id[j], &keys[key])) {        /* a line: positions at even places */
-                b->in_book[key] = 1; for (int p = 0; p <= j; p += 2) route_add(b, key, &run.id[p], p / 2); break; }
-            free(run.id);
+            int key = h[k].src;
+            if (key < 0 || key >= nkeys || (exclude && lp_id_eq(&h[k].entity, exclude))) continue;
+            lp_id *ids = NULL; int n = line_run_of(h[k].path, (size_t)h[k].path_len, &ids);
+            /* Accept non-claim trajectories [P0, P1, ..., Pn], and 1-ply [start_pos, P1] even when also a transition claim. */
+            if (n >= 2 && (!h[k].claim || (n == 2 && lp_id_eq(&ids[0], &start_pos)))) {
+                for (int j = 0; j < n; j++) if (lp_id_eq(&ids[j], &keys[key])) {
+                    b->in_book[key] = 1;
+                    for (int p = 0; p <= j; p++) route_add(b, key, &ids[p], p);
+                    break;
+                }
+            }
+            free(ids);
         }
         holds_free(h, nh); free(hub);
     }
@@ -94,19 +133,22 @@ static int book_read(PGconn *pg, const lp_id *keys, int nkeys, int routes, const
         }
     }
     lp_vec_free(&wanted);
-    /* 4: each named position's own line, the shortest recorded line ending in it. A one-move line [P0, M0, P1] is the
-     * same entity as the transition claim [P0, M0, P1] Engine chess.c states for that move, so it is held as a claim and
-     * is read here all the same. The other claims of a position ([P, "opening name", name], its ECO code, a NAG) end in
-     * their value, never in the position, so endpoint=2 (last vertex) selects lines ending in the position directly. */
+    /* 4: each named position's own line, the shortest recorded line from start_pos ending in it. A one-move line [P0, P1]
+     * is the same entity as the transition claim [P0, P1], so kinds=3 reads both claims and observations while requiring
+     * ids[0] == start_pos excludes midgame [P_{k-1}, P_k] transitions. */
     if (b->nnamed) {
         lp_id *positions = malloc(sizeof(lp_id) * b->nnamed); for (size_t i = 0; i < b->nnamed; i++) positions[i] = b->named[i].position;
         int nh = 0, *hub = calloc(b->nnamed * 2, sizeof(int));
         Hold *h = holds_endpoint(pg, positions, (int)b->nnamed, LINES_CAP, 0, 3, 2, hub, &nh);
         for (int k = 0; k < nh; k++) {
             if (h[k].src < 0 || (size_t)h[k].src >= b->nnamed) continue;
-            Named *n = &b->named[h[k].src]; Run run = run_of(h[k].path, (size_t)h[k].path_len);
-            if ((run.n & 1) && lp_id_eq(&run.id[run.n - 1], &n->position) && (!n->has_line || run.n / 2 < n->plies)) { n->line = h[k].entity; n->plies = run.n / 2; n->has_line = 1; }
-            free(run.id);
+            Named *n = &b->named[h[k].src];
+            lp_id *ids = NULL; int len = line_run_of(h[k].path, (size_t)h[k].path_len, &ids);
+            if (len >= 2 && lp_id_eq(&ids[0], &start_pos) && lp_id_eq(&ids[len - 1], &n->position)
+                && (!n->has_line || len - 1 < n->plies)) {
+                n->line = h[k].entity; n->plies = len - 1; n->has_line = 1;
+            }
+            free(ids);
         }
         holds_free(h, nh); free(hub); free(positions);
     }
@@ -202,9 +244,15 @@ static size_t game_positions(PGconn *pg, const char *pgn, const lp_id *line_id, 
         return n;
     }
     int np = 0; Hold *paths = paths_of(pg, line_id, 1, &np); size_t n = 0;
-    if (np > 0) { Run run = run_of(paths[0].path, (size_t)paths[0].path_len);
-        if (run.n & 1) for (int j = 0; j < run.n && n <= GAME_PLIES; j += 2) positions[n++] = run.id[j];
-        free(run.id); }
+    if (np > 0) {
+        if (is_position_path(paths[0].path, (size_t)paths[0].path_len)) {
+            positions[n++] = *line_id;
+        } else {
+            lp_id *ids = NULL; int len = line_run_of(paths[0].path, (size_t)paths[0].path_len, &ids);
+            for (int j = 0; j < len && n <= GAME_PLIES; j++) positions[n++] = ids[j];
+            free(ids);
+        }
+    }
     holds_free(paths, np); *line = *line_id; return n;
 }
 

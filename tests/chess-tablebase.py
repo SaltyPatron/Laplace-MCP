@@ -63,7 +63,7 @@ with contextlib.ExitStack() as resources:
     assert (read['position'], read['wdl'], read['dtz']) == ('ba7239ecffb26a06aca87a451b8fea07', 'loss', -12), read
     assert [(m['san'], m['wdl'], m['value']) for m in read['moves']] == [('Kg8', 'loss', -12)], read['moves']
     line = read['line']
-    assert (line['id'], line['result'], len(line['plies'])) == (cli_line[1], cli_line[2], int(cli_line[3])) == ('6554c79ccee9acdcb4aa4adfa1b4a6d3', '1-0', 12), (line, cli_line)
+    assert (line['id'], line['result'], len(line['plies'])) == (cli_line[1], cli_line[2], int(cli_line[3])) == ('b8deb32ea992db34bb6e765a027153a7', '1-0', 12), (line, cli_line)
     assert ' '.join(p['san'] for p in line['plies']) == cli_line[4], line
     assert [p['claim'] for p in line['plies']] == cli_claims, (line, cli_claims)
     assert read['moves'][0]['claim'] == line['plies'][0]['claim'], read

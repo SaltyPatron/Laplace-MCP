@@ -64,7 +64,9 @@ def main():
             assert [(p['name'], p['games']) for p in exact['players']] == [(LAPLACE, 3)], exact
             word = request('/v1/chess_players', {'search': CARLSEN})
             assert [(p['name'], p['games']) for p in word['players']] == [(CARLSEN_NAME, 2)], word
-            assert 'error' in request('/v1/chess_players', {})
+            roster = request('/v1/chess_players', {'limit': 200})
+            roster_map = {p['name']: p['games'] for p in roster['players']}
+            assert roster_map.get(LAPLACE) == 3 and roster_map.get(CARLSEN_NAME) == 2 and roster_map.get(NAKAMURA) == 1, roster
 
             # a player's record and games, newest first
             carlsen = request('/v1/chess_player', {'name': CARLSEN_NAME})
