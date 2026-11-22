@@ -144,8 +144,9 @@ static void decode_seat_verts(const Verts *sv, SeatInfo *out){
     if (!cp_is(&sv->id[ei], '-')) { out->elo = sv->id[ei]; out->has_elo = 1; }
 }
 
-/* Batch-hydrate Game structs (G -> meta -> seats -> seat_0/seat_1 -> composite date/tc/counters/fide) and prefetch texts. */
-static void games_load(PGconn *pg, Load *L){
+/* Batch-hydrate Game structs (G -> meta -> seats -> seat_0/seat_1 -> composite date/tc/counters/fide).
+ * mode 0: seat IDs only (unfiltered roster); mode 1: date/elo/variant for sorting & summaries; mode 2: full single-game tags. */
+static void games_load_mode(PGconn *pg, Load *L, int mode){
     if (!L->n) return;
     Paths p; paths_init(&p);
     lp_vec(lp_id) q = { 0 };
@@ -179,9 +180,9 @@ static void games_load(PGconn *pg, Load *L){
         if (!g->has_meta) continue;
         const Verts *mv = is_meta_verts(m0) ? m0 : m1;
         if (!cp_is(&mv->id[0], '-')) lp_push(&q, mv->id[0]);
-        if (!cp_is(&mv->id[2], '-') && mv->said[2] == LP_SAID_TUPLE) lp_push(&q, mv->id[2]);
-        if (!cp_is(&mv->id[7], '-') && mv->said[7] == LP_SAID_TUPLE) lp_push(&q, mv->id[7]);
-        if (!cp_is(&mv->id[9], '-') && mv->said[9] == LP_SAID_TUPLE) lp_push(&q, mv->id[9]);
+        if (mode >= 1 && !cp_is(&mv->id[2], '-') && mv->said[2] == LP_SAID_TUPLE) lp_push(&q, mv->id[2]);
+        if (mode >= 2 && !cp_is(&mv->id[7], '-') && mv->said[7] == LP_SAID_TUPLE) lp_push(&q, mv->id[7]);
+        if (mode >= 2 && !cp_is(&mv->id[9], '-') && mv->said[9] == LP_SAID_TUPLE) lp_push(&q, mv->id[9]);
     }
     paths_add_ids(pg, q.v, q.n, &p); q.n = 0;
 
@@ -195,22 +196,24 @@ static void games_load(PGconn *pg, Load *L){
     }
     paths_add_ids(pg, q.v, q.n, &p); q.n = 0;
 
-    for (size_t i = 0; i < L->n; i++) {
-        Game *g = &L->g[i];
-        if (!g->has_meta) continue;
-        const Verts *mv = path_at(&p, &g->meta);
-        if (!mv || mv->n != 10) continue;
-        const Verts *sv = !cp_is(&mv->id[0], '-') ? path_at(&p, &mv->id[0]) : NULL;
-        if (sv && sv->n == 2) {
-            for (int s = 0; s < 2; s++) {
-                const Verts *seat = path_at(&p, &sv->id[s]);
-                if (seat && seat->n == 3) lp_push(&q, seat->id[0]);
+    if (mode >= 2) {
+        for (size_t i = 0; i < L->n; i++) {
+            Game *g = &L->g[i];
+            if (!g->has_meta) continue;
+            const Verts *mv = path_at(&p, &g->meta);
+            if (!mv || mv->n != 10) continue;
+            const Verts *sv = !cp_is(&mv->id[0], '-') ? path_at(&p, &mv->id[0]) : NULL;
+            if (sv && sv->n == 2) {
+                for (int s = 0; s < 2; s++) {
+                    const Verts *seat = path_at(&p, &sv->id[s]);
+                    if (seat && seat->n == 3) lp_push(&q, seat->id[0]);
+                }
             }
         }
+        paths_add_ids(pg, q.v, q.n, &p); q.n = 0;
     }
-    paths_add_ids(pg, q.v, q.n, &p); q.n = 0;
 
-    lp_idmap *texts = lp_idmap_new();
+    lp_idmap *texts = mode >= 1 ? lp_idmap_new() : NULL;
     for (size_t i = 0; i < L->n; i++) {
         Game *g = &L->g[i];
         if (!g->has_meta) continue;
@@ -222,30 +225,33 @@ static void games_load(PGconn *pg, Load *L){
         if (sv && sv->n == 2) {
             for (int s = 0; s < 2; s++) {
                 decode_seat_verts(path_at(&p, &sv->id[s]), &g->seat[s]);
-                if (g->seat[s].has_name) lp_idmap_put(texts, &g->seat[s].name, NULL);
-                if (g->seat[s].has_elo) lp_idmap_put(texts, &g->seat[s].elo, NULL);
-                if (g->seat[s].has_fide) {
+                if (mode >= 2 && g->seat[s].has_name) lp_idmap_put(texts, &g->seat[s].name, NULL);
+                if (mode >= 1 && g->seat[s].has_elo) lp_idmap_put(texts, &g->seat[s].elo, NULL);
+                if (mode >= 2 && g->seat[s].has_fide) {
                     const Verts *fv = path_at(&p, &g->seat[s].fide_node);
                     if (fv && fv->n == 2) { g->seat[s].fide_node = fv->id[1]; lp_idmap_put(texts, &fv->id[1], NULL); }
                     else g->seat[s].has_fide = 0;
                 }
             }
         }
+        if (mode == 0) continue;
         if (!cp_is(&mv->id[2], '-')) {
             g->date = mv->id[2]; g->has_date = 1;
             const Verts *dv = mv->said[2] == LP_SAID_TUPLE ? path_at(&p, &mv->id[2]) : NULL;
             if (dv && dv->n == 3) { for (int k = 0; k < 3; k++) lp_idmap_put(texts, &dv->id[k], NULL); }
             else lp_idmap_put(texts, &mv->id[2], NULL);
         }
-        if (!cp_is(&mv->id[3], '-')) { g->event = mv->id[3]; g->has_event = 1; lp_idmap_put(texts, &g->event, NULL); }
-        if (!cp_is(&mv->id[4], '-')) { g->site = mv->id[4]; g->has_site = 1; lp_idmap_put(texts, &g->site, NULL); }
-        if (!cp_is(&mv->id[5], '-')) { g->round = mv->id[5]; g->has_round = 1; lp_idmap_put(texts, &g->round, NULL); }
-        if (!cp_is(&mv->id[6], '-')) { g->eco = mv->id[6]; g->has_eco = 1; lp_idmap_put(texts, &g->eco, NULL); }
+        if (!cp_is(&mv->id[3], '-')) { g->event = mv->id[3]; g->has_event = 1; if (mode >= 2) lp_idmap_put(texts, &g->event, NULL); }
+        if (!cp_is(&mv->id[4], '-')) { g->site = mv->id[4]; g->has_site = 1; if (mode >= 2) lp_idmap_put(texts, &g->site, NULL); }
+        if (!cp_is(&mv->id[5], '-')) { g->round = mv->id[5]; g->has_round = 1; if (mode >= 2) lp_idmap_put(texts, &g->round, NULL); }
+        if (!cp_is(&mv->id[6], '-')) { g->eco = mv->id[6]; g->has_eco = 1; if (mode >= 2) lp_idmap_put(texts, &g->eco, NULL); }
         if (!cp_is(&mv->id[7], '-')) {
             g->tc = mv->id[7]; g->has_tc = 1;
-            const Verts *tv = mv->said[7] == LP_SAID_TUPLE ? path_at(&p, &mv->id[7]) : NULL;
-            if (tv && tv->n == 2) { lp_idmap_put(texts, &tv->id[0], NULL); lp_idmap_put(texts, &tv->id[1], NULL); }
-            else lp_idmap_put(texts, &mv->id[7], NULL);
+            if (mode >= 2) {
+                const Verts *tv = mv->said[7] == LP_SAID_TUPLE ? path_at(&p, &mv->id[7]) : NULL;
+                if (tv && tv->n == 2) { lp_idmap_put(texts, &tv->id[0], NULL); lp_idmap_put(texts, &tv->id[1], NULL); }
+                else lp_idmap_put(texts, &mv->id[7], NULL);
+            }
         }
         if (!cp_is(&mv->id[8], '-')) { g->variant = mv->id[8]; g->has_variant = 1; lp_idmap_put(texts, &g->variant, NULL); }
         if (!cp_is(&mv->id[9], '-')) {
@@ -255,11 +261,14 @@ static void games_load(PGconn *pg, Load *L){
             else lp_idmap_put(texts, &mv->id[9], NULL);
         }
     }
-    if (lp_idmap_count(texts)) reader_prefetch(L->rd, lp_idmap_keys(texts), lp_idmap_count(texts), 512);
-    lp_idmap_free(texts);
+    if (texts) {
+        if (lp_idmap_count(texts)) reader_prefetch(L->rd, lp_idmap_keys(texts), lp_idmap_count(texts), 512);
+        lp_idmap_free(texts);
+    }
     paths_free(&p);
     lp_vec_free(&q);
 }
+static void games_load(PGconn *pg, Load *L){ games_load_mode(pg, L, 1); }
 
 static const char *result_str(const Game *g){
     if (!g->has_meta) return NULL;
@@ -577,6 +586,18 @@ static Game *game_add(Load *L, const lp_id *rec){
 static void emit_page(lp_buf *o, PGconn *pg, const Load *L, const size_t *idx, int offset, int limit, int player){
     size_t from = (size_t)offset < L->n ? (size_t)offset : L->n;
     size_t to = from + (size_t)limit < L->n ? from + (size_t)limit : L->n;
+    if (to > from) {
+        lp_idmap *pt = lp_idmap_new();
+        for (size_t i = from; i < to; i++) {
+            const Game *g = &L->g[idx[i]];
+            if (g->seat[0].has_name) lp_idmap_put(pt, &g->seat[0].name, NULL);
+            if (g->seat[1].has_name) lp_idmap_put(pt, &g->seat[1].name, NULL);
+            if (g->has_event) lp_idmap_put(pt, &g->event, NULL);
+            if (g->has_eco) lp_idmap_put(pt, &g->eco, NULL);
+        }
+        if (lp_idmap_count(pt)) reader_prefetch(L->rd, lp_idmap_keys(pt), lp_idmap_count(pt), 512);
+        lp_idmap_free(pt);
+    }
     Paths lines; lines_read(pg, L, idx + from, to - from, &lines);
     lp_buf_byte(o, '[');
     for (size_t i = from; i < to; i++) { if (i > from) lp_buf_byte(o, ','); emit_row(o, pg, L, &lines, &L->g[idx[i]], player); }
@@ -771,6 +792,13 @@ static void discover_chess_game_witnesses(PGconn *pg, Ids *chess_trunks){
     free(roots); free(cur); free(done);
 }
 
+typedef struct { lp_id name; long games; uint8_t capped; } PlayerEntry;
+static int player_entry_cmp(const void *a, const void *b){
+    const PlayerEntry *x = (const PlayerEntry *)a, *y = (const PlayerEntry *)b;
+    if (x->games != y->games) return x->games > y->games ? -1 : 1;
+    return memcmp(&x->name, &y->name, 16);
+}
+
 /* POST /v1/chess_players {search, limit, offset}: {search, offset, total, players: [{name, games, games_complete}]} */
 void on_chess_players(int c, const char *body){
     char search[256] = ""; int limit = 25, offset = 0;
@@ -780,7 +808,6 @@ void on_chess_players(int c, const char *body){
     if (!fide_ready()) { api_http(c, 500, "{\"error\":\"tier0\"}"); return; }
     PGconn *pg = api_db(); if (!pg) { unavailable(c); return; }
 
-    typedef struct { lp_id name; long games; uint8_t capped; } PlayerEntry;
     lp_vec(PlayerEntry) roster = { 0 };
     lp_idmap *by_name = lp_idmap_sized(sizeof(int));
 
@@ -870,9 +897,9 @@ void on_chess_players(int c, const char *body){
         Ids trunks = { 0 };
         discover_chess_game_witnesses(pg, &trunks);
         if (trunks.n) {
-            Load L = { 0 }; L.rd = reader_new(pg);
+            Load L = { 0 };
             walk_trunks_records(pg, trunks.v, trunks.n, &L);
-            games_load(pg, &L);
+            games_load_mode(pg, &L, 0);
             for (size_t i = 0; i < L.n; i++) {
                 const Game *g = &L.g[i];
                 for (int s = 0; s < 2; s++) {
@@ -894,39 +921,41 @@ void on_chess_players(int c, const char *body){
     }
     lp_idmap_free(by_name);
 
-    size_t *idx = malloc(sizeof(size_t) * (roster.n ? roster.n : 1));
-    for (size_t i = 0; i < roster.n; i++) idx[i] = i;
-    for (size_t i = 1; i < roster.n; i++) {
-        size_t x = idx[i], j = i;
-        while (j && (roster.v[idx[j - 1]].games < roster.v[x].games ||
-               (roster.v[idx[j - 1]].games == roster.v[x].games && memcmp(&roster.v[idx[j - 1]].name, &roster.v[x].name, 16) > 0))) {
-            idx[j] = idx[j - 1]; j--;
-        }
-        idx[j] = x;
-    }
+    if (roster.n > 1) qsort(roster.v, roster.n, sizeof(PlayerEntry), player_entry_cmp);
 
     size_t from = (size_t)offset < roster.n ? (size_t)offset : roster.n;
     size_t to = from + (size_t)limit < roster.n ? from + (size_t)limit : roster.n;
     Reader *rd = reader_new(pg);
     lp_vec(lp_id) shown = { 0 };
-    for (size_t i = from; i < to; i++) lp_push(&shown, roster.v[idx[i]].name);
+    for (size_t i = from; i < to; i++) lp_push(&shown, roster.v[i].name);
     if (shown.n) reader_prefetch(rd, shown.v, shown.n, 512);
 
     lp_buf o = { 0 };
     lp_buf_cstr(&o, "{\"search\":"); emit_str(&o, search);
     lp_buf_fmt(&o, ",\"offset\":%d,\"total\":%zu,\"players\":[", offset, roster.n);
     for (size_t i = from; i < to; i++) {
-        const PlayerEntry *pe = &roster.v[idx[i]];
+        const PlayerEntry *pe = &roster.v[i];
         char *t = reader_text(rd, &pe->name, 512);
         lp_buf_fmt(&o, "%s{\"name\":", i > from ? "," : ""); emit_str(&o, t ? t : ""); free(t);
         lp_buf_fmt(&o, ",\"games\":%ld,\"games_complete\":%s}", pe->games, pe->capped ? "false" : "true");
     }
     lp_buf_cstr(&o, "]}");
     api_reply_buf(c, 200, &o);
-    reader_free(rd); lp_vec_free(&shown); free(idx); lp_vec_free(&roster);
+    reader_free(rd); lp_vec_free(&shown); lp_vec_free(&roster);
 }
 
 typedef struct { long games, wins, draws, losses, unscored; } Record;
+typedef struct { lp_id name; Record r; } Rival;
+typedef struct { int rating; long games; } Elo;
+static int elo_cmp(const void *a, const void *b){
+    const Elo *x = (const Elo *)a, *y = (const Elo *)b;
+    return (y->rating > x->rating) - (y->rating < x->rating);
+}
+static int rival_cmp(const void *a, const void *b){
+    const Rival *x = (const Rival *)a, *y = (const Rival *)b;
+    if (x->r.games != y->r.games) return x->r.games > y->r.games ? -1 : 1;
+    return memcmp(&x->name, &y->name, 16);
+}
 static void emit_record(lp_buf *o, const char *key, const Record *r){
     long scored = r->wins + r->draws + r->losses;
     lp_buf_fmt(o, ",\"%s\":{\"games\":%ld,\"wins\":%ld,\"draws\":%ld,\"losses\":%ld,\"unscored\":%ld,\"score\":",
@@ -985,8 +1014,6 @@ void on_chess_player(int c, const char *body){
     games_load(pg, &L);
 
     Record all = { 0 }, by[2] = { { 0 } };
-    typedef struct { lp_id name; Record r; } Rival;
-    typedef struct { int rating; long games; } Elo;
     lp_vec(Rival) rivals = { 0 }; lp_vec(Elo) elos = { 0 };
     lp_idmap *rival_at = lp_idmap_sized(sizeof(int));
 
@@ -1024,24 +1051,20 @@ void on_chess_player(int c, const char *body){
     size_t *idx = ordered(&L); lp_buf o = { 0 };
     lp_buf_cstr(&o, "{\"name\":"); emit_str(&o, name);
     emit_record(&o, "overall", &all); emit_record(&o, "as_white", &by[0]); emit_record(&o, "as_black", &by[1]);
-    for (size_t i = 1; i < elos.n; i++) {
-        Elo x = elos.v[i]; size_t j = i;
-        while (j && elos.v[j - 1].rating < x.rating) { elos.v[j] = elos.v[j - 1]; j--; }
-        elos.v[j] = x;
-    }
-    for (size_t i = 1; i < rivals.n; i++) {
-        Rival x = rivals.v[i]; size_t j = i;
-        while (j && (rivals.v[j - 1].r.games < x.r.games ||
-               (rivals.v[j - 1].r.games == x.r.games && memcmp(&rivals.v[j - 1].name, &x.name, 16) > 0))) {
-            rivals.v[j] = rivals.v[j - 1]; j--;
-        }
-        rivals.v[j] = x;
+    if (elos.n > 1) qsort(elos.v, elos.n, sizeof(Elo), elo_cmp);
+    if (rivals.n > 1) qsort(rivals.v, rivals.n, sizeof(Rival), rival_cmp);
+    size_t n_opp = rivals.n < (size_t)opponents ? rivals.n : (size_t)opponents;
+    if (n_opp) {
+        lp_vec(lp_id) rn = { 0 };
+        for (size_t i = 0; i < n_opp; i++) lp_push(&rn, rivals.v[i].name);
+        reader_prefetch(L.rd, rn.v, rn.n, 512);
+        lp_vec_free(&rn);
     }
     if (elos.n) lp_buf_fmt(&o, ",\"peak_rating\":%d", elos.v[0].rating); else lp_buf_cstr(&o, ",\"peak_rating\":null");
     lp_buf_cstr(&o, ",\"ratings\":[");
     for (size_t i = 0; i < elos.n; i++) lp_buf_fmt(&o, "%s{\"rating\":%d,\"games\":%ld}", i ? "," : "", elos.v[i].rating, elos.v[i].games);
     lp_buf_fmt(&o, "],\"opponents_total\":%zu,\"opponents\":[", rivals.n);
-    for (size_t i = 0; i < rivals.n && i < (size_t)opponents; i++) {
+    for (size_t i = 0; i < n_opp; i++) {
         char *t = reader_text(L.rd, &rivals.v[i].name, 512);
         lp_buf_fmt(&o, "%s{\"name\":", i ? "," : ""); emit_str(&o, t ? t : ""); free(t);
         const Record *rr = &rivals.v[i].r; long scored = rr->wins + rr->draws + rr->losses;
@@ -1119,7 +1142,7 @@ void on_chess_game(int c, const char *body){
 
     Load L = { 0 }; L.rd = reader_new(pg);
     Game *g = game_add(&L, &id);
-    games_load(pg, &L);
+    games_load_mode(pg, &L, 2);
     g = &L.g[0];
     size_t one = 0; Paths lines; lines_read(pg, &L, &one, 1, &lines);
     Replay r = { 0 };

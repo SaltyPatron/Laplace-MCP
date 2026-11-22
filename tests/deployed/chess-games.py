@@ -54,19 +54,25 @@ def main():
         games = fixture.data / 'games'
         games.mkdir()
         (games / 'fixture.pgn').write_text(GAMES, encoding='utf-8', newline='\n')
-        # A sample of a source's files (ingest -s SOURCE FILE) publishes no witness; a witness named at run time does.
-        fixture.run('witness', '-r', fixture.recipes, '-j', '2', '--as', witness, '--class', 'AppDerived', games / 'fixture.pgn')
 
         with _lpm.Server(fixture, 'lpm-check-chess-games') as server:
             request = server.request
-            # players: a name as written, and a word of it
+            before_total = request('/v1/chess_players', {'limit': 1})['total']
+            # A sample of a source's files (ingest -s SOURCE FILE) publishes no witness; a witness named at run time does.
+            fixture.run('witness', '-r', fixture.recipes, '-j', '2', '--as', witness, '--class', 'AppDerived', games / 'fixture.pgn')
+
+            # players: a name as written, a word of it, and the unfiltered roster total
             exact = request('/v1/chess_players', {'search': LAPLACE})
             assert [(p['name'], p['games']) for p in exact['players']] == [(LAPLACE, 3)], exact
             word = request('/v1/chess_players', {'search': CARLSEN})
             assert [(p['name'], p['games']) for p in word['players']] == [(CARLSEN_NAME, 2)], word
+            hikaru = request('/v1/chess_players', {'search': 'Hikaru'})
+            assert (NAKAMURA, 1) in [(p['name'], p['games']) for p in hikaru['players']], hikaru
             roster = request('/v1/chess_players', {'limit': 200})
-            roster_map = {p['name']: p['games'] for p in roster['players']}
-            assert roster_map.get(LAPLACE) == 3 and roster_map.get(CARLSEN_NAME) == 2 and roster_map.get(NAKAMURA) == 1, roster
+            assert roster['total'] == before_total + 3, (before_total, roster)
+            if roster['total'] <= 200:
+                roster_map = {p['name']: p['games'] for p in roster['players']}
+                assert roster_map.get(LAPLACE) == 3 and roster_map.get(CARLSEN_NAME) == 2 and roster_map.get(NAKAMURA) == 1, roster
 
             # a player's record and games, newest first
             carlsen = request('/v1/chess_player', {'name': CARLSEN_NAME})
