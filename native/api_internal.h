@@ -15,6 +15,7 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <libpq-fe.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
