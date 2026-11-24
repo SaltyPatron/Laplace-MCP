@@ -336,7 +336,8 @@ static void fen_full(const Bd *b, int half, int full, char *out){
     snprintf(out + n, LP_CHESS_FEN + 24 - n, " %d %d", half, full);
 }
 
-/* Decode non-standard start board P0 directly from its canonical [board, side, castling, ep, ...] DAG node. */
+/* Decode non-standard start board P0 directly from its canonical [board, side, castling, ep, ...] DAG node.
+ * NOTE: paths_add_ids reallocates p->v, so copy IDs out before adding new paths and re-resolve Verts* afterward. */
 static int decode_position_db(PGconn *pg, Reader *rd, const lp_id *pos_id, const LpChessLaw *law, Bd *b){
     Paths p; paths_init(&p);
     paths_add_ids(pg, pos_id, 1, &p);
@@ -344,35 +345,45 @@ static int decode_position_db(PGconn *pg, Reader *rd, const lp_id *pos_id, const
     if (!k || k->n < 4 || k->n > 7) { paths_free(&p); return 0; }
     int64_t side = lp_tier0_codepoint(T0, &k->id[1]);
     if (side != 'w' && side != 'b') { paths_free(&p); return 0; }
-    lp_id lvl1[3] = { k->id[0], k->id[2], k->id[3] };
+    size_t k_n = k->n;
+    lp_id k_ids[7]; memcpy(k_ids, k->id, sizeof(lp_id) * k_n);
+    lp_id lvl1[3] = { k_ids[0], k_ids[2], k_ids[3] };
     paths_add_ids(pg, lvl1, 3, &p);
-    const Verts *ps = path_at(&p, &k->id[0]), *cm = path_at(&p, &k->id[2]), *epv = path_at(&p, &k->id[3]);
-    if (!ps || ps->n < 2 || !cm || cm->n != 2) { paths_free(&p); return 0; }
-    paths_add_ids(pg, ps->id, ps->n, &p);
+    const Verts *ps = path_at(&p, &k_ids[0]);
+    if (!ps || ps->n < 2) { paths_free(&p); return 0; }
+    size_t ps_n = ps->n;
+    lp_id *ps_ids = malloc(sizeof(lp_id) * ps_n);
+    if (!ps_ids) { paths_free(&p); return 0; }
+    memcpy(ps_ids, ps->id, sizeof(lp_id) * ps_n);
+    paths_add_ids(pg, ps_ids, ps_n, &p);
     lp_vec(lp_id) sqs = { 0 };
-    for (size_t i = 0; i < ps->n; i++) {
-        const Verts *two = path_at(&p, &ps->id[i]);
-        if (!two || two->n != 2) { lp_vec_free(&sqs); paths_free(&p); return 0; }
+    for (size_t i = 0; i < ps_n; i++) {
+        const Verts *two = path_at(&p, &ps_ids[i]);
+        if (!two || two->n != 2) { lp_vec_free(&sqs); free(ps_ids); paths_free(&p); return 0; }
         lp_push(&sqs, two->id[1]);
     }
     paths_add_ids(pg, sqs.v, sqs.n, &p);
     lp_vec_free(&sqs);
+
+    const Verts *cm = path_at(&p, &k_ids[2]), *epv = path_at(&p, &k_ids[3]);
+    if (!cm || cm->n != 2) { free(ps_ids); paths_free(&p); return 0; }
 
     memset(b, 0, sizeof *b);
     b->side = side == 'b';
     b->ep = -1;
     b->law = law;
     b->c960 = (uint8_t)(law && law->c960);
-    for (size_t i = 0; i < ps->n; i++) {
-        const Verts *two = path_at(&p, &ps->id[i]);
+    for (size_t i = 0; i < ps_n; i++) {
+        const Verts *two = path_at(&p, &ps_ids[i]);
         const Verts *sq = two ? path_at(&p, &two->id[1]) : NULL;
-        if (!two || !sq || sq->n != 2) { paths_free(&p); return 0; }
+        if (!two || !sq || sq->n != 2) { free(ps_ids); paths_free(&p); return 0; }
         int64_t pc = lp_tier0_codepoint(T0, &two->id[0]);
         int64_t fch = lp_tier0_codepoint(T0, &sq->id[0]), rch = lp_tier0_codepoint(T0, &sq->id[1]);
         const char *w = pc > 0 && pc < 128 && pc != '.' ? strchr(PIECES, toupper((int)pc)) : NULL;
-        if (!w || fch < 'a' || fch > 'h' || rch < '1' || rch > '8') { paths_free(&p); return 0; }
+        if (!w || fch < 'a' || fch > 'h' || rch < '1' || rch > '8') { free(ps_ids); paths_free(&p); return 0; }
         b->sq[(rch - '1') * 8 + (fch - 'a')] = (int8_t)((w - PIECES) * (isupper((int)pc) ? 1 : -1));
     }
+    free(ps_ids);
     for (int c = 0; c < 2; c++) {
         unsigned m = 0;
         if (!uint_from_reader(rd, &cm->id[c], &m)) { paths_free(&p); return 0; }
@@ -383,8 +394,8 @@ static int decode_position_db(PGconn *pg, Reader *rd, const lp_id *pos_id, const
         int64_t ef = lp_tier0_codepoint(T0, &epv->id[0]), er = lp_tier0_codepoint(T0, &epv->id[1]);
         if (ef >= 'a' && ef <= 'h' && er >= '1' && er <= '8') b->ep = (int8_t)((ef - 'a') + 8 * (er - '1'));
     }
-    for (size_t i = 4; i < k->n; i++) {
-        char *xt = reader_text(rd, &k->id[i], 128);
+    for (size_t i = 4; i < k_n; i++) {
+        char *xt = reader_text(rd, &k_ids[i], 128);
         if (!xt || !*xt) { free(xt); paths_free(&p); return 0; }
         size_t xl = strlen(xt);
         if (xt[0] == '+') {
@@ -792,7 +803,7 @@ static void discover_chess_game_witnesses(PGconn *pg, Ids *chess_trunks){
     free(roots); free(cur); free(done);
 }
 
-typedef struct { lp_id name; long games; uint8_t capped; } PlayerEntry;
+typedef struct { lp_id name; long games; uint8_t capped; uint8_t has_fide; } PlayerEntry;
 static int player_entry_cmp(const void *a, const void *b){
     const PlayerEntry *x = (const PlayerEntry *)a, *y = (const PlayerEntry *)b;
     if (x->games != y->games) return x->games > y->games ? -1 : 1;
@@ -848,8 +859,10 @@ void on_chess_players(int c, const char *body){
               if (h[k].src < 0 || (size_t)h[k].src >= values.n || h[k].claim) continue;
               Verts sv = verts_of(h[k].path, (size_t)h[k].path_len);
               if (sv.n == 2 || sv.n == 3) {
+                  int plain = (sv.n == 2 && sv.said[0] == 0 && sv.said[1] == 0)
+                           || (sv.n == 3 && sv.said[0] == LP_SAID_TUPLE && sv.said[1] == 0 && sv.said[2] == 0);
                   size_t ni = sv.n == 3 ? 1 : 0;
-                  int matched = lp_id_eq(&sv.id[ni], &values.v[h[k].src]) || (sv.n == 3 && lp_id_eq(&sv.id[0], &values.v[h[k].src]));
+                  int matched = plain && (lp_id_eq(&sv.id[ni], &values.v[h[k].src]) || (sv.n == 3 && lp_id_eq(&sv.id[0], &values.v[h[k].src])));
                   const lp_id *nm = &sv.id[ni];
                   if (matched && !cp_is(nm, '?') && !cp_is(nm, '-')) {
                       bool nf; size_t slot = lp_idmap_put(by_name, nm, &nf);
@@ -859,6 +872,7 @@ void on_chess_players(int c, const char *body){
                           memset(pe, 0, sizeof *pe); pe->name = *nm;
                       }
                       int owner = *(int *)lp_idmap_at(by_name, slot);
+                      if (sv.n == 3) roster.v[owner].has_fide = 1;
                       if (hub[2 * h[k].src + 1]) roster.v[owner].capped = 1;
                       uint8_t skey[20]; memcpy(skey, h[k].entity.b, 16); memcpy(skey + 16, &owner, 4);
                       bool sf;
@@ -884,9 +898,9 @@ void on_chess_players(int c, const char *body){
             for (size_t i = 0; i < roster.n; i++) roster.v[i].capped |= ocap[i];
             lp_strmap_free(og_seen); lp_vec_free(&hits); free(ocap);
 
-            /* Prune candidate super-strings that were never in an actual chess game. */
+            /* Prune candidate super-strings that were never in an actual chess game or FIDE seat. */
             size_t keep = 0;
-            for (size_t i = 0; i < roster.n; i++) if (roster.v[i].games > 0) roster.v[keep++] = roster.v[i];
+            for (size_t i = 0; i < roster.n; i++) if (roster.v[i].games > 0 || roster.v[i].has_fide) roster.v[keep++] = roster.v[i];
             roster.n = keep;
         } else {
             roster.n = 0;
@@ -989,8 +1003,9 @@ void on_chess_player(int c, const char *body){
       for (int k = 0; k < nh; k++) {
           if (h[k].src < 0 || (size_t)h[k].src >= keys.n || h[k].claim) continue;
           Verts sv = verts_of(h[k].path, (size_t)h[k].path_len);
-          int match = (sv.n == 2 && lp_id_eq(&sv.id[0], &value))
-                   || (sv.n == 3 && (lp_id_eq(&sv.id[1], &value) || (keys.n == 2 && lp_id_eq(&sv.id[0], &keys.v[1]))));
+          int match = (sv.n == 2 && sv.said[0] == 0 && sv.said[1] == 0 && lp_id_eq(&sv.id[0], &value))
+                   || (sv.n == 3 && sv.said[0] == LP_SAID_TUPLE && sv.said[1] == 0 && sv.said[2] == 0
+                       && (lp_id_eq(&sv.id[1], &value) || (keys.n == 2 && lp_id_eq(&sv.id[0], &keys.v[1]))));
           verts_free(&sv);
           if (!match) continue;
           bool fr; lp_idmap_put(once, &h[k].entity, &fr);
