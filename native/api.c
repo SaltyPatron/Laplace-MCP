@@ -231,18 +231,15 @@ void api_parts_json(const lp_ref *parts, size_t n, lp_buf *out) {
 }
 
 int api_mask_claim(const char *m, int len) {
-    if (len < 5) return 0;
-    return ((const unsigned char *)m)[4] & 0x80;
+    if (len != 8) return 0;
+    return (lp_be((const uint8_t *)m, 8) & (UINT64_C(1) << LP_KIND_CLAIM)) != 0;
 }
 
 void api_emit_mask_values(lp_buf *out, const char *wire, int len) {
     const lp_highway *highway = api_view_highway();
     lp_buf_byte(out, '[');
-    if (highway && len == 12 && lp_be(wire, 4) == 64) {
-        lp_mask mask = 0;
-        const uint8_t *bytes = (const uint8_t *)wire + 4;
-        for (unsigned bit = 0; bit < 64; bit++)
-            if (bytes[bit >> 3] & (0x80u >> (bit & 7))) mask |= UINT64_C(1) << bit;
+    if (highway && len == 8) {
+        lp_mask mask = (lp_mask)lp_be((const uint8_t *)wire, 8);
         int shown = 0;
         for (size_t i = 0; i < highway->nbanks; i++) {
             const lp_bank *bank = highway->bank + i;
