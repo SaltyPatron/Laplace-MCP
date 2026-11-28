@@ -276,8 +276,9 @@ def synchronize_sources(source, snapshot, revisions):
         current = run([*git, 'rev-parse', 'HEAD'], capture_output=True).stdout.strip()
         if not existed or current != revision:
             if run([*git, 'cat-file', '-e', revision + '^{commit}'], capture_output=True, check=False).returncode:
-                run([*git, 'fetch', '--quiet', '--no-tags', source / repo, revision])
+                run([*git, 'fetch', '--quiet', '--no-tags', '--update-shallow', source / repo, revision])
             run([*git, 'checkout', '--quiet', '--detach', revision])
+            run([*git, 'clean', '-fdq'])
         if run([*git, 'status', '--porcelain'], capture_output=True).stdout.strip():
             raise ValueError('Build source snapshot was modified: ' + repo)
     return snapshot

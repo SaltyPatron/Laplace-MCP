@@ -51,6 +51,7 @@ class Deployment(unittest.TestCase):
                             '-c', 'user.email=cache@example.invalid', 'commit', '--quiet', '-m', message], check=True)
             return subprocess.check_output(['git', '-C', repository, 'rev-parse', 'HEAD'], text=True).strip()
         (repository / 'reader.c').write_text('int reader(void){return 1;}')
+        (repository / '.gitignore').write_text('web/bin/\n')
         first = commit('Initial source')
         snapshot = self.work / 'incremental/sources'
         deployment.synchronize_sources(source, snapshot, {'Laplace-MCP': first})
@@ -58,12 +59,16 @@ class Deployment(unittest.TestCase):
                          'The reusable build snapshot still borrows objects from disposable CI work')
         subprocess.run(['git', '-C', snapshot / 'Laplace-MCP', 'fsck', '--full'],
                        check=True, capture_output=True)
+        (snapshot / 'Laplace-MCP/web/bin').mkdir(parents=True)
+        (snapshot / 'Laplace-MCP/web/bin/stale.dll').write_text('ignored build output')
         compiled_input = snapshot / 'Laplace-MCP/reader.c'
         timestamp = compiled_input.stat().st_mtime_ns
         (repository / 'README.md').write_text('Documentation changed')
-        second = commit('Documentation only')
+        (repository / '.gitignore').write_text('')
+        second = commit('Documentation only and retire ignored build dir')
         deployment.synchronize_sources(source, snapshot, {'Laplace-MCP': second})
         self.assertEqual(timestamp, compiled_input.stat().st_mtime_ns)
+        self.assertFalse((snapshot / 'Laplace-MCP/web').exists())
         compiled_input.write_text('unfinished operator edit')
         with self.assertRaisesRegex(ValueError, 'snapshot was modified'):
             deployment.synchronize_sources(source, snapshot, {'Laplace-MCP': first})
