@@ -370,10 +370,6 @@ def _package(config, output, clean_build=False):
         shutil.copyfile(source / 'Laplace-MCP/deployment.py', controller)
         shutil.copyfile(client_controller, stage / 'libexec/laplace-client.py')
         package_resources(config, source, stage, recipe_grammars)
-        # The /modular host (Laplace.Modular.Web) ships in the same release as the reader it forwards to, so a
-        # release switch moves both and a rollback restores both. It runs on the host's shared .NET runtime.
-        run(['dotnet', 'publish', source / 'Laplace-MCP/web/Laplace.Modular.Web.csproj', '-c', 'Release',
-             '--no-self-contained', '-p:UseAppHost=false', '-o', stage / 'web'], env=environment)
         dependencies = {}
         for relative in ('bin/lpm', 'bin/laplace', 'lib/liblpm.so'):
             report = run(['ldd', stage / relative], capture_output=True).stdout
@@ -424,7 +420,7 @@ def verify_package(release):
     required = {'share/prepared/tier0.bin', 'share/prepared/tier0.flags', 'share/prepared/tier0.flags.layout',
                 'share/prepared/tier0.highway', 'share/prepared/tier0.chess', 'share/manifest/banks.tsv',
                 'share/firmware/program.firmware',
-                'libexec/laplace-client.py', 'web/Laplace.Modular.Web.dll'}
+                'libexec/laplace-client.py'}
     if not required.issubset(receipt['files']) or not any(name.startswith('share/grammars/') and name.endswith('.so') for name in receipt['files']):
         raise PackageUpgradeRequired('Modular package lacks its immutable runtime resources; rebuild a compatible release')
     if any(name.startswith('share/recipes/formats/grammars/') for name in receipt['files']):
