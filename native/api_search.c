@@ -474,6 +474,22 @@ void on_code_search(int c, const char *body) {
     int witnesses = 0;
     uint64_t t_scope = os_monotonic_ns();
     lp_idmap *scope = code_scope(pg, rd, source, &witnesses);
+    if (!witnesses || !scope) {
+        double ms = (double)(os_monotonic_ns() - t0) / 1e6;
+        lp_buf out = { 0 };
+        lp_buf_fmt(&out,
+                "{\"docs\":0,\"entities\":0,\"ms\":%.3f,\"model\":\"laplace-containment\",\"scope\":\"%s\","
+                "\"source\":", ms, scope_s);
+        lp_json_str(&out, source, strlen(source));
+        lp_buf_fmt(&out,
+                ",\"query\":{\"nodes\":%zu,\"held\":%zu},\"witnesses\":0,\"levels\":0,\"cut\":false,"
+                "\"error\":\"requested source witness is not ingested\",\"candidates\":{\"reached\":0,\"kept\":0},\"hits\":[]}",
+                qnodes, qheld);
+        lp_buf_free(&binfo);
+        reader_free(rd);
+        api_reply_buf(c, 200, &out);
+        return;
+    }
 
     /* how common each term is: the paths that hold it directly, read from the container index at once; a term with
      * more than LAPLACE_CODE_HUB of a kind is a hub */
@@ -672,13 +688,13 @@ void on_reindex(int c, const char *body) {
     api_on_engine(c, av);
 }
 
-/* ---- rerank: documents scored against a query by the inverse frequency, over the database's containment, of the
- * query's terms each holds (the terms as code_search reads them), as a share of all the query's terms. A term's
- * frequency is how many paths hold it directly; LAPLACE_CODE_HUB and more are alike. */
-typedef struct { uint32_t index, shared; double score; size_t bytes; } RerankItem;
+/* ---- rerank: documents scored against a query by continuous substrate salience IDF + real unpacked 4D entity.coord
+ * Fréchet curve distance (lp_frechet4), returning both typed channels cleanly with zero binary hub cliffs. */
+typedef struct { uint32_t index, shared; double score, frechet4d; size_t bytes; } RerankItem;
 static int cmp_rerank_item(const void *a, const void *b) {
     const RerankItem *x = a, *y = b;
     if (x->score != y->score) return x->score < y->score ? 1 : -1;
+    if (x->frechet4d != y->frechet4d) return x->frechet4d < y->frechet4d ? -1 : 1;
     if (x->bytes != y->bytes) return x->bytes < y->bytes ? -1 : 1;
     return (x->index > y->index) - (x->index < y->index);
 }
@@ -705,37 +721,76 @@ void on_rerank(int c, const char *body) {
     uint64_t t0 = os_monotonic_ns();
     Terms q;
     code_terms(query, &q);
-    double df[64] = { 0 }, idf[64] = { 0 }, total = 0;
-    int *hub = calloc((size_t)(q.n ? q.n : 1) * 2, sizeof *hub), nh = 0;
-    Hold *h = q.n ? holds_capped(pg, q.id, q.n, (int)cap, 0, 3, hub, &nh) : NULL;
-    for (int j = 0; j < nh; j++) if (h[j].src >= 0 && h[j].src < q.n) df[h[j].src]++;
-    holds_free(h, nh);
-    for (int b = 0; b < q.n; b++) {
-        if (hub[2 * b] || hub[2 * b + 1]) df[b] = (double)cap + 1;
-        idf[b] = term_idf(df[b], (double)cap + 1);
-        total += idf[b];
+    double idf[64] = { 0 }, total = 0;
+    if (q.n > 0) {
+        int nsal = 0;
+        LpSalienceRow *sal = salience_of(pg, q.id, q.n, NULL, 0, &nsal);
+        for (int b = 0; b < q.n; b++) idf[b] = 1.0;
+        for (int r = 0; r < nsal; r++) {
+            if (sal[r].ord >= 1 && sal[r].ord <= q.n && sal[r].info_bits > 0.0)
+                idf[sal[r].ord - 1] = sal[r].info_bits;
+        }
+        free(sal);
+        for (int b = 0; b < q.n; b++) total += idf[b];
     }
-    free(hub);
-    RerankItem *items = calloc(nd, sizeof *items);
-    Terms *d = malloc(sizeof *d);
+
+    /* Collect all unique term IDs across query + documents for one batched real 4D entity.coord fetch. */
+    Terms *doc_terms = calloc(nd, sizeof *doc_terms);
+    lp_idmap *umap = lp_idmap_new();
+    for (int b = 0; b < q.n; b++) lp_idmap_put(umap, &q.id[b], NULL);
     for (size_t i = 0; i < nd; i++) {
-        code_terms(docs[i], d);
-        items[i] = (RerankItem){ (uint32_t)i, 0, 0, strlen(docs[i]) };
+        code_terms(docs[i], &doc_terms[i]);
+        for (int k = 0; k < doc_terms[i].n; k++) lp_idmap_put(umap, &doc_terms[i].id[k], NULL);
+    }
+    size_t nu = lp_idmap_count(umap);
+    double *ucoords = calloc(nu ? nu * 4u : 4u, sizeof(double));
+    uint8_t *uhas = calloc(nu ? nu : 1u, 1);
+    if (nu > 0) coords_of(pg, lp_idmap_keys(umap), (int)nu, ucoords, uhas);
+
+    double qcurve[64 * 4];
+    size_t qclen = 0;
+    for (int b = 0; b < q.n; b++) {
+        int64_t u = lp_idmap_find(umap, &q.id[b]);
+        if (u >= 0 && uhas[u]) { memcpy(qcurve + qclen * 4u, ucoords + (size_t)u * 4u, 32); qclen++; }
+    }
+
+    RerankItem *items = calloc(nd, sizeof *items);
+    double dcurve[64 * 4];
+    for (size_t i = 0; i < nd; i++) {
+        const Terms *d = &doc_terms[i];
+        items[i] = (RerankItem){ (uint32_t)i, 0, 0.0, INFINITY, strlen(docs[i]) };
         for (int b = 0; b < q.n; b++)
             for (int k = 0; k < d->n; k++)
                 if (!memcmp(q.id[b].b, d->id[k].b, 16)) { items[i].shared++; items[i].score += idf[b]; break; }
-        if (total > 0) items[i].score /= total;
+        if (total > 0.0) items[i].score /= total;
+
+        size_t dclen = 0;
+        for (int k = 0; k < d->n; k++) {
+            int64_t u = lp_idmap_find(umap, &d->id[k]);
+            if (u >= 0 && uhas[u]) { memcpy(dcurve + dclen * 4u, ucoords + (size_t)u * 4u, 32); dclen++; }
+        }
+        if (qclen >= 1u && dclen >= 1u) {
+            double fd = lp_frechet4(qcurve, qclen, dcurve, dclen);
+            if (isfinite(fd) && fd >= 0.0) items[i].frechet4d = fd;
+        }
         free(docs[i]);
     }
-    free(d);
+    free(doc_terms);
+    lp_idmap_free(umap);
+    free(ucoords);
+    free(uhas);
+
     qsort(items, nd, sizeof *items, cmp_rerank_item);
     size_t shown = (size_t)top_n < nd ? (size_t)top_n : nd;
     double ms = (double)(os_monotonic_ns() - t0) / 1e6;
     lp_buf out = { 0 };
-    lp_buf_fmt(&out, "{\"model\":\"laplace-containment\",\"ms\":%.3f,\"results\":[", ms);
-    for (size_t i = 0; i < shown; i++)
-        lp_buf_fmt(&out, "%s{\"index\":%u,\"relevance_score\":%.6f,\"shared\":%u}",
+    lp_buf_fmt(&out, "{\"model\":\"laplace-salience-frechet4d\",\"ms\":%.3f,\"results\":[", ms);
+    for (size_t i = 0; i < shown; i++) {
+        lp_buf_fmt(&out, "%s{\"index\":%u,\"relevance_score\":%.6f,\"shared\":%u,\"frechet_4d\":",
                 i ? "," : "", items[i].index, items[i].score, items[i].shared);
+        if (isfinite(items[i].frechet4d)) lp_buf_fmt(&out, "%.6f}", items[i].frechet4d);
+        else lp_buf_cstr(&out, "null}");
+    }
     lp_buf_cstr(&out, "]}");
     free(items);
     api_reply_buf(c, 200, &out);
